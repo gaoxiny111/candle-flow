@@ -290,16 +290,87 @@ def evaluate_confluence(klines: Sequence, index: int, direction: str) -> Conflue
         elif not bullish and rsi >= 52:
             result.add("RSI", f"RSI(14)={rsi:.1f}，高于 52，未超卖，支持做空")
 
+    from app.core.oscillators import (
+        bearish_divergence,
+        bullish_divergence,
+        rsi_series,
+        stochastic_at,
+    )
+
+    stoch = stochastic_at(klines, index)
+    if stoch:
+        k_val, d_val = stoch
+        if bullish and (k_val <= 25 or (k_val > d_val and k_val < 40)):
+            result.add(
+                "随机指标",
+                f"%K={k_val:.1f} %D={d_val:.1f}，超卖区或低位金叉，支持做多",
+            )
+        elif not bullish and (k_val >= 75 or (k_val < d_val and k_val > 60)):
+            result.add(
+                "随机指标",
+                f"%K={k_val:.1f} %D={d_val:.1f}，超买区或高位死叉，支持做空",
+            )
+
+    rsi_line = rsi_series(closes)
+    if bullish and bullish_divergence(closes, rsi_line, index):
+        result.add("RSI背离", "价格创新低而 RSI 未创新低（看涨背离）")
+    elif not bullish and bearish_divergence(closes, rsi_line, index):
+        result.add("RSI背离", "价格创新高而 RSI 未创新高（看跌背离）")
+
+    if macd:
+        # Build MACD hist over a short lookback for divergence (avoid full O(n²))
+        hist_line: list[float | None] = [None] * len(closes)
+        start_h = max(30, index - 40)
+        for i in range(start_h, index + 1):
+            m = macd_at(closes, i)
+            if m:
+                hist_line[i] = m[2]
+        if bullish and bullish_divergence(closes, hist_line, index):
+            result.add("MACD背离", "价格创新低而 MACD 柱未创新低（看涨背离）")
+        elif not bullish and bearish_divergence(closes, hist_line, index):
+            result.add("MACD背离", "价格创新高而 MACD 柱未创新高（看跌背离）")
+
+    # Ch.15 volume: breakout thrust, dry-up pullback, confirmation of turn
     vols = [_vol(k) for k in klines[max(0, index - 19) : index + 1]]
     if len(vols) >= 5:
         avg_vol = sum(vols[:-1]) / max(len(vols) - 1, 1)
         today_vol = _vol(klines[index])
-        if avg_vol > 0 and today_vol >= avg_vol:
+        prev_vol = _vol(klines[index - 1]) if index > 0 else 0.0
+        if avg_vol > 0 and today_vol >= avg_vol * 1.15:
             ratio = today_vol / avg_vol
-            result.add(
-                "放量",
-                f"当日量 {_vol_zh(today_vol)}，约为近 20 日均量 {_vol_zh(avg_vol)} 的 {ratio:.2f} 倍",
-            )
+            breaking_high = prior and close > prior_high
+            breaking_low = prior and close < prior_low
+            if bullish and (breaking_high or today_vol >= avg_vol * 1.4):
+                result.add(
+                    "放量",
+                    f"确认放量 {_vol_zh(today_vol)}≈均量 {ratio:.2f} 倍"
+                    + ("，收盘越过前高" if breaking_high else ""),
+                )
+            elif not bullish and (breaking_low or today_vol >= avg_vol * 1.4):
+                result.add(
+                    "放量",
+                    f"确认放量 {_vol_zh(today_vol)}≈均量 {ratio:.2f} 倍"
+                    + ("，收盘跌破前低" if breaking_low else ""),
+                )
+            elif today_vol >= avg_vol:
+                result.add(
+                    "放量",
+                    f"当日量 {_vol_zh(today_vol)}，约为近 20 日均量 {_vol_zh(avg_vol)} 的 {ratio:.2f} 倍",
+                )
+        # 缩量回撤：近几日量能低于均量后今日转强/转弱
+        if avg_vol > 0 and index >= 3:
+            recent3 = [_vol(klines[i]) for i in range(index - 3, index)]
+            dry = sum(1 for v in recent3 if v < avg_vol * 0.85) >= 2
+            if bullish and dry and today_vol >= prev_vol and close > float(klines[index].open):
+                result.add(
+                    "缩量回撤",
+                    f"回调段缩量（低于均量），今日量能回升并收阳，量价配合看涨",
+                )
+            elif not bullish and dry and today_vol >= prev_vol and close < float(klines[index].open):
+                result.add(
+                    "缩量回撤",
+                    f"反弹段缩量（低于均量），今日量能回升并收阴，量价配合看跌",
+                )
 
     if period_low > 0 and bullish and (close - period_low) / period_low <= 0.03:
         dist = (close - period_low) / period_low
@@ -349,6 +420,29 @@ def evaluate_confluence(klines: Sequence, index: int, direction: str) -> Conflue
                 "窗口阻力",
                 f"收盘 {_px(close)} 回测未回补降窗 {_px(z.bottom)}–{_px(z.top)}（仅收盘填补才失效）",
             )
+
+    from app.core.western_levels import (
+        polarity_levels,
+        retracement_hit,
+        trendline_proximity,
+    )
+
+    # Ch.11 polarity + trendline
+    for role, price, detail in polarity_levels(klines, index):
+        near = abs(close - price) / max(price, 1e-9) <= 0.015
+        if bullish and role == "support" and near:
+            result.add("极性支撑", detail + f"；现价 {_px(close)} 回测该位")
+        elif not bullish and role == "resistance" and near:
+            result.add("极性阻力", detail + f"；现价 {_px(close)} 回测该位")
+
+    tl = trendline_proximity(klines, index, "bullish" if bullish else "bearish")
+    if tl:
+        result.add(tl.name, tl.detail)
+
+    # Ch.12 percentage retracements
+    rh = retracement_hit(klines, index, "bullish" if bullish else "bearish")
+    if rh:
+        result.add(rh.name, rh.detail)
 
     near_high = period_high > 0 and close >= period_high * 0.98
     near_low = period_low > 0 and close <= period_low * 1.02

@@ -153,7 +153,7 @@ function formatDate(value?: string) {
         <div v-else class="status-tag">{{ signalStatusZh(s.status) }}</div>
       </div>
     </div>
-    <p v-if="displaySignals.length" class="hint">买点必须来自已确认的蜡烛形态；周线逆势不做。金叉/死叉只作确认。形态须与均线 / MACD / RSI / 量能 / 高低点 / 窗口至少两项同向。止盈优先第十六章测幅（箱体/对等/旗形），否则用 2R/3R。</p>
+    <p v-if="displaySignals.length" class="hint">买点必须来自已确认的蜡烛形态；周线逆势不做。汇聚含均线/MACD/RSI/随机/背离/量能/高低点/窗口/趋势线/极性/回撤，至少两项同向。止盈优先第十六章测幅，否则 2R/3R。</p>
   </div>
 </template>
 

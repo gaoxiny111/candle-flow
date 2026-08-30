@@ -203,23 +203,107 @@ class DojiStrategy(PatternStrategy):
 
     def identify(self, candles: List[Candle], index: int) -> Optional[PatternResult]:
         c = candles[index]
-        if c.range == 0:
+        if c.range == 0 or c.body >= c.range * 0.08:
             return None
         name = "十字线"
         direction = "neutral"
-        if c.body < c.range * 0.05:
-            if c.lower_shadow >= c.range * 0.70 and c.upper_shadow < c.range * 0.10:
-                name = "蜻蜓十字线"
-                direction = "bullish" if is_downtrend(candles, index) else "neutral"
-            elif c.upper_shadow >= c.range * 0.70 and c.lower_shadow < c.range * 0.10:
-                name = "墓碑十字线"
-                direction = "bearish" if is_uptrend(candles, index) else "neutral"
-            elif not is_uptrend(candles, index) and not is_downtrend(candles, index):
-                return None
+        long_upper = c.upper_shadow >= c.range * 0.30
+        long_lower = c.lower_shadow >= c.range * 0.30
+        near_mid = abs(c.body_mid - (c.high + c.low) / 2) / c.range <= 0.12
+
+        if c.lower_shadow >= c.range * 0.70 and c.upper_shadow < c.range * 0.12:
+            name = "蜻蜓十字线"
+            direction = "bullish" if is_downtrend(candles, index) else "neutral"
+        elif c.upper_shadow >= c.range * 0.70 and c.lower_shadow < c.range * 0.12:
+            name = "墓碑十字线"
+            direction = "bearish" if is_uptrend(candles, index) else "neutral"
+        elif long_upper and long_lower and near_mid:
+            name = "黄包车夫"
+            # 长影十字，多空犹豫；上涨后偏空警示，下跌后偏多观察
+            if is_uptrend(candles, index):
+                direction = "bearish"
+            elif is_downtrend(candles, index):
+                direction = "bullish"
+        elif long_upper and long_lower:
+            name = "长腿十字线"
+            if is_uptrend(candles, index):
+                direction = "bearish"
+            elif is_downtrend(candles, index):
+                direction = "bullish"
+        elif is_uptrend(candles, index):
+            # 第八章：上涨行情中的十字线（北方十字）— 顶部警示
+            name = "北方十字"
+            direction = "bearish"
+        elif is_downtrend(candles, index):
+            name = "十字线"
+            direction = "neutral"
         else:
             return None
-        score = min(100.0, 35.0 + evaluate_trend(candles, index) + position_score(candles, index))
+
+        score = min(100.0, 38.0 + evaluate_trend(candles, index) + position_score(candles, index))
+        if name in {"北方十字", "长腿十字线", "黄包车夫"}:
+            score = min(100.0, score + 8.0)
         return PatternResult(name, direction, score, index, score_to_level(score))
+
+    def calculate_score(self, candle: Candle, context: Dict) -> float:
+        return context.get("score", 0.0)
+
+
+class DojiMorningStarStrategy(PatternStrategy):
+    """十字启明星：启明星中间一根为十字，力度更强（第五章）。"""
+
+    def window_size(self) -> int:
+        return 3
+
+    def identify(self, candles: List[Candle], index: int) -> Optional[PatternResult]:
+        if index < 2:
+            return None
+        c1, c2, c3 = candles[index - 2], candles[index - 1], candles[index]
+        avg_b = avg_body(candles, index - 2, 5)
+        if c1.is_bullish or c1.body < avg_b * 1.15:
+            return None
+        if c2.range == 0 or c2.body >= c2.range * 0.08:
+            return None
+        if not c3.is_bullish or c3.body < avg_b * 0.8:
+            return None
+        if c2.high >= min(c1.open, c1.close):
+            return None
+        if c3.close <= c1.body_mid:
+            return None
+        if not is_downtrend(candles, index - 2):
+            return None
+        score = min(100.0, 62.0 + evaluate_trend(candles, index) + 10.0)
+        return PatternResult("十字启明星", "bullish", score, index, score_to_level(score))
+
+    def calculate_score(self, candle: Candle, context: Dict) -> float:
+        return context.get("score", 0.0)
+
+
+class DojiEveningStarStrategy(PatternStrategy):
+    """十字黄昏星：黄昏星中间一根为十字（第五章）。"""
+
+    def window_size(self) -> int:
+        return 3
+
+    def identify(self, candles: List[Candle], index: int) -> Optional[PatternResult]:
+        if index < 2:
+            return None
+        c1, c2, c3 = candles[index - 2], candles[index - 1], candles[index]
+        avg_b = avg_body(candles, index - 2, 5)
+        if not c1.is_bullish or c1.body < avg_b * 1.15:
+            return None
+        if c2.range == 0 or c2.body >= c2.range * 0.08:
+            return None
+        if c3.is_bullish or c3.body < avg_b * 0.8:
+            return None
+        if c2.low <= max(c1.open, c1.close):
+            return None
+        if c3.close >= c1.body_mid:
+            return None
+        if not is_uptrend(candles, index - 2):
+            return None
+        score = min(100.0, 62.0 + evaluate_trend(candles, index) + 10.0)
+        return PatternResult("十字黄昏星", "bearish", score, index, score_to_level(score))
 
     def calculate_score(self, candle: Candle, context: Dict) -> float:
         return context.get("score", 0.0)
@@ -404,6 +488,8 @@ DEFAULT_STRATEGIES: List[PatternStrategy] = [
     ShootingStarStrategy(),
     InvertedHammerStrategy(),
     DojiStrategy(),
+    DojiMorningStarStrategy(),
+    DojiEveningStarStrategy(),
     BullishEngulfingStrategy(),
     BearishEngulfingStrategy(),
     MorningStarStrategy(),

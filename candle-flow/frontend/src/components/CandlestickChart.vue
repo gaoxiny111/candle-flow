@@ -3,7 +3,7 @@ import { ref, watch, onMounted, onUnmounted } from 'vue'
 import { createChart, ColorType, CrosshairMode, LineStyle, type IChartApi, type ISeriesApi, type LogicalRange, type SeriesMarker } from 'lightweight-charts'
 import type { KlineItem, PatternItem } from '@/api'
 import { patternNameZh } from '@/utils/labels'
-import { barTime, calcBoll, sanitizeKlines } from '@/utils/indicators'
+import { barTime, calcBoll, calcRetracements, sanitizeKlines } from '@/utils/indicators'
 import { unfilledWindows } from '@/utils/windows'
 
 const props = withDefaults(
@@ -14,8 +14,9 @@ const props = withDefaults(
     showAllMarkers?: boolean
     showMa?: boolean
     showBoll?: boolean
+    showRetrace?: boolean
   }>(),
-  { showMa: true, showBoll: false }
+  { showMa: true, showBoll: false, showRetrace: false }
 )
 
 const emit = defineEmits<{
@@ -27,6 +28,7 @@ const containerRef = ref<HTMLDivElement | null>(null)
 const maLegend = ref({ ma5: 0, ma10: 0, ma20: 0 })
 const bollLegend = ref({ mid: 0, upper: 0, lower: 0 })
 const windowLegend = ref<{ title: string; color: string }[]>([])
+const retraceLegend = ref<{ title: string; color: string }[]>([])
 let chart: IChartApi | null = null
 let candleSeries: ISeriesApi<'Candlestick'> | null = null
 let volumeSeries: ISeriesApi<'Histogram'> | null = null
@@ -37,18 +39,28 @@ let bollMidSeries: ISeriesApi<'Line'> | null = null
 let bollUpSeries: ISeriesApi<'Line'> | null = null
 let bollDnSeries: ISeriesApi<'Line'> | null = null
 let windowSeries: ISeriesApi<'Line'>[] = []
+let retraceSeries: ISeriesApi<'Line'>[] = []
 let syncing = false
 
-function clearWindowSeries() {
+function clearExtraSeries(list: ISeriesApi<'Line'>[]) {
   if (!chart) return
-  for (const s of windowSeries) {
+  for (const s of list) {
     try {
       chart.removeSeries(s)
     } catch {
       /* already removed */
     }
   }
+}
+
+function clearWindowSeries() {
+  clearExtraSeries(windowSeries)
   windowSeries = []
+}
+
+function clearRetraceSeries() {
+  clearExtraSeries(retraceSeries)
+  retraceSeries = []
 }
 
 function drawWindows(bars: KlineItem[]) {
@@ -98,6 +110,41 @@ function drawWindows(bars: KlineItem[]) {
     legend.push({ title: `${keyTitle} ${keyPrice.toFixed(2)}`, color })
   }
   windowLegend.value = legend
+}
+
+function drawRetracements(bars: KlineItem[]) {
+  clearRetraceSeries()
+  if (!chart || !props.showRetrace) {
+    retraceLegend.value = []
+    return
+  }
+  const levels = calcRetracements(bars)
+  if (!levels.length || bars.length < 2) {
+    retraceLegend.value = []
+    return
+  }
+  const from = barTime(bars[Math.max(0, bars.length - 50)])
+  const to = barTime(bars[bars.length - 1])
+  const colors = ['#722ed1', '#13c2c2', '#eb2f96']
+  const legend: { title: string; color: string }[] = []
+  levels.forEach((lv, i) => {
+    const color = colors[i % colors.length]
+    const s = chart!.addLineSeries({
+      color,
+      lineWidth: 1,
+      lineStyle: LineStyle.Dotted,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+    })
+    s.setData([
+      { time: from, value: lv.price },
+      { time: to, value: lv.price },
+    ])
+    retraceSeries.push(s)
+    legend.push({ title: `${lv.label} ${lv.price.toFixed(2)}`, color })
+  })
+  retraceLegend.value = legend
 }
 
 function toChartData(data: KlineItem[]) {
@@ -216,6 +263,7 @@ function updateData(focusDate?: string) {
   bollLegend.value = lastB ? { mid: lastB.mid, upper: lastB.upper, lower: lastB.lower } : { mid: 0, upper: 0, lower: 0 }
   candleSeries.setMarkers(buildMarkers())
   drawWindows(bars)
+  drawRetracements(bars)
   candleSeries.priceScale().applyOptions({ autoScale: true, scaleMargins: { top: 0.08, bottom: 0.18 } })
   if (focusDate) {
     scrollToDate(focusDate)
@@ -326,11 +374,12 @@ onMounted(() => {
 onUnmounted(() => {
   ro?.disconnect()
   clearWindowSeries()
+  clearRetraceSeries()
   chart?.remove()
 })
 
 watch(
-  () => [props.klineData, props.markers, props.highlightPatternId, props.showAllMarkers, props.showMa, props.showBoll] as const,
+  () => [props.klineData, props.markers, props.highlightPatternId, props.showAllMarkers, props.showMa, props.showBoll, props.showRetrace] as const,
   () => {
     const highlighted = props.markers?.find((p) => p.id === props.highlightPatternId)
     updateData(highlighted?.candle_date)
@@ -341,12 +390,13 @@ watch(
 
 <template>
   <div class="lw-wrap">
-    <div v-if="(showMa && maLegend.ma5) || windowLegend.length || (showBoll && bollLegend.mid)" class="ma-legend">
+    <div v-if="(showMa && maLegend.ma5) || windowLegend.length || retraceLegend.length || (showBoll && bollLegend.mid)" class="ma-legend">
       <span v-if="showMa && maLegend.ma5" class="ma5">MA5 {{ maLegend.ma5.toFixed(2) }}</span>
       <span v-if="showMa && maLegend.ma5" class="ma10">MA10 {{ maLegend.ma10.toFixed(2) }}</span>
       <span v-if="showMa && maLegend.ma5" class="ma20">MA20 {{ maLegend.ma20.toFixed(2) }}</span>
       <span v-if="showBoll && bollLegend.mid" class="boll">BOLL {{ bollLegend.lower.toFixed(2) }} / {{ bollLegend.mid.toFixed(2) }} / {{ bollLegend.upper.toFixed(2) }}</span>
       <span v-for="w in windowLegend" :key="w.title" class="win" :style="{ color: w.color }">{{ w.title }}</span>
+      <span v-for="r in retraceLegend" :key="r.title" class="retrace" :style="{ color: r.color }">{{ r.title }}</span>
     </div>
     <div ref="containerRef" class="lw-chart" />
   </div>

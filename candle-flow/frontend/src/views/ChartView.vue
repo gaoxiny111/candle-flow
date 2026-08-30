@@ -234,7 +234,9 @@ watch(symbol, (s) => loadAll(s))
           :show-boll="visibleIndicators.includes('BOLL')"
           :show-macd="visibleIndicators.includes('MACD')"
           :show-rsi="visibleIndicators.includes('RSI')"
+          :show-stoch="visibleIndicators.includes('STOCH')"
           :show-atr="visibleIndicators.includes('ATR')"
+          :show-retrace="visibleIndicators.includes('RETRACE')"
           :loading="kline.loading"
         />
       </div>

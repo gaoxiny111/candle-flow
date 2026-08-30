@@ -9,7 +9,7 @@ const emit = defineEmits<{
   changePeriod: [type: string, period: number]
 }>()
 
-const types = ['MA', 'BOLL', 'MACD', 'RSI', 'ATR']
+const types = ['MA', 'BOLL', 'RETRACE', 'MACD', 'RSI', 'STOCH', 'ATR']
 const visible = defineModel<string[]>('visibleTypes', { default: () => ['MA'] })
 
 function toggle(t: string) {
@@ -29,7 +29,7 @@ function toggle(t: string) {
         {{ indicatorZh(t) }}
       </label>
     </div>
-    <p class="hint">均线、布林叠在主图；MACD / RSI / ATR 显示在 K 线下方。可用日线/周线切换：周线定趋势，日线找入场。窗口带从跳空日起画到当前，仅收盘填补才消失。</p>
+    <p class="hint">均线/布林/回撤叠在主图；MACD / RSI / 随机 / ATR 在副图。汇聚含第十一～十五章：趋势线与极性、百分比回撤、随机与背离、量价。周线定趋势，日线找入场。</p>
   </div>
 </template>
 

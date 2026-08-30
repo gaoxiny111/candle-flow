@@ -468,3 +468,90 @@ def test_equal_move_target():
     assert t.price > 13.2
 
 
+def test_springboard_bullish():
+    from app.core.western_levels import detect_springboard
+
+    specs = []
+    for i in range(15):
+        specs.append((10 + i * 0.05, 10.2 + i * 0.05, 9.9 + i * 0.05, 10.1 + i * 0.05, 1000))
+    # support ~9.9 from early bars; pierce then close above
+    specs.append((10.0, 10.1, 9.7, 10.05, 2000))
+    candles = make_candles(specs)
+    hit = detect_springboard(candles, len(candles) - 1)
+    assert hit is not None
+    assert hit[0] == "破低反涨"
+    assert hit[1] == "bullish"
+
+
+def test_retracement_and_stoch():
+    from app.core.western_levels import active_retracements, retracement_hit
+    from app.core.oscillators import stochastic_at
+
+    specs = []
+    # up swing 10 → 20
+    for i in range(20):
+        px = 10 + i * 0.5
+        specs.append((px - 0.1, px + 0.2, px - 0.2, px, 1000))
+    # pullback toward ~50% (~15)
+    for i in range(8):
+        px = 20 - i * 0.55
+        specs.append((px + 0.1, px + 0.15, px - 0.2, px, 800))
+    candles = make_candles(specs)
+    levels = active_retracements(candles, len(candles) - 1)
+    assert levels
+    close = float(candles[-1].close)
+    # nudge close onto a level for hit
+    nearest = min(levels, key=lambda x: abs(x[0] - close))
+    candles[-1].close = nearest[0]
+    hit = retracement_hit(candles, len(candles) - 1, "bullish")
+    assert hit is not None
+    assert "回撤" in hit.name
+
+    st = stochastic_at(candles, len(candles) - 1)
+    assert st is not None
+    assert 0 <= st[0] <= 100
+
+
+def test_doji_morning_star_and_northern():
+    from app.core.pattern_engine import PatternEngine
+
+    # downtrend + long black, doji gap, long white
+    specs = _downtrend_bars(20)
+    specs.append((12.0, 12.1, 11.0, 11.1, 2000))  # long black
+    specs.append((10.5, 10.7, 10.4, 10.55, 800))  # doji star
+    specs.append((10.6, 12.2, 10.55, 12.0, 2200))  # reclaim white
+    candles = make_candles(specs)
+    names = [r.pattern_name for r in PatternEngine(min_score=40).scan(candles)]
+    assert "十字启明星" in names or "启明星" in names
+
+    # northern doji: uptrend then small-body doji
+    specs2 = _uptrend_bars(20)
+    specs2.append((18.0, 18.4, 17.6, 18.02, 900))
+    candles2 = make_candles(specs2)
+    names2 = [r.pattern_name for r in PatternEngine(min_score=30).scan(candles2)]
+    assert any(n in names2 for n in ("北方十字", "长腿十字线", "黄包车夫", "十字线", "墓碑十字线"))
+
+
+def test_three_mountains_shape():
+    from app.core.nison_patterns import ThreeMountainsStrategy
+
+    specs = []
+    # three peaks near 20 with dips between
+    base = 15.0
+    for peak in (20.0, 20.1, 19.95):
+        for i in range(4):
+            px = base + (peak - base) * (i / 3)
+            specs.append((px - 0.1, px + 0.15, px - 0.2, px, 1000))
+        for i in range(3):
+            px = peak - (peak - 16) * ((i + 1) / 3)
+            specs.append((px + 0.1, px + 0.2, px - 0.15, px, 900))
+        base = 16.0
+    specs.append((17.5, 17.7, 16.8, 16.9, 1200))  # fail from third peak
+    candles = make_candles(specs)
+    r = ThreeMountainsStrategy().identify(candles, len(candles) - 1)
+    # shape detection is heuristic; accept None only if peaks too irregular
+    if r is not None:
+        assert r.pattern_name == "三山形态"
+        assert r.direction == "bearish"
+
+

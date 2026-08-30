@@ -786,6 +786,166 @@ class FallingWindowRetestStrategy(PatternStrategy):
         return None
 
 
+class BullishSpringboardStrategy(PatternStrategy):
+    """破低反涨：刺破近期支撑后收盘重新站上（第十一章）。"""
+
+    def window_size(self) -> int:
+        return 12
+
+    def identify(self, candles: List[Candle], index: int) -> Optional[PatternResult]:
+        from app.core.western_levels import detect_springboard
+
+        hit = detect_springboard(candles, index)
+        if not hit or hit[0] != "破低反涨":
+            return None
+        _, _, level = hit
+        score = min(100.0, 58.0 + evaluate_trend(candles, index) + 8.0)
+        return PatternResult(
+            "破低反涨",
+            "bullish",
+            score,
+            index,
+            score_to_level(score),
+            details={"level": level},
+        )
+
+
+class BearishSpringboardStrategy(PatternStrategy):
+    """破高反跌：刺破近期阻力后收盘重新压回（第十一章）。"""
+
+    def window_size(self) -> int:
+        return 12
+
+    def identify(self, candles: List[Candle], index: int) -> Optional[PatternResult]:
+        from app.core.western_levels import detect_springboard
+
+        hit = detect_springboard(candles, index)
+        if not hit or hit[0] != "破高反跌":
+            return None
+        _, _, level = hit
+        score = min(100.0, 58.0 + evaluate_trend(candles, index) + 8.0)
+        return PatternResult(
+            "破高反跌",
+            "bearish",
+            score,
+            index,
+            score_to_level(score),
+            details={"level": level},
+        )
+
+
+class RoundedTopStrategy(PatternStrategy):
+    """圆形顶部：高点呈拱形回落，末端收阴确认（第六章）。"""
+
+    def window_size(self) -> int:
+        return 12
+
+    def identify(self, candles: List[Candle], index: int) -> Optional[PatternResult]:
+        if index < 11:
+            return None
+        win = candles[index - 11 : index + 1]
+        highs = [c.high for c in win]
+        peak_i = max(range(len(highs)), key=lambda i: highs[i])
+        if peak_i < 3 or peak_i > len(win) - 4:
+            return None
+        left = highs[: peak_i + 1]
+        right = highs[peak_i:]
+        # 左升右降的拱形
+        if left[-1] <= left[0] * 1.01:
+            return None
+        if right[-1] >= right[0] * 0.995:
+            return None
+        # 右侧逐步走低
+        if sum(1 for i in range(1, len(right)) if right[i] <= right[i - 1] * 1.005) < len(right) - 2:
+            return None
+        c = candles[index]
+        if c.is_bullish or c.close > win[peak_i].high * 0.97:
+            return None
+        if not is_uptrend(candles, index - 8):
+            return None
+        score = min(100.0, 55.0 + evaluate_trend(candles, index) + 8.0)
+        return PatternResult("圆形顶部", "bearish", score, index, score_to_level(score))
+
+
+class FryingPanBottomStrategy(PatternStrategy):
+    """平底锅底部（圆形底）：低点呈碗形抬升，末端收阳确认（第六章）。"""
+
+    def window_size(self) -> int:
+        return 12
+
+    def identify(self, candles: List[Candle], index: int) -> Optional[PatternResult]:
+        if index < 11:
+            return None
+        win = candles[index - 11 : index + 1]
+        lows = [c.low for c in win]
+        trough_i = min(range(len(lows)), key=lambda i: lows[i])
+        if trough_i < 3 or trough_i > len(win) - 4:
+            return None
+        left = lows[: trough_i + 1]
+        right = lows[trough_i:]
+        if left[-1] >= left[0] * 0.99:
+            return None
+        if right[-1] <= right[0] * 1.005:
+            return None
+        if sum(1 for i in range(1, len(right)) if right[i] >= right[i - 1] * 0.995) < len(right) - 2:
+            return None
+        c = candles[index]
+        if not c.is_bullish or c.close < win[trough_i].low * 1.03:
+            return None
+        if not is_downtrend(candles, index - 8):
+            return None
+        score = min(100.0, 55.0 + evaluate_trend(candles, index) + 8.0)
+        return PatternResult("平底锅底部", "bullish", score, index, score_to_level(score))
+
+
+class ThreeMountainsStrategy(PatternStrategy):
+    """三山形态：三个相近高点后回落，日式三重顶（第六章）。"""
+
+    def window_size(self) -> int:
+        return 25
+
+    def identify(self, candles: List[Candle], index: int) -> Optional[PatternResult]:
+        if index < 20:
+            return None
+        # 在近 25 根内找三个局部高点，高度接近，且当前收盘已从第三峰回落
+        start = index - 24
+        peaks: list[tuple[int, float]] = []
+        for i in range(start + 2, index - 1):
+            h = candles[i].high
+            if h >= candles[i - 1].high and h >= candles[i - 2].high and h >= candles[i + 1].high:
+                if not peaks or i - peaks[-1][0] >= 3:
+                    peaks.append((i, h))
+                elif h > peaks[-1][1]:
+                    peaks[-1] = (i, h)
+        if len(peaks) < 3:
+            return None
+        p1, p2, p3 = peaks[-3], peaks[-2], peaks[-1]
+        avg_h = (p1[1] + p2[1] + p3[1]) / 3
+        if avg_h <= 0:
+            return None
+        if max(abs(p1[1] - avg_h), abs(p2[1] - avg_h), abs(p3[1] - avg_h)) / avg_h > 0.025:
+            return None
+        # 峰间有回撤
+        mid1 = min(c.low for c in candles[p1[0] : p2[0] + 1])
+        mid2 = min(c.low for c in candles[p2[0] : p3[0] + 1])
+        if mid1 > avg_h * 0.97 or mid2 > avg_h * 0.97:
+            return None
+        c = candles[index]
+        if c.close > p3[1] * 0.985:
+            return None
+        if index - p3[0] > 6:
+            return None
+        score = min(100.0, 58.0 + evaluate_trend(candles, index) + 10.0)
+        return PatternResult(
+            "三山形态",
+            "bearish",
+            score,
+            index,
+            score_to_level(score),
+            details={"peaks": [p1[1], p2[1], p3[1]]},
+        )
+
+
 NISON_STRATEGIES: List[PatternStrategy] = [
     HaramiCrossStrategy(),
     PiercingStrategy(),
@@ -816,4 +976,9 @@ NISON_STRATEGIES: List[PatternStrategy] = [
     TowerTopStrategy(),
     AdvanceBlockStrategy(),
     StalledPatternStrategy(),
+    BullishSpringboardStrategy(),
+    BearishSpringboardStrategy(),
+    RoundedTopStrategy(),
+    FryingPanBottomStrategy(),
+    ThreeMountainsStrategy(),
 ]

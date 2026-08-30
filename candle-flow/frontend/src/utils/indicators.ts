@@ -138,3 +138,74 @@ export function calcAtr(data: KlineItem[], period = 14): { time: string; value: 
   }
   return rows
 }
+
+export type StochPoint = { time: string; k: number; d: number }
+
+/** 慢速随机指标 Stochastic(14,3) */
+export function calcStoch(data: KlineItem[], kPeriod = 14, dPeriod = 3): StochPoint[] {
+  if (data.length < kPeriod + dPeriod - 1) return []
+  const rawK: { time: string; k: number }[] = []
+  for (let i = kPeriod - 1; i < data.length; i++) {
+    let hh = -Infinity
+    let ll = Infinity
+    for (let j = i - kPeriod + 1; j <= i; j++) {
+      hh = Math.max(hh, Number(data[j].high))
+      ll = Math.min(ll, Number(data[j].low))
+    }
+    const close = Number(data[i].close)
+    const k = hh <= ll ? 50 : (100 * (close - ll)) / (hh - ll)
+    rawK.push({ time: barTime(data[i]), k })
+  }
+  const rows: StochPoint[] = []
+  for (let i = dPeriod - 1; i < rawK.length; i++) {
+    let sum = 0
+    for (let j = i - dPeriod + 1; j <= i; j++) sum += rawK[j].k
+    rows.push({
+      time: rawK[i].time,
+      k: Number(rawK[i].k.toFixed(2)),
+      d: Number((sum / dPeriod).toFixed(2)),
+    })
+  }
+  return rows
+}
+
+export type RetraceLevel = { ratio: number; price: number; label: string }
+
+/** 最近一段升浪/降浪的 38.2/50/61.8% 回撤（第十二章） */
+export function calcRetracements(data: KlineItem[], lookback = 50): RetraceLevel[] {
+  if (data.length < 20) return []
+  const start = Math.max(0, data.length - lookback)
+  const slice = data.slice(start)
+  let hiI = 0
+  let loI = 0
+  let hi = Number(slice[0].high)
+  let lo = Number(slice[0].low)
+  for (let i = 1; i < slice.length; i++) {
+    const h = Number(slice[i].high)
+    const l = Number(slice[i].low)
+    if (h >= hi) {
+      hi = h
+      hiI = i
+    }
+    if (l <= lo) {
+      lo = l
+      loI = i
+    }
+  }
+  const ratios = [0.382, 0.5, 0.618]
+  const out: RetraceLevel[] = []
+  if (hiI > loI && hi > lo) {
+    const span = hi - lo
+    for (const r of ratios) {
+      const price = hi - span * r
+      out.push({ ratio: r, price, label: `${(r * 100).toFixed(1).replace(/\.0$/, '')}% 回撤` })
+    }
+  } else if (loI > hiI && hi > lo) {
+    const span = hi - lo
+    for (const r of ratios) {
+      const price = lo + span * r
+      out.push({ ratio: r, price, label: `${(r * 100).toFixed(1).replace(/\.0$/, '')}% 反弹` })
+    }
+  }
+  return out
+}
