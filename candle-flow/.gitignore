@@ -1,0 +1,16 @@
+backend/data/
+backend/venv/
+frontend/node_modules/
+frontend/dist/
+dist-ref/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+*.db-journal
+scripts/deploy/tunnel-credentials.json
+**/tunnel-credentials.json
+cloudflared*.json
+*.pem
+*.key

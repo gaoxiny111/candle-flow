@@ -1,0 +1,9 @@
+tunnel: f3eb03d8-7017-488e-9176-79377668ea3f
+credentials-file: /etc/cloudflared/f3eb03d8-7017-488e-9176-79377668ea3f.json
+
+ingress:
+  - hostname: candle-flow.online
+    service: http://127.0.0.1:8002
+  - hostname: www.candle-flow.online
+    service: http://127.0.0.1:8002
+  - service: http_status:404

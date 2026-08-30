@@ -1,0 +1,96 @@
+:root {
+  --color-primary: #1890ff;
+  --color-up: #f5222d;
+  --color-down: #52c41a;
+  --bg-dark: #1a1a2e;
+  --bg-light: #ffffff;
+  --bg-page: #f5f7fa;
+  --text-primary: #1f2937;
+  --text-secondary: #6b7280;
+  --border-color: #e5e7eb;
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --font-family: 'Inter', 'PingFang SC', sans-serif;
+}
+
+[data-theme='dark'] {
+  --bg-page: #0f0f1a;
+  --bg-light: #1a1a2e;
+  --text-primary: #e5e7eb;
+  --text-secondary: #9ca3af;
+  --border-color: #374151;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: var(--font-family);
+  background: var(--bg-page);
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+a { color: var(--color-primary); text-decoration: none; }
+
+button {
+  cursor: pointer;
+  border: none;
+  border-radius: 6px;
+  padding: var(--space-sm) var(--space-md);
+  font-family: inherit;
+  font-size: 14px;
+}
+
+.btn-primary {
+  background: var(--color-primary);
+  color: #fff;
+}
+
+.btn-primary:hover { opacity: 0.9; }
+
+.btn-secondary {
+  background: var(--border-color);
+  color: var(--text-primary);
+}
+
+input, select {
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-light);
+  color: var(--text-primary);
+  font-family: inherit;
+}
+
+.card {
+  background: var(--bg-light);
+  border-radius: 8px;
+  border: 1px solid var(--border-color);
+  padding: var(--space-md);
+}
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.badge-bullish { background: #fef2f2; color: var(--color-up); }
+.badge-bearish { background: #f0fdf4; color: var(--color-down); }
+.badge-strong { background: #dbeafe; color: #1d4ed8; }
+.badge-medium { background: #fef3c7; color: #b45309; }
+.badge-weak { background: #f3f4f6; color: #6b7280; }
+
+[data-theme='dark'] .badge-bullish { background: #450a0a; }
+[data-theme='dark'] .badge-bearish { background: #052e16; }
+
+@media (max-width: 768px) {
+  .hide-mobile { display: none !important; }
+  input, select, textarea { font-size: 16px; }
+  .card { padding: var(--space-sm) var(--space-md); }
+}
