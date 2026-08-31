@@ -96,6 +96,40 @@ def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
 
 
+def profit_yoy_eff(row: ScreenRow) -> float | None:
+    """扣非优先：防止一次性收益顶高硬条件与增速分。"""
+    if row.deducted_profit_yoy is not None:
+        return row.deducted_profit_yoy
+    return row.profit_yoy
+
+
+def score_cyclical_extra(row: ScreenRow) -> float:
+    """周期/价值轨附加分（股息 / 现金利润比 / 扣非增速）。"""
+    extra = 0.0
+
+    if row.dividend_yield is not None:
+        extra += min(row.dividend_yield / 8.0, 1.0) * 12
+
+    ocf = row.ocf_ps
+    if ocf is not None and row.eps:
+        r = ocf / row.eps
+        extra += 8 if r >= 0.8 else (5 if r >= 0.6 else 0)
+
+    p = profit_yoy_eff(row)
+    if p is not None:
+        extra += min(max(p, 0.0), 50.0) / 50.0 * 10
+
+    return extra
+
+
+def valuation_flag(row: ScreenRow) -> str | None:
+    """PB 分位 >90 才预警，并区分改善 / 恶化。"""
+    if row.pb_percentile is None or row.pb_percentile <= 90:
+        return None
+    improving = (row.revenue_yoy or -1e9) > 0 or (profit_yoy_eff(row) or -1e9) > 0
+    return "高估+改善·不追高" if improving else "高估+恶化·回避"
+
+
 def roe_series(
     hist_roe: dict[str, dict[str, float]], dates: list[str], sym: str, n: int
 ) -> list[float]:
@@ -144,7 +178,7 @@ def score_growth(row: ScreenRow, th: ScreenThresholds) -> float:
         s += 15
     elif row.roe_years_ok == th.roe_years - 1:
         s += 8
-    growth = max(row.revenue_yoy or -999, row.profit_yoy or -999)
+    growth = max(row.revenue_yoy or -999, profit_yoy_eff(row) or -999)
     if growth > 0:
         s += min(growth, 50) * 0.5
     if row.ocf_ps is not None and row.ocf_ps > 0:
@@ -216,6 +250,7 @@ def score_value_cyclical(row: ScreenRow, th: ScreenThresholds) -> float:
     )
     if row.dividend_yield is not None and row.dividend_yield >= th.dividend_bonus_min:
         s = min(100.0, s + 5)
+    s = s + score_cyclical_extra(row)
     return round(s, 2)
 
 
@@ -283,17 +318,30 @@ def build_checks_growth(row: ScreenRow, th: ScreenThresholds) -> list[CheckItem]
             f"近{row.roe_years_ok}年达标" + (f"；最新 {row.roe:.1f}%" if row.roe is not None else ""),
         )
     ]
+    py = profit_yoy_eff(row)
     growth_ok = (row.revenue_yoy is not None and row.revenue_yoy >= th.growth_min) or (
-        row.profit_yoy is not None and row.profit_yoy >= th.growth_min
+        py is not None and py >= th.growth_min
     )
+    if row.deducted_profit_yoy is not None:
+        growth_detail = (
+            f"营收 {row.revenue_yoy}% / 扣非 {row.deducted_profit_yoy}%"
+            if row.revenue_yoy is not None or row.deducted_profit_yoy is not None
+            else "无增速数据"
+        )
+        if row.profit_yoy is not None:
+            growth_detail += f"（表观净利 {row.profit_yoy}%）"
+    else:
+        growth_detail = (
+            f"营收 {row.revenue_yoy}% / 净利 {row.profit_yoy}%"
+            if row.revenue_yoy is not None or row.profit_yoy is not None
+            else "无增速数据"
+        )
     checks.append(
         CheckItem(
             "growth",
-            f"营收或净利增速≥{th.growth_min}%",
+            f"营收或净利增速≥{th.growth_min}%（扣非优先）",
             growth_ok,
-            f"营收 {row.revenue_yoy}% / 净利 {row.profit_yoy}%"
-            if row.revenue_yoy is not None or row.profit_yoy is not None
-            else "无增速数据",
+            growth_detail,
         )
     )
     ocf_ok = (not th.require_ocf_positive) or (row.ocf_ps is not None and row.ocf_ps > 0)
@@ -370,16 +418,35 @@ def build_checks(row: ScreenRow, th: ScreenThresholds) -> list[CheckItem]:
     return build_checks_growth(row, th)
 
 
+def cash_ratio(row: ScreenRow) -> float | None:
+    """每股经营现金流 / 基本 EPS（同一报告期）。"""
+    if row.ocf_ps is None or row.eps is None or abs(row.eps) < 1e-12:
+        return None
+    return row.ocf_ps / row.eps
+
+
+def is_cash_stabilizer(row: ScreenRow) -> bool:
+    """高现金利润比的周期/价值「稳定器」特征。"""
+    r = cash_ratio(row)
+    return bool(row.track in ("cyclical", "value") and r is not None and r >= 1.5)
+
+
 def verdict(row: ScreenRow) -> tuple[str, str]:
-    if row.roe is None and row.roe_avg is None and row.revenue_yoy is None and row.profit_yoy is None:
+    if (
+        row.roe is None
+        and row.roe_avg is None
+        and row.revenue_yoy is None
+        and profit_yoy_eff(row) is None
+    ):
         return "无财报数据", "na"
     hard_ok = row.passed_hard
-    strong_cut = 55 if row.track in ("cyclical", "value") else 40
-    mid_cut = 35 if row.track in ("cyclical", "value") else 25
+    strong_cut = 40
+    mid_cut = 25
     tag = TRACK_LABEL.get(row.track, "")
     suffix = f"（{tag}）" if tag else ""
     if hard_ok and row.score >= strong_cut:
-        return f"基本面偏强{suffix}", "strong"
+        stab = "·稳定器" if is_cash_stabilizer(row) else ""
+        return f"基本面偏强{stab}{suffix}", "strong"
     if hard_ok or row.score >= mid_cut:
         return f"基本面一般{suffix}", "mid"
     return f"基本面偏弱{suffix}", "weak"
@@ -398,16 +465,21 @@ def enrich_track_metrics(
     n = th.cyclical_roe_years
     roes = roe_series(hist_roe, dates, row.symbol, n)
     m = _mean(roes)
-    row.roe_avg = round(m, 2) if m is not None else None
+    if m is not None:
+        row.roe_avg = round(m, 2)
     profits = profit_series(hist_profit, dates, row.symbol, max(n, 5))
     ok, loss_n, _ = no_consec_loss(profits[:n])
-    row.no_consec_loss = ok
-    row.loss_years = loss_n
+    if ok is not None:
+        row.no_consec_loss = ok
+        row.loss_years = loss_n
     known = [p for p in profits if p is not None]
-    row.profit_cv = _cv(known) if len(known) >= 2 else None
-    row.profit_positive_years = sum(1 for p in known if p > 0)
+    if len(known) >= 2:
+        row.profit_cv = _cv(known)
+    if known:
+        row.profit_positive_years = sum(1 for p in known if p > 0)
     row.checks = build_checks(row, th)
     row.score = score_row(row, th)
+    row.valuation_flag = valuation_flag(row)
 
 
 def metrics_line(row: ScreenRow) -> str:
@@ -416,7 +488,7 @@ def metrics_line(row: ScreenRow) -> str:
     if tag:
         parts.append(tag)
     if row.track in ("cyclical", "value") and row.roe_avg is not None:
-        parts.append(f"ROE均 {row.roe_avg:.1f}%")
+        parts.append(f"ROE均 {row.roe_avg:.1f}%(3Y)")
     elif row.roe is not None:
         parts.append(f"ROE {row.roe:.1f}%")
         if row.roe_years_ok:
@@ -427,10 +499,26 @@ def metrics_line(row: ScreenRow) -> str:
     if row.profit_yoy is not None:
         sign = "+" if row.profit_yoy > 0 else ""
         parts.append(f"净利{sign}{row.profit_yoy:.1f}%")
+    if row.deducted_profit_yoy is not None:
+        sign = "+" if row.deducted_profit_yoy > 0 else ""
+        parts.append(f"扣非{sign}{row.deducted_profit_yoy:.1f}%")
     if row.debt_ratio is not None:
         parts.append(f"负债{row.debt_ratio:.0f}%")
     if row.dividend_yield is not None:
         parts.append(f"股息{row.dividend_yield:.1f}%")
+    cr = cash_ratio(row)
+    if cr is not None:
+        parts.append(f"现金比{cr:.0%}")
     if row.peg is not None and row.track == "growth":
         parts.append(f"PEG {row.peg:.2f}")
+    rd = str(row.report_date or "")
+    if len(rd) == 8 and rd.isdigit():
+        pl = {"0331": f"{rd[:4]}Q1", "0630": f"{rd[:4]}H1", "0930": f"{rd[:4]}Q3", "1231": f"{rd[:4]}A"}.get(
+            rd[4:]
+        )
+        if pl:
+            parts.append(pl)
+    flag = row.valuation_flag if row.valuation_flag is not None else valuation_flag(row)
+    if flag:
+        parts.append("⚠" + flag)
     return " · ".join(parts) if parts else "—"

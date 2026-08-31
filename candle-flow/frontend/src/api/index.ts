@@ -572,7 +572,9 @@ export interface WatchFundamental {
   roe_years_ok: number
   revenue_yoy: number | null
   profit_yoy: number | null
+  deducted_profit_yoy?: number | null
   ocf_ps: number | null
+  eps?: number | null
   debt_ratio: number | null
   pe_ttm: number | null
   pb: number | null
@@ -582,6 +584,7 @@ export interface WatchFundamental {
   track?: 'growth' | 'cyclical' | 'value' | string
   track_label?: string
   dividend_yield?: number | null
+  valuation_flag?: string | null
   checks: FundamentalCheck[]
   notes: string
   verdict: string

@@ -145,7 +145,9 @@ class ScreenRow:
     roe_years_ok: int = 0
     revenue_yoy: float | None = None
     profit_yoy: float | None = None
-    ocf_ps: float | None = None
+    deducted_profit_yoy: float | None = None  # 扣非净利同比 (%)
+    ocf_ps: float | None = None  # 每股经营现金流 (元)；别名 ocf_per_share
+    eps: float | None = None  # 基本 EPS (元)
     debt_ratio: float | None = None
     pe_ttm: float | None = None
     pb: float | None = None
@@ -161,10 +163,15 @@ class ScreenRow:
     roe_avg: float | None = None
     no_consec_loss: bool | None = None
     loss_years: int = 0
-    dividend_yield: float | None = None
+    dividend_yield: float | None = None  # 股息率 TTM (%)
     profit_cv: float | None = None
     profit_positive_years: int = 0
     revenue: float | None = None
+    valuation_flag: str | None = None
+
+    @property
+    def ocf_per_share(self) -> float | None:
+        return self.ocf_ps
 
     @property
     def passed_hard(self) -> bool:
@@ -173,6 +180,175 @@ class ScreenRow:
         keys = hard_keys_for(self.track)
         hard = {c.key for c in self.checks if c.key in keys and c.ok}
         return keys.issubset(hard)
+
+
+# B 股等覆盖不稳定时的人工兜底：只在自动数据缺失时生效（key=6 位代码）
+# 增速/每股指标优先用最新季报 yjbb，勿在此硬编码以免盖住真值
+MANUAL_OVERRIDE: dict[str, dict[str, Any]] = {
+    "900948": {
+        "dividend_yield_ttm": 9.5,  # B 股股息率源不稳定时兜底
+    },
+}
+
+_FIN_EXTRAS_CACHE: dict[str, tuple[float, dict[str, float | None]]] = {}
+_FIN_EXTRAS_TTL = 24 * 3600
+
+
+def _symbol_code6(symbol: str) -> str:
+    s = str(symbol or "").strip().upper()
+    if "." in s:
+        s = s.split(".", 1)[0]
+    return _code6(s)
+
+
+def _fill_extras(row: ScreenRow, fin: dict[str, Any], symbol: str = "") -> None:
+    """构建 ScreenRow 后、算 checks/score 前调用。缺失字段不覆盖已有值。"""
+    code = _symbol_code6(symbol or row.symbol)
+    merged = dict(fin)
+    for k, v in MANUAL_OVERRIDE.get(code, {}).items():
+        if merged.get(k) is None:
+            merged[k] = v
+
+    if row.deducted_profit_yoy is None:
+        row.deducted_profit_yoy = _num(merged.get("deducted_profit_yoy"))
+    if row.dividend_yield is None:
+        row.dividend_yield = _num(merged.get("dividend_yield_ttm"))
+    if row.ocf_ps is None:
+        row.ocf_ps = _num(merged.get("ocf_per_share"))
+    if row.eps is None:
+        row.eps = _num(merged.get("eps"))
+    if row.pb_percentile is None:
+        row.pb_percentile = _num(merged.get("pb_percentile"))
+    if row.roe is None:
+        row.roe = _num(merged.get("roe"))
+    if row.roe_avg is None:
+        row.roe_avg = _num(merged.get("roe_avg"))
+    if row.debt_ratio is None:
+        row.debt_ratio = _num(merged.get("debt_ratio"))
+    if row.revenue_yoy is None:
+        row.revenue_yoy = _num(merged.get("revenue_yoy"))
+    if row.profit_yoy is None:
+        row.profit_yoy = _num(merged.get("profit_yoy"))
+    if row.no_consec_loss is None and merged.get("no_consec_loss") is not None:
+        row.no_consec_loss = bool(merged.get("no_consec_loss"))
+    if not row.industry and merged.get("industry"):
+        row.industry = str(merged.get("industry"))
+    if not row.name and merged.get("name"):
+        row.name = str(merged.get("name"))
+
+
+def _fetch_fin_extras(
+    symbol: str, *, prefer_date: str | None = None
+) -> dict[str, float | None]:
+    """
+    尽力拉取扣非同比 / EPS / 每股经营现金流。
+    扣非同比要求「同期对比」（如同为 6-30）；prefer_date=YYYYMMDD 时优先对齐该报告期。
+    """
+    import time
+    from datetime import datetime as _dt
+
+    code = _symbol_code6(symbol)
+    if not code or not code.isdigit():
+        return {}
+    cache_key = f"{code}:{prefer_date or ''}"
+    now = time.time()
+    hit = _FIN_EXTRAS_CACHE.get(cache_key)
+    if hit and now - hit[0] < _FIN_EXTRAS_TTL:
+        return dict(hit[1])
+
+    out: dict[str, float | None] = {
+        "deducted_profit_yoy": None,
+        "eps": None,
+        "ocf_per_share": None,
+    }
+    try:
+        import akshare as ak
+
+        df = ak.stock_financial_analysis_indicator(symbol=code)
+        if df is None or df.empty:
+            _FIN_EXTRAS_CACHE[cache_key] = (now, out)
+            return dict(out)
+
+        date_col = df.columns[0]
+        col_ded = "扣除非经常性损益后的净利润(元)"
+        col_eps = "加权每股收益(元)" if "加权每股收益(元)" in df.columns else "摊薄每股收益(元)"
+        col_ocf = "每股经营性现金流(元)"
+
+        rows: list[tuple[_dt, Any]] = []
+        for _, r in df.iterrows():
+            raw_d = r.get(date_col)
+            try:
+                if hasattr(raw_d, "year"):
+                    dt = _dt(int(raw_d.year), int(raw_d.month), int(raw_d.day))
+                else:
+                    dt = _dt.strptime(str(raw_d)[:10], "%Y-%m-%d")
+            except Exception:
+                continue
+            rows.append((dt, r))
+        rows.sort(key=lambda x: x[0], reverse=True)
+        if not rows:
+            _FIN_EXTRAS_CACHE[cache_key] = (now, out)
+            return dict(out)
+
+        prefer_mmdd = None
+        prefer_y = None
+        if prefer_date and len(prefer_date) == 8 and prefer_date.isdigit():
+            prefer_y = int(prefer_date[:4])
+            prefer_mmdd = (int(prefer_date[4:6]), int(prefer_date[6:8]))
+
+        latest_dt, latest_r = rows[0]
+        if prefer_mmdd:
+            matched = [
+                (dt, r)
+                for dt, r in rows
+                if (dt.month, dt.day) == prefer_mmdd and (prefer_y is None or dt.year <= prefer_y)
+            ]
+            if matched:
+                latest_dt, latest_r = matched[0]
+
+        # 每股指标以 yjbb 为准；这里仅在调用方缺失时作补充，故仍填
+        if col_eps in df.columns:
+            out["eps"] = _num(latest_r.get(col_eps))
+        if col_ocf in df.columns:
+            out["ocf_per_share"] = _num(latest_r.get(col_ocf))
+
+        if col_ded in df.columns:
+            a = _num(latest_r.get(col_ded))
+            prior = None
+            for dt, r in rows:
+                if dt >= latest_dt:
+                    continue
+                if dt.month == latest_dt.month and dt.day == latest_dt.day:
+                    prior = _num(r.get(col_ded))
+                    break
+            if a is not None and prior is not None and abs(prior) > 1e-9:
+                out["deducted_profit_yoy"] = round((a - prior) / abs(prior) * 100.0, 2)
+    except Exception as e:
+        logger.debug("fin extras %s failed: %s", code, e)
+
+    _FIN_EXTRAS_CACHE[cache_key] = (now, out)
+    return dict(out)
+
+
+def resolve_latest_report_frame(
+    today: date | None = None,
+) -> tuple[str | None, pd.DataFrame]:
+    """最新可用业绩快报（优先中报/季报，再回落到年报）。"""
+    for d in recent_quarter_ends(8, today=today):
+        df = _fetch_yjbb(d)
+        if df is not None and not df.empty:
+            logger.info("latest snapshot yjbb %s rows=%s", d, len(df))
+            return d, df
+    return None, pd.DataFrame()
+
+
+def report_period_label(report_date: str) -> str:
+    """Human label for YYYYMMDD report date."""
+    s = str(report_date or "")
+    if len(s) != 8 or not s.isdigit():
+        return s or ""
+    y, md = s[:4], s[4:]
+    return {"0331": f"{y}Q1", "0630": f"{y}H1", "0930": f"{y}Q3", "1231": f"{y}A"}.get(md, s)
 
 
 HARD_KEYS_GROWTH = frozenset({"roe_streak", "growth", "ocf"})
@@ -758,10 +934,42 @@ def _fetch_debt_map(report_date: str) -> dict[str, float]:
 
 
 def _peg(pe: float | None, profit_yoy: float | None) -> float | None:
-    """PEG = PE / 净利同比增速(百分数，如 20 表示 20%)。"""
+    """PEG = PE / 净利同比增速(百分数，如 20 表示 20%)。优先用扣非增速。"""
     if pe is None or pe <= 0 or profit_yoy is None or profit_yoy <= 0:
         return None
     return round(pe / profit_yoy, 2)
+
+
+def _fin_dict_from_yjbb(raw: Any, v: dict[str, Any] | None = None) -> dict[str, Any]:
+    v = v or {}
+    return {
+        "deducted_profit_yoy": None,
+        "dividend_yield_ttm": _num(v.get("dividend_yield")),
+        "ocf_per_share": _num(raw.get("每股经营现金流量")) if raw is not None else None,
+        "eps": _num(raw.get("每股收益")) if raw is not None else None,
+        "pb_percentile": _num(v.get("pb_percentile")),
+    }
+
+
+def _apply_row_extras(row: ScreenRow, fin: dict[str, Any], *, fetch: bool = False) -> None:
+    """Merge yjbb/valuation + optional remote extras + MANUAL_OVERRIDE, then PEG."""
+    from app.services.fundamental_tracks import profit_yoy_eff
+
+    merged = dict(fin)
+    code = _symbol_code6(row.symbol)
+    # B 股财务指标接口不稳定，跳过远程拉数，依赖 yjbb/估值/MANUAL_OVERRIDE
+    do_fetch = fetch and not code.startswith(("9", "2"))
+    if do_fetch and merged.get("deducted_profit_yoy") is None:
+        try:
+            remote = _fetch_fin_extras(row.symbol, prefer_date=row.report_date)
+            # 只补扣非；每股指标以同报告期 yjbb 为准，避免年报/中报混用
+            if merged.get("deducted_profit_yoy") is None and remote.get("deducted_profit_yoy") is not None:
+                merged["deducted_profit_yoy"] = remote["deducted_profit_yoy"]
+        except Exception as e:
+            logger.debug("extras fetch skipped for %s: %s", row.symbol, e)
+    _fill_extras(row, merged, row.symbol)
+    row.peg = _peg(row.pe_ttm, profit_yoy_eff(row))
+
 
 
 def _score(row: ScreenRow, th: ScreenThresholds) -> float:
@@ -868,6 +1076,7 @@ def screen_fundamentals(
         rev = _num(row.get("营业总收入-同比增长"))
         profit = _num(row.get("净利润-同比增长"))
         ocf = _num(row.get("每股经营现金流量"))
+        eps = _num(row.get("每股收益"))
         years_ok = 0
         for d in dates:
             r = hist_roe.get(d, {}).get(sym)
@@ -887,6 +1096,7 @@ def screen_fundamentals(
             revenue_yoy=rev,
             profit_yoy=profit,
             ocf_ps=ocf,
+            eps=eps,
             debt_ratio=debt_map.get(sym),
         )
         # Hard prefilter before valuation (keep list manageable)
@@ -926,7 +1136,17 @@ def screen_fundamentals(
             r.pb_percentile = _num(v.get("pb_percentile"))
             r.price = _num(v.get("price"))
             r.change_pct = _num(v.get("change_pct"))
-            r.peg = _peg(r.pe_ttm, r.profit_yoy)
+            _apply_row_extras(
+                r,
+                {
+                    "deducted_profit_yoy": None,
+                    "dividend_yield_ttm": _num(v.get("dividend_yield")),
+                    "ocf_per_share": r.ocf_ps,
+                    "eps": r.eps,
+                    "pb_percentile": r.pb_percentile,
+                },
+                fetch=False,
+            )
 
     # Soft valuation filter: keep if PE/PB pct unknown OR under threshold
     from app.services.fundamental_tracks import enrich_track_metrics
@@ -1147,7 +1367,8 @@ def analyze_symbols(
         return {"report_dates": [], "items": []}
 
     dates, frames = resolve_report_frames(max(th.roe_years, 5))
-    if not dates:
+    snap_date, snap_df = resolve_latest_report_frame()
+    if not dates and (snap_df is None or snap_df.empty):
         return {
             "report_dates": [],
             "items": [
@@ -1179,11 +1400,14 @@ def analyze_symbols(
             ],
         }
 
-    latest = dates[0]
-    base_df = frames.get(latest)
-    if base_df is None:
-        base_df = pd.DataFrame()
-    base_index = _index_yjbb(base_df)
+    # 增速/每股指标用「最新报告期」（中报优先）；ROE 连年/均值仍用年报序列
+    if snap_df is None or snap_df.empty:
+        snap_date = dates[0] if dates else None
+        snap_df = frames.get(snap_date) if snap_date else pd.DataFrame()
+        if snap_df is None:
+            snap_df = pd.DataFrame()
+    latest = snap_date or (dates[0] if dates else "")
+    base_index = _index_yjbb(snap_df)
     hist_roe: dict[str, dict[str, float]] = {d: {} for d in dates}
     hist_profit: dict[str, dict[str, float]] = {d: {} for d in dates}
     for d, df in frames.items():
@@ -1200,6 +1424,8 @@ def analyze_symbols(
             np_ = _num(row.get("净利润"))
             if np_ is None:
                 np_ = _num(row.get("归母净利润"))
+            if np_ is None:
+                np_ = _num(row.get("净利润-净利润"))
             if np_ is not None:
                 hist_profit[d][sym] = np_
 
@@ -1214,35 +1440,77 @@ def analyze_symbols(
     from app.services.fundamental_tracks import enrich_track_metrics
 
     theme_ids = list(THEME_KEYWORDS.keys())
+    period_tag = report_period_label(latest)
     items: list[dict[str, Any]] = []
     for sym in wanted:
         raw = base_index.get(sym)
         v = vals.get(sym) or {}
         if raw is None:
+            # B 股等可能无年报覆盖：仍尝试 manual override / 估值
+            row = ScreenRow(
+                symbol=sym,
+                name=str(v.get("name") or ""),
+                industry="",
+                themes=[],
+                report_date=latest,
+                debt_ratio=debt_map.get(sym),
+                pe_ttm=_num(v.get("pe_ttm")),
+                pb=_num(v.get("pb")),
+                pe_percentile=_num(v.get("pe_percentile")),
+                pb_percentile=_num(v.get("pb_percentile")),
+                price=_num(v.get("price")),
+                change_pct=_num(v.get("change_pct")),
+                dividend_yield=_num(v.get("dividend_yield")),
+            )
+            _apply_row_extras(row, _fin_dict_from_yjbb(None, v), fetch=False)
+            enrich_track_metrics(
+                row, th=th, hist_roe=hist_roe, hist_profit=hist_profit, dates=dates
+            )
+            label, tone = _verdict(row)
+            has_any = (
+                row.roe is not None
+                or row.roe_avg is not None
+                or row.revenue_yoy is not None
+                or row.profit_yoy is not None
+                or row.deducted_profit_yoy is not None
+                or row.dividend_yield is not None
+            )
             items.append(
                 {
-                    "symbol": sym,
-                    "name": str(v.get("name") or ""),
-                    "industry": "",
+                    "symbol": row.symbol,
+                    "name": row.name,
+                    "industry": row.industry,
                     "report_date": latest,
-                    "score": 0,
-                    "roe": None,
-                    "roe_years_ok": 0,
-                    "revenue_yoy": None,
-                    "profit_yoy": None,
-                    "ocf_ps": None,
-                    "debt_ratio": debt_map.get(sym),
-                    "pe_ttm": _num(v.get("pe_ttm")),
-                    "pb": _num(v.get("pb")),
-                    "pe_percentile": _num(v.get("pe_percentile")),
-                    "pb_percentile": _num(v.get("pb_percentile")),
-                    "peg": None,
-                    "track": sector_classify("", name=str(v.get("name") or ""), symbol=sym),
-                    "checks": [],
-                    "notes": "业绩快报未覆盖该标的（可能为 B 股/新股）",
-                    "verdict": "无财报数据",
-                    "verdict_tone": "na",
-                    "metrics": "—",
+                    "report_period": period_tag,
+                    "score": row.score,
+                    "roe": row.roe,
+                    "roe_avg": row.roe_avg,
+                    "roe_years_ok": row.roe_years_ok,
+                    "revenue_yoy": row.revenue_yoy,
+                    "profit_yoy": row.profit_yoy,
+                    "deducted_profit_yoy": row.deducted_profit_yoy,
+                    "ocf_ps": row.ocf_ps,
+                    "eps": row.eps,
+                    "debt_ratio": row.debt_ratio,
+                    "pe_ttm": row.pe_ttm,
+                    "pb": row.pb,
+                    "pe_percentile": row.pe_percentile,
+                    "pb_percentile": row.pb_percentile,
+                    "peg": row.peg,
+                    "track": row.track,
+                    "track_label": TRACK_LABEL.get(row.track, row.track),
+                    "dividend_yield": row.dividend_yield,
+                    "valuation_flag": row.valuation_flag,
+                    "checks": [
+                        {"key": c.key, "label": c.label, "ok": c.ok, "detail": c.detail}
+                        for c in row.checks
+                    ],
+                    "notes": "业绩快报未覆盖该标的（可能为 B 股/新股）；已套用可得估值与人工兜底字段"
+                    if has_any
+                    else "业绩快报未覆盖该标的（可能为 B 股/新股）",
+                    "verdict": label if has_any else "无财报数据",
+                    "verdict_tone": tone if has_any else "na",
+                    "metrics": _metrics_line(row) if has_any else "—",
                 }
             )
             continue
@@ -1252,7 +1520,10 @@ def analyze_symbols(
         rev = _num(raw.get("营业总收入-同比增长"))
         profit = _num(raw.get("净利润-同比增长"))
         ocf = _num(raw.get("每股经营现金流量"))
+        eps = _num(raw.get("每股收益"))
         revenue = _num(raw.get("营业总收入"))
+        if revenue is None:
+            revenue = _num(raw.get("营业总收入-营业总收入"))
         years_ok = 0
         for d in dates:
             r = hist_roe.get(d, {}).get(sym)
@@ -1272,6 +1543,7 @@ def analyze_symbols(
             revenue_yoy=rev,
             profit_yoy=profit,
             ocf_ps=ocf,
+            eps=eps,
             debt_ratio=debt_map.get(sym),
             pe_ttm=_num(v.get("pe_ttm")),
             pb=_num(v.get("pb")),
@@ -1282,18 +1554,22 @@ def analyze_symbols(
             dividend_yield=_num(v.get("dividend_yield")),
             revenue=revenue,
         )
-        row.peg = _peg(row.pe_ttm, row.profit_yoy)
+        _apply_row_extras(row, _fin_dict_from_yjbb(raw, v), fetch=True)
         enrich_track_metrics(
             row, th=th, hist_roe=hist_roe, hist_profit=hist_profit, dates=dates
         )
         label, tone = _verdict(row)
         notes = []
+        if period_tag:
+            notes.append(f"增速口径 {period_tag}")
         if not row.passed_hard:
             notes.append(f"{TRACK_LABEL.get(row.track, row.track)}硬条件未全过")
         if row.pe_percentile is not None and row.pe_percentile >= th.pe_pct_max:
             notes.append("PE 分位偏高")
         if row.pb_percentile is not None and row.pb_percentile >= th.pb_pct_max:
             notes.append("PB 分位偏高")
+        if row.valuation_flag:
+            notes.append(row.valuation_flag)
         items.append(
             {
                 "symbol": row.symbol,
@@ -1301,13 +1577,16 @@ def analyze_symbols(
                 "industry": row.industry,
                 "themes": list(row.themes),
                 "report_date": row.report_date,
+                "report_period": period_tag,
                 "score": row.score,
                 "roe": row.roe,
                 "roe_avg": row.roe_avg,
                 "roe_years_ok": row.roe_years_ok,
                 "revenue_yoy": row.revenue_yoy,
                 "profit_yoy": row.profit_yoy,
+                "deducted_profit_yoy": row.deducted_profit_yoy,
                 "ocf_ps": row.ocf_ps,
+                "eps": row.eps,
                 "debt_ratio": row.debt_ratio,
                 "pe_ttm": row.pe_ttm,
                 "pb": row.pb,
@@ -1317,6 +1596,7 @@ def analyze_symbols(
                 "track": row.track,
                 "track_label": TRACK_LABEL.get(row.track, row.track),
                 "dividend_yield": row.dividend_yield,
+                "valuation_flag": row.valuation_flag,
                 "checks": [
                     {"key": c.key, "label": c.label, "ok": c.ok, "detail": c.detail} for c in row.checks
                 ],
@@ -1327,7 +1607,8 @@ def analyze_symbols(
             }
         )
 
-    return {"report_dates": dates, "items": items}
+    out_dates = [latest] + [d for d in dates if d != latest]
+    return {"report_dates": out_dates, "items": items}
 
 
 def themes_catalog() -> list[dict[str, Any]]:
