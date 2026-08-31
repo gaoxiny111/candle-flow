@@ -24,12 +24,15 @@ from app.utils.symbol import (
 
 logger = logging.getLogger(__name__)
 
-SINA_SUGGEST_URL = "https://suggest3.sinajs.cn/suggest/type=11,12,13&key={key}"
+SINA_SUGGEST_URL = "https://suggest3.sinajs.cn/suggest/type=11,12,13,22&key={key}"
 REFRESH_TTL = timedelta(hours=24)
 _refresh_lock = threading.Lock()
 _last_refresh: datetime | None = None
 
 _MARKET_CODE = re.compile(r"^(sh|sz)(\d{6})$", re.I)
+_OF_CODE = re.compile(r"^of(\d{6})$", re.I)
+# 11/12/13 股票，22 场内基金/ETF
+_SINA_KINDS = {"11", "12", "13", "22"}
 
 
 def code_to_symbol(code: str, market: str | None = None) -> str | None:
@@ -67,14 +70,19 @@ def parse_sina_suggest(text: str) -> list[dict]:
             continue
         kind = parts[1] if len(parts) > 1 else ""
         code = parts[2] if len(parts) > 2 else ""
-        if kind not in ("11", "12", "13"):
+        if kind not in _SINA_KINDS:
             continue
-        market_token = next((p for p in parts if _MARKET_CODE.match(p)), "")
+        market_token = next((p for p in parts if _MARKET_CODE.match(p) or _OF_CODE.match(p)), "")
         m = _MARKET_CODE.match(market_token)
         if m:
             market, code = m.group(1).lower(), m.group(2)
         else:
-            market = None
+            ofm = _OF_CODE.match(market_token)
+            if ofm:
+                code = ofm.group(1)
+                market = None
+            else:
+                market = None
         symbol = code_to_symbol(code, market)
         if not symbol or symbol in seen:
             continue

@@ -12,8 +12,15 @@ from app.services.signal_service import SignalService
 from app.services.watchlist import (
     MAX_WATCHLIST,
     add_symbol,
+    add_symbol_to_groups,
+    create_group,
+    default_groups,
     dump_watchlist,
+    find_group,
+    flatten_groups,
+    move_symbol,
     parse_watchlist,
+    parse_watchlist_groups,
     remove_symbol,
 )
 
@@ -28,6 +35,27 @@ def test_parse_watchlist_empty():
 def test_parse_watchlist_dedupes_and_uppercases():
     raw = dump_watchlist(["600519.sh", " 000001.SZ ", "600519.SH", ""])
     assert parse_watchlist(raw) == ["600519.SH", "000001.SZ"]
+
+
+def test_parse_legacy_flat_list():
+    raw = '["600519.SH", "000001.SZ"]'
+    assert parse_watchlist(raw) == ["600519.SH", "000001.SZ"]
+    groups = parse_watchlist_groups(raw)
+    assert len(groups) == 1
+    assert groups[0].id == "default"
+    assert groups[0].symbols == ["600519.SH", "000001.SZ"]
+
+
+def test_groups_add_move_create():
+    groups = default_groups(["600519.SH"])
+    groups = create_group(groups, "半导体")
+    groups = add_symbol_to_groups(groups, "688981.SH", group_name="半导体")
+    assert flatten_groups(groups) == ["600519.SH", "688981.SH"]
+    chip = next(g for g in groups if g.name == "半导体")
+    assert chip.symbols == ["688981.SH"]
+    groups = move_symbol(groups, "600519.SH", chip.id)
+    assert chip.symbols == ["688981.SH", "600519.SH"]
+    assert find_group(groups, group_id="default").symbols == []
 
 
 def test_add_and_remove_symbol():

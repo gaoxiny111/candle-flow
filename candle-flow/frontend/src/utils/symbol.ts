@@ -1,7 +1,7 @@
 import { ref } from 'vue'
 import { fetchSymbolNames } from '@/api'
 
-/** 股票/指数代码 -> 中文名称 */
+/** 股票/指数/ETF 代码 -> 中文名称 */
 export const SYMBOL_NAMES: Record<string, string> = {
   '000001.SZ': '平安银行',
   '600519.SH': '贵州茅台',
@@ -15,9 +15,18 @@ export const SYMBOL_NAMES: Record<string, string> = {
   '000300.SH': '沪深300',
   '000016.SH': '上证50',
   '000688.SH': '科创50',
+  '510300.SH': '沪深300ETF',
+  '510500.SH': '中证500ETF',
+  '510050.SH': '上证50ETF',
+  '159915.SZ': '创业板ETF',
+  '159919.SZ': '沪深300ETF',
+  '588000.SH': '科创50ETF',
+  '513100.SH': '纳指ETF',
+  '159920.SZ': '恒生ETF',
+  '513050.SH': '中概互联ETF',
 }
 
-/** Normalize A-share symbol to standard format */
+/** Normalize A-share / ETF symbol to standard format */
 const ALIASES: Record<string, string> = {
   神华: '601088.SH',
   中国神华: '601088.SH',
@@ -38,6 +47,19 @@ const ALIASES: Record<string, string> = {
   沪深300: '000300.SH',
   上证50: '000016.SH',
   科创50: '000688.SH',
+  沪深300ETF: '510300.SH',
+  '300ETF': '510300.SH',
+  华泰柏瑞沪深300ETF: '510300.SH',
+  中证500ETF: '510500.SH',
+  '500ETF': '510500.SH',
+  上证50ETF: '510050.SH',
+  '50ETF': '510050.SH',
+  创业板ETF: '159915.SZ',
+  科创50ETF: '588000.SH',
+  科创板50ETF: '588000.SH',
+  纳指ETF: '513100.SH',
+  恒生ETF: '159920.SZ',
+  中概互联ETF: '513050.SH',
 }
 
 function isFutureSymbol(symbol: string): boolean {
@@ -53,6 +75,23 @@ export function isIndexSymbol(symbol: string): boolean {
   return false
 }
 
+export function isEtfSymbol(symbol: string): boolean {
+  const m = /^(\d{6})\.(SH|SZ)$/.exec(symbol.trim().toUpperCase())
+  if (!m) return false
+  const [, code, market] = m
+  if (market === 'SH' && /^(51|56|58)/.test(code)) return true
+  if (market === 'SZ' && code.startsWith('15')) return true
+  return false
+}
+
+function marketForCode(code: string): 'SH' | 'SZ' {
+  if (code.startsWith('5') || code.startsWith('6') || code.startsWith('9')) return 'SH'
+  if (code.startsWith('0') || code.startsWith('1') || code.startsWith('2') || code.startsWith('3')) {
+    return 'SZ'
+  }
+  throw new Error(`无法识别市场: ${code}`)
+}
+
 export function normalizeSymbol(input: string): string {
   const raw = input.trim()
   if (!raw) throw new Error('股票代码不能为空')
@@ -66,12 +105,10 @@ export function normalizeSymbol(input: string): string {
   if (withMarket) return `${withMarket[1]}.${withMarket[2]}`
 
   if (/^\d{6}$/.test(upper)) {
-    if (upper.startsWith('6') || upper.startsWith('9')) return `${upper}.SH`
-    if (upper.startsWith('0') || upper.startsWith('3')) return `${upper}.SZ`
-    throw new Error(`无法识别市场: ${upper}`)
+    return `${upper}.${marketForCode(upper)}`
   }
 
-  throw new Error(`无效代码: ${raw}，请使用如 000001.SZ、600519 或中文名如 茅台`)
+  throw new Error(`无效代码: ${raw}，请使用如 000001.SZ、510300、600519 或中文名如 茅台`)
 }
 
 export function tryNormalizeSymbol(input: string): string | null {

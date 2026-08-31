@@ -39,8 +39,15 @@ class ConfigOut(BaseSchema):
     membership: MembershipOut = Field(default_factory=MembershipOut)
 
 
+class WatchlistGroupOut(BaseSchema):
+    id: str
+    name: str
+    symbols: list[str] = Field(default_factory=list)
+
+
 class WatchlistOut(BaseSchema):
     symbols: list[str]
+    groups: list[WatchlistGroupOut] = Field(default_factory=list)
     limit: int = 8
 
 

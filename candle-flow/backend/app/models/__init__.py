@@ -1,3 +1,4 @@
+from app.models.fundamental import FundamentalCandidate
 from app.models.indicator import Indicator
 from app.models.kline import KlineData
 from app.models.pattern import PatternRecord
@@ -18,4 +19,5 @@ __all__ = [
     "ValuationHistory",
     "PaymentOrder",
     "PaymentClaim",
+    "FundamentalCandidate",
 ]

@@ -139,25 +139,31 @@ function pctClass(n: number | null | undefined) {
   return 'pct'
 }
 
-const watchRows = computed(() =>
-  watchlist.symbols.map((sym) => {
-    const v = valuations.value[sym.toUpperCase()]
-    return {
-      symbol: sym,
-      code: tickerOf(sym),
-      name: v?.name || symbolName(sym) || '—',
-      price: fmtNum(v?.price),
-      change: fmtChange(v?.change_pct),
-      changeClass: changeClass(v?.change_pct),
-      pe: fmtPe(v?.pe_ttm),
-      pePct: fmtPct(v?.pe_percentile),
-      pePctClass: pctClass(v?.pe_percentile),
-      pb: fmtNum(v?.pb),
-      pbPct: fmtPct(v?.pb_percentile),
-      pbPctClass: pctClass(v?.pb_percentile),
-      cap: fmtCap(v?.market_cap),
-    }
-  }),
+function rowOf(sym: string) {
+  const v = valuations.value[sym.toUpperCase()]
+  return {
+    symbol: sym,
+    code: tickerOf(sym),
+    name: v?.name || symbolName(sym) || '—',
+    price: fmtNum(v?.price),
+    change: fmtChange(v?.change_pct),
+    changeClass: changeClass(v?.change_pct),
+    pe: fmtPe(v?.pe_ttm),
+    pePct: fmtPct(v?.pe_percentile),
+    pePctClass: pctClass(v?.pe_percentile),
+    pb: fmtNum(v?.pb),
+    pbPct: fmtPct(v?.pb_percentile),
+    pbPctClass: pctClass(v?.pb_percentile),
+    cap: fmtCap(v?.market_cap),
+  }
+}
+
+const watchRows = computed(() => watchlist.symbols.map(rowOf))
+
+const watchGroups = computed(() =>
+  watchlist.groups
+    .map((g) => ({ id: g.id, name: g.name, rows: g.symbols.map(rowOf) }))
+    .filter((g) => g.rows.length > 0),
 )
 
 onMounted(async () => {
@@ -318,67 +324,75 @@ async function unfollow(sym: string) {
           </tr>
         </thead>
         <tbody>
-          <tr
-            v-for="row in watchRows"
-            :key="row.symbol"
-            class="watch-row"
-            @click="router.push(`/chart/${row.symbol}`)"
-          >
-            <td class="symbol-code">{{ row.code }}</td>
-            <td class="symbol-name">{{ row.name }}</td>
-            <td>{{ row.price }}</td>
-            <td :class="row.changeClass">{{ row.change }}</td>
-            <td>
-              <div>{{ row.pe }}</div>
-              <div :class="row.pePctClass" title="相对该股近十年，不是行业分位">{{ row.pePct }}</div>
-            </td>
-            <td>
-              <div>{{ row.pb }}</div>
-              <div :class="row.pbPctClass" title="相对该股近十年，不是行业分位">{{ row.pbPct }}</div>
-            </td>
-            <td>{{ row.cap }}</td>
-            <td>
-              <span class="chip-x" title="取消关注" @click.stop="unfollow(row.symbol)">×</span>
-            </td>
-          </tr>
+          <template v-for="g in watchGroups" :key="g.id">
+            <tr v-if="watchGroups.length > 1" class="group-sep">
+              <td colspan="8">{{ g.name }}</td>
+            </tr>
+            <tr
+              v-for="row in g.rows"
+              :key="row.symbol"
+              class="watch-row"
+              @click="router.push(`/chart/${row.symbol}`)"
+            >
+              <td class="symbol-code">{{ row.code }}</td>
+              <td class="symbol-name">{{ row.name }}</td>
+              <td>{{ row.price }}</td>
+              <td :class="row.changeClass">{{ row.change }}</td>
+              <td>
+                <div>{{ row.pe }}</div>
+                <div :class="row.pePctClass" title="相对该股近十年，不是行业分位">{{ row.pePct }}</div>
+              </td>
+              <td>
+                <div>{{ row.pb }}</div>
+                <div :class="row.pbPctClass" title="相对该股近十年，不是行业分位">{{ row.pbPct }}</div>
+              </td>
+              <td>{{ row.cap }}</td>
+              <td>
+                <span class="chip-x" title="取消关注" @click.stop="unfollow(row.symbol)">×</span>
+              </td>
+            </tr>
+          </template>
         </tbody>
       </table>
       </div>
       <div v-if="watchRows.length" class="watch-cards">
-        <article
-          v-for="row in watchRows"
-          :key="'m-' + row.symbol"
-          class="watch-card"
-          @click="router.push(`/chart/${row.symbol}`)"
-        >
-          <div class="watch-card-head">
-            <div>
-              <div class="watch-card-name">{{ row.name }}</div>
-              <div class="symbol-code">{{ row.code }}</div>
+        <template v-for="g in watchGroups" :key="'mg-' + g.id">
+          <div v-if="watchGroups.length > 1" class="watch-group-label">{{ g.name }}</div>
+          <article
+            v-for="row in g.rows"
+            :key="'m-' + row.symbol"
+            class="watch-card"
+            @click="router.push(`/chart/${row.symbol}`)"
+          >
+            <div class="watch-card-head">
+              <div>
+                <div class="watch-card-name">{{ row.name }}</div>
+                <div class="symbol-code">{{ row.code }}</div>
+              </div>
+              <span class="chip-x" title="取消关注" @click.stop="unfollow(row.symbol)">×</span>
             </div>
-            <span class="chip-x" title="取消关注" @click.stop="unfollow(row.symbol)">×</span>
-          </div>
-          <div class="watch-card-quote">
-            <span>{{ row.price }}</span>
-            <span :class="row.changeClass">{{ row.change }}</span>
-          </div>
-          <div class="watch-card-metrics">
-            <div>
-              <span class="k">市盈率</span>
-              <span>{{ row.pe }}</span>
-              <span :class="row.pePctClass">{{ row.pePct }}</span>
+            <div class="watch-card-quote">
+              <span>{{ row.price }}</span>
+              <span :class="row.changeClass">{{ row.change }}</span>
             </div>
-            <div>
-              <span class="k">市净率</span>
-              <span>{{ row.pb }}</span>
-              <span :class="row.pbPctClass">{{ row.pbPct }}</span>
+            <div class="watch-card-metrics">
+              <div>
+                <span class="k">市盈率</span>
+                <span>{{ row.pe }}</span>
+                <span :class="row.pePctClass">{{ row.pePct }}</span>
+              </div>
+              <div>
+                <span class="k">市净率</span>
+                <span>{{ row.pb }}</span>
+                <span :class="row.pbPctClass">{{ row.pbPct }}</span>
+              </div>
+              <div>
+                <span class="k">市值</span>
+                <span>{{ row.cap }}</span>
+              </div>
             </div>
-            <div>
-              <span class="k">市值</span>
-              <span>{{ row.cap }}</span>
-            </div>
-          </div>
-        </article>
+          </article>
+        </template>
       </div>
     </section>
 
@@ -430,6 +444,19 @@ async function unfollow(sym: string) {
 .status-ok { font-size: 18px; color: var(--color-primary); }
 .watch-table-wrap { margin-top: var(--space-sm); overflow-x: auto; }
 .watch-cards { display: none; }
+.group-sep td {
+  background: color-mix(in srgb, var(--color-primary) 8%, transparent);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 10px;
+}
+.watch-group-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin: 4px 0 2px;
+}
 .watch-row { cursor: pointer; }
 .watch-row:hover { background: rgba(24, 144, 255, 0.04); }
 .quote-up { color: var(--color-up); }

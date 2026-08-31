@@ -37,6 +37,16 @@ const marketStats = ref<{ scanned: number; universe_size: number; count: number 
 const hasResults = computed(() => Boolean(single.value?.hits.length || batch.value.length))
 const currentRule = computed(() => ruleFor(selectedTactic.value))
 
+const rankedBatch = computed(() =>
+  [...batch.value].sort((a, b) => bestScore(b) - bestScore(a)),
+)
+
+const resultTitle = computed(() => {
+  if (marketStats.value) return '全市场扫描结果'
+  if (batch.value.length) return '关注列表扫描结果'
+  return '扫描结果'
+})
+
 function ruleFor(name: TacticId) {
   return rules.value.find((r) => r.id === name || r.name === name)
 }
@@ -57,6 +67,47 @@ function selectTactic(tactic: TacticId) {
   error.value = ''
   message.value = ''
   clearResults()
+}
+
+function bestScore(row: BullTacticScanRow) {
+  if (!row.hits.length) return 0
+  return Math.max(...row.hits.map((h) => h.score))
+}
+
+function scoreTone(score: number) {
+  if (score >= 85) return 'hot'
+  if (score >= 70) return 'warm'
+  return 'cool'
+}
+
+function shortDate(value?: string) {
+  if (!value) return '—'
+  const s = String(value).slice(0, 10)
+  return s.length >= 10 ? s.slice(5) : s
+}
+
+function detailParts(hit: BullTacticHit): { label: string; value: string }[] {
+  const d = hit.details || {}
+  if (hit.tactic === '黑马跨栏') {
+    const days = (d.limit_days as string[] | undefined)?.map(shortDate).join(' → ') || '—'
+    return [
+      { label: '三连板', value: days },
+      { label: '支撑收盘', value: String(d.floor_close ?? d.ref_close ?? '—') },
+      { label: 'MA7', value: String(d.ma7 ?? '—') },
+    ]
+  }
+  if (hit.tactic === 'N字反包') {
+    return [
+      { label: '涨停日', value: shortDate(hit.setup_date) },
+      { label: '守开盘价', value: String(d.limit_open ?? '—') },
+      { label: '量比', value: String(d.limit_volume_ratio ?? '—') },
+    ]
+  }
+  return [
+    { label: '信号日', value: shortDate(hit.setup_date) },
+    { label: '缺口下沿', value: String(d.gap_low ?? '—') },
+    { label: '倍量', value: String(d.volume_ratio ?? '—') },
+  ]
 }
 
 async function loadRules() {
@@ -157,17 +208,6 @@ async function scanMarket() {
   }
 }
 
-function detailText(hit: BullTacticHit) {
-  const d = hit.details || {}
-  if (hit.tactic === '黑马跨栏') {
-    return `三连板 ${(d.limit_days as string[] | undefined)?.join(' → ') || ''}，支撑收盘 ${d.floor_close ?? d.ref_close ?? '—'}，MA7 ${d.ma7 ?? '—'}`
-  }
-  if (hit.tactic === 'N字反包') {
-    return `涨停日 ${hit.setup_date}，守开盘价 ${d.limit_open ?? '—'}，量比 ${d.limit_volume_ratio ?? '—'}`
-  }
-  return `信号日 ${hit.setup_date}，缺口下沿 ${d.gap_low ?? '—'}，倍量 ${d.volume_ratio ?? '—'}`
-}
-
 onMounted(async () => {
   await config.restoreSession()
   await watchlist.load()
@@ -177,8 +217,10 @@ onMounted(async () => {
 
 <template>
   <div class="bull-view">
-    <h1>主板战法扫描</h1>
-    <p class="lead">{{ universe || '沪深主板非 ST' }}，扫描近 30 个交易日内买点。</p>
+    <header class="page-head">
+      <h1>主板战法扫描</h1>
+      <p class="lead">{{ universe || '沪深主板非 ST' }}，扫描近 30 个交易日内买点。</p>
+    </header>
 
     <div class="tabs" role="tablist" aria-label="战法切换">
       <button
@@ -222,67 +264,83 @@ onMounted(async () => {
     </div>
 
     <p v-if="error" class="error">{{ error }}</p>
-    <p v-if="message" class="message">{{ message }}</p>
+    <p v-if="message && !hasResults" class="message">{{ message }}</p>
 
-    <div v-if="single?.hits.length" class="card">
-      <h2>
-        {{ formatSymbol(single.symbol) }}
-        <span v-if="single.name" class="muted">{{ single.name }}</span>
-      </h2>
-      <table>
-        <thead>
-          <tr>
-            <th>买点日期</th>
-            <th>买点价</th>
-            <th>信号日</th>
-            <th>得分</th>
-            <th>说明</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="(h, i) in single.hits" :key="i">
-            <td>{{ h.buy_date }}</td>
-            <td>{{ h.buy_price.toFixed(2) }}</td>
-            <td>{{ h.setup_date }}</td>
-            <td>{{ h.score.toFixed(0) }}</td>
-            <td class="detail">{{ detailText(h) }}</td>
-            <td><RouterLink :to="`/chart/${single.symbol}`">看K线</RouterLink></td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-
-    <div v-if="batch.length" class="card">
-      <h2>
-        {{ marketStats ? `全市场扫描结果（${marketStats.count}）` : `关注列表扫描结果（${batch.length}）` }}
-      </h2>
-      <div v-for="row in batch" :key="row.symbol" class="batch-block">
-        <h3>
-          {{ formatSymbol(row.symbol) }}
-          <span v-if="row.name" class="muted">{{ row.name }}</span>
-          <RouterLink :to="`/chart/${row.symbol}`">看K线</RouterLink>
-        </h3>
-        <table>
-          <thead>
-            <tr>
-              <th>买点</th>
-              <th>价格</th>
-              <th>得分</th>
-              <th>说明</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="(h, i) in row.hits" :key="i">
-              <td>{{ h.buy_date }}</td>
-              <td>{{ h.buy_price.toFixed(2) }}</td>
-              <td>{{ h.score.toFixed(0) }}</td>
-              <td class="detail">{{ detailText(h) }}</td>
-            </tr>
-          </tbody>
-        </table>
+    <section v-if="single?.hits.length" class="results">
+      <div class="results-head">
+        <div>
+          <h2>{{ formatSymbol(single.symbol) }}</h2>
+          <p v-if="single.name" class="sub">{{ single.name }} · {{ selectedTactic }}</p>
+        </div>
+        <RouterLink class="chart-link" :to="`/chart/${single.symbol}`">看 K 线</RouterLink>
       </div>
-    </div>
+      <div class="hit-grid">
+        <article v-for="(h, i) in single.hits" :key="i" class="hit-card">
+          <div class="hit-top">
+            <span class="buy-date">买点 {{ h.buy_date }}</span>
+            <span class="score" :class="scoreTone(h.score)">{{ h.score.toFixed(0) }}</span>
+          </div>
+          <div class="price-row">
+            <span class="price">{{ h.buy_price.toFixed(2) }}</span>
+            <span class="price-label">买点价</span>
+          </div>
+          <dl class="meta">
+            <div v-for="p in detailParts(h)" :key="p.label" class="meta-item">
+              <dt>{{ p.label }}</dt>
+              <dd>{{ p.value }}</dd>
+            </div>
+          </dl>
+        </article>
+      </div>
+    </section>
+
+    <section v-if="batch.length" class="results">
+      <div class="results-head">
+        <div>
+          <h2>{{ resultTitle }}</h2>
+          <p class="sub">
+            <template v-if="marketStats">
+              已扫 {{ marketStats.scanned }}/{{ marketStats.universe_size }} · 命中
+              <strong>{{ marketStats.count }}</strong> 只 · {{ selectedTactic }}
+            </template>
+            <template v-else>
+              命中 <strong>{{ batch.length }}</strong> 只 · {{ selectedTactic }} · 按得分排序
+            </template>
+          </p>
+        </div>
+      </div>
+
+      <div class="stock-list">
+        <article v-for="row in rankedBatch" :key="row.symbol" class="stock-card">
+          <header class="stock-head">
+            <div class="stock-id">
+              <span class="code">{{ formatSymbol(row.symbol) }}</span>
+              <span v-if="row.name" class="name">{{ row.name }}</span>
+              <span class="hit-count">{{ row.hits.length }} 个买点</span>
+            </div>
+            <div class="stock-aside">
+              <span class="score lg" :class="scoreTone(bestScore(row))">{{ bestScore(row).toFixed(0) }}</span>
+              <RouterLink class="chart-link" :to="`/chart/${row.symbol}`">看 K 线</RouterLink>
+            </div>
+          </header>
+
+          <div class="hit-strip">
+            <div v-for="(h, i) in row.hits" :key="i" class="hit-pill">
+              <div class="pill-main">
+                <span class="pill-date">{{ shortDate(h.buy_date) }}</span>
+                <span class="pill-price">{{ h.buy_price.toFixed(2) }}</span>
+                <span class="score sm" :class="scoreTone(h.score)">{{ h.score.toFixed(0) }}</span>
+              </div>
+              <div class="pill-meta">
+                <span v-for="p in detailParts(h)" :key="p.label">
+                  {{ p.label }} {{ p.value }}
+                </span>
+              </div>
+            </div>
+          </div>
+        </article>
+      </div>
+    </section>
 
     <div v-if="!loading && !hasResults && !error && !message" class="empty card">
       切换战法后，扫描单票、关注列表或全市场主板。
@@ -292,8 +350,15 @@ onMounted(async () => {
 
 <style scoped>
 .bull-view { max-width: 960px; }
-.bull-view h1 { margin-bottom: var(--space-sm); }
-.lead { color: var(--text-secondary); font-size: 14px; margin-bottom: var(--space-md); line-height: 1.6; }
+
+.page-head h1 { margin: 0 0 var(--space-sm); font-size: 1.6rem; letter-spacing: -0.02em; }
+.lead {
+  color: var(--text-secondary);
+  font-size: 14px;
+  margin: 0 0 var(--space-lg);
+  line-height: 1.6;
+}
+
 .card { margin-bottom: var(--space-lg); }
 
 .tabs {
@@ -324,7 +389,7 @@ onMounted(async () => {
 .tactic-panel .rule {
   font-size: 14px;
   color: var(--text-secondary);
-  line-height: 1.6;
+  line-height: 1.65;
   margin: 0 0 var(--space-md);
 }
 .symbol-row {
@@ -336,15 +401,232 @@ onMounted(async () => {
 }
 .symbol-row :deep(.symbol-search) { flex: 1; min-width: 200px; }
 .tactic-actions { display: flex; flex-wrap: wrap; gap: var(--space-sm); }
+.market-btn {
+  border: 1px solid var(--color-primary);
+  color: var(--color-primary);
+  background: transparent;
+}
 
-table { width: 100%; border-collapse: collapse; font-size: 14px; }
-th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border-color); }
-.detail { font-size: 13px; color: var(--text-secondary); max-width: 280px; }
-.muted { color: var(--text-secondary); font-weight: 400; font-size: 13px; margin-left: 6px; }
-.batch-block { margin-bottom: var(--space-lg); }
-.batch-block h3 { font-size: 15px; margin: 0 0 var(--space-sm); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.empty { color: var(--text-secondary); text-align: center; padding: 32px; }
-.error { color: var(--color-danger, #c0392b); }
-.message { color: var(--color-primary); }
-.market-btn { border-color: var(--color-primary); color: var(--color-primary); }
+.error { color: var(--color-up); margin-bottom: var(--space-md); }
+.message { color: var(--color-primary); margin-bottom: var(--space-md); }
+.empty { color: var(--text-secondary); text-align: center; padding: 40px 24px; }
+
+.results { margin-bottom: var(--space-xl); }
+.results-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-md);
+  margin-bottom: var(--space-md);
+}
+.results-head h2 {
+  margin: 0;
+  font-size: 1.15rem;
+  letter-spacing: -0.01em;
+}
+.sub {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.sub strong { color: var(--text-primary); font-weight: 600; }
+
+.chart-link {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-light);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: border-color 0.15s, color 0.15s;
+}
+.chart-link:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+.score {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 2.25rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.score.lg {
+  min-width: 2.75rem;
+  padding: 4px 10px;
+  font-size: 15px;
+}
+.score.sm { min-width: 1.75rem; padding: 1px 6px; font-size: 11px; }
+.score.hot {
+  background: rgba(245, 34, 45, 0.12);
+  color: var(--color-up);
+}
+.score.warm {
+  background: rgba(250, 140, 22, 0.14);
+  color: #d46b08;
+}
+.score.cool {
+  background: rgba(24, 144, 255, 0.12);
+  color: var(--color-primary);
+}
+
+.hit-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: var(--space-md);
+}
+.hit-card {
+  background: var(--bg-light);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.hit-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.buy-date {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.price-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.price {
+  font-size: 1.75rem;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1;
+}
+.price-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.meta {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding-top: 4px;
+  border-top: 1px solid var(--border-color);
+}
+.meta-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+}
+.meta-item dt { color: var(--text-secondary); }
+.meta-item dd {
+  margin: 0;
+  text-align: right;
+  color: var(--text-primary);
+  font-weight: 500;
+  word-break: break-all;
+}
+
+.stock-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.stock-card {
+  background: var(--bg-light);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  padding: 14px 16px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.stock-card:hover {
+  border-color: color-mix(in srgb, var(--color-primary) 45%, var(--border-color));
+  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.04);
+}
+.stock-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.stock-id {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.code {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+.name { font-size: 14px; color: var(--text-secondary); }
+.hit-count {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--bg-page);
+  color: var(--text-secondary);
+}
+.stock-aside {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.hit-strip {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.hit-pill {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg-page);
+}
+.pill-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+.pill-date {
+  font-size: 13px;
+  font-weight: 600;
+  min-width: 3rem;
+}
+.pill-price {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+.pill-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+@media (max-width: 640px) {
+  .stock-head { flex-direction: column; align-items: flex-start; }
+  .stock-aside { width: 100%; justify-content: space-between; }
+  .pill-main { flex-wrap: wrap; }
+}
 </style>

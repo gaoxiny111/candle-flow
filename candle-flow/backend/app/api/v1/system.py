@@ -22,6 +22,7 @@ from app.schemas.system import (
     HealthOut,
     MembershipOfferOut,
     MembershipOut,
+    WatchlistGroupOut,
     WatchlistOut,
 )
 from app.services.akshare_client import akshare_client
@@ -40,10 +41,18 @@ from app.services.payment import online_channels
 from app.services.phone import normalize_account
 from app.services.stock_universe import resolve_symbol
 from app.services.watchlist import (
-    add_symbol,
+    add_symbol_to_groups,
+    create_group,
+    delete_group,
     dump_watchlist,
+    dump_watchlist_groups,
+    flatten_groups,
+    move_symbol,
     parse_watchlist,
-    remove_symbol,
+    parse_watchlist_groups,
+    remove_symbol_from_groups,
+    rename_group,
+    replace_symbols,
 )
 from app.utils.symbol import SymbolError
 
@@ -114,7 +123,12 @@ def _config_out(cfg: UserConfig | None) -> ConfigOut:
 
 
 def _watchlist_out(cfg: UserConfig) -> WatchlistOut:
-    return WatchlistOut(symbols=parse_watchlist(cfg.watchlist), limit=watchlist_limit(cfg))
+    groups = parse_watchlist_groups(cfg.watchlist)
+    return WatchlistOut(
+        symbols=flatten_groups(groups),
+        groups=[WatchlistGroupOut(id=g.id, name=g.name, symbols=list(g.symbols)) for g in groups],
+        limit=watchlist_limit(cfg),
+    )
 
 
 def _auth_out(cfg: UserConfig) -> AuthOut:
@@ -169,6 +183,12 @@ class WatchlistBody(BaseModel):
     symbols: list[str] | None = None
     add: str | None = None
     remove: str | None = None
+    group_id: str | None = None
+    group_name: str | None = None
+    create_group: str | None = None
+    rename_group: dict[str, str] | None = None
+    delete_group: str | None = None
+    move: dict[str, str] | None = None
 
 
 class AdminMembershipBody(BaseModel):
@@ -462,35 +482,85 @@ def update_config(body: ConfigUpdateBody, user: UserConfig = Depends(require_use
 @router.get("/config/watchlist")
 def get_watchlist(user: UserConfig | None = Depends(get_optional_user)):
     if not user:
-        return ApiResponse(data=WatchlistOut(symbols=[], limit=WATCHLIST_LIMIT))
+        return ApiResponse(
+            data=WatchlistOut(
+                symbols=[],
+                groups=[WatchlistGroupOut(id="default", name="默认", symbols=[])],
+                limit=WATCHLIST_LIMIT,
+            )
+        )
     return ApiResponse(data=_watchlist_out(user))
 
 
 @router.post("/config/watchlist")
 def update_watchlist(body: WatchlistBody, user: UserConfig = Depends(require_user), db: Session = Depends(get_db)):
-    current = parse_watchlist(user.watchlist)
+    groups = parse_watchlist_groups(user.watchlist)
     limit = watchlist_limit(user)
+
+    if body.create_group:
+        try:
+            groups = create_group(groups, body.create_group)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+    if body.rename_group:
+        gid = str(body.rename_group.get("id") or "").strip()
+        name = str(body.rename_group.get("name") or "").strip()
+        try:
+            groups = rename_group(groups, gid, name)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+    if body.delete_group:
+        try:
+            groups = delete_group(groups, body.delete_group)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
     if body.symbols is not None:
         resolved: list[str] = []
         for raw in body.symbols:
             item = _resolve_watch_symbol(raw, db)
             if item not in resolved:
                 resolved.append(item)
-        if len(resolved) > limit:
-            raise HTTPException(status_code=400, detail=f"关注列表最多 {limit} 只")
-        current = resolved
-    if body.add:
         try:
-            current = add_symbol(current, _resolve_watch_symbol(body.add, db), max_size=limit)
+            groups = replace_symbols(groups, resolved, max_size=limit)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
+
+    if body.add:
+        try:
+            groups = add_symbol_to_groups(
+                groups,
+                _resolve_watch_symbol(body.add, db),
+                group_id=body.group_id,
+                group_name=body.group_name,
+                max_size=limit,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
     if body.remove:
         try:
             target = _resolve_watch_symbol(body.remove, db)
         except HTTPException:
             target = body.remove
-        current = remove_symbol(current, target)
-    user.watchlist = dump_watchlist(current)
+        groups = remove_symbol_from_groups(groups, target)
+
+    if body.move:
+        sym = str(body.move.get("symbol") or "").strip()
+        gid = str(body.move.get("group_id") or "").strip()
+        if sym and gid:
+            try:
+                resolved = _resolve_watch_symbol(sym, db)
+            except HTTPException:
+                resolved = sym
+            try:
+                groups = move_symbol(groups, resolved, gid)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+
+    user.watchlist = dump_watchlist_groups(groups)
     db.commit()
     db.refresh(user)
     return ApiResponse(data=_watchlist_out(user))

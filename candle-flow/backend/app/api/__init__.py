@@ -1,12 +1,13 @@
 from fastapi import APIRouter
 
-from app.api.v1 import bull_tactics, flow, kline, patterns, pay, risk, signals, system, symbols, ws
+from app.api.v1 import bull_tactics, flow, fundamentals, kline, patterns, pay, risk, signals, system, symbols, ws
 
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(symbols.router, tags=["symbols"])
 api_router.include_router(kline.router, tags=["kline"])
 api_router.include_router(flow.router, tags=["flow"])
 api_router.include_router(bull_tactics.router, tags=["bull-tactics"])
+api_router.include_router(fundamentals.router, tags=["fundamentals"])
 api_router.include_router(patterns.router, tags=["patterns"])
 api_router.include_router(signals.router, tags=["signals"])
 api_router.include_router(risk.router, tags=["risk"])

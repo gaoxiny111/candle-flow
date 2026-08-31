@@ -41,6 +41,12 @@ const router = createRouter({
       meta: { title: '主板战法', requiresAuth: false },
     },
     {
+      path: '/fundamentals',
+      name: 'fundamentals',
+      component: () => import('@/views/FundamentalPoolView.vue'),
+      meta: { title: '基本面候选池', requiresAuth: false },
+    },
+    {
       path: '/backtest',
       name: 'backtest',
       component: () => import('@/views/BacktestView.vue'),

@@ -19,6 +19,25 @@ def test_normalize_code_only():
     assert normalize_symbol("600519") == "600519.SH"
     assert normalize_symbol("000001") == "000001.SZ"
     assert normalize_symbol("900948") == "900948.SH"
+    assert normalize_symbol("510300") == "510300.SH"
+    assert normalize_symbol("159915") == "159915.SZ"
+    assert normalize_symbol("588000") == "588000.SH"
+
+
+def test_normalize_etf_alias():
+    assert normalize_symbol("沪深300ETF") == "510300.SH"
+    assert normalize_symbol("创业板ETF") == "159915.SZ"
+    assert normalize_symbol("科创50ETF") == "588000.SH"
+
+
+def test_is_etf_symbol():
+    from app.utils.symbol import is_etf_symbol, is_index_symbol
+
+    assert is_etf_symbol("510300.SH")
+    assert is_etf_symbol("159915.SZ")
+    assert not is_etf_symbol("000001.SH")
+    assert is_index_symbol("000001.SH")
+    assert not is_index_symbol("510300.SH")
 
 
 def test_normalize_alias():

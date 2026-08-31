@@ -125,9 +125,23 @@ NAME_ALIASES: dict[str, str] = {
     "沪深300": "000300.SH",
     "上证50": "000016.SH",
     "科创50": "000688.SH",
+    # 指数 ETF（可交易）
+    "沪深300ETF": "510300.SH",
+    "300ETF": "510300.SH",
+    "华泰柏瑞沪深300ETF": "510300.SH",
+    "中证500ETF": "510500.SH",
+    "500ETF": "510500.SH",
+    "上证50ETF": "510050.SH",
+    "50ETF": "510050.SH",
+    "创业板ETF": "159915.SZ",
+    "科创50ETF": "588000.SH",
+    "科创板50ETF": "588000.SH",
+    "纳指ETF": "513100.SH",
+    "恒生ETF": "159920.SZ",
+    "中概互联ETF": "513050.SH",
 }
 
-# 股票/指数代码 -> 中文名称
+# 股票/指数/ETF 代码 -> 中文名称
 SYMBOL_NAMES: dict[str, str] = {
     "000001.SZ": "平安银行",
     "600519.SH": "贵州茅台",
@@ -141,6 +155,15 @@ SYMBOL_NAMES: dict[str, str] = {
     "000300.SH": "沪深300",
     "000016.SH": "上证50",
     "000688.SH": "科创50",
+    "510300.SH": "沪深300ETF",
+    "510500.SH": "中证500ETF",
+    "510050.SH": "上证50ETF",
+    "159915.SZ": "创业板ETF",
+    "159919.SZ": "沪深300ETF",
+    "588000.SH": "科创50ETF",
+    "513100.SH": "纳指ETF",
+    "159920.SZ": "恒生ETF",
+    "513050.SH": "中概互联ETF",
 }
 
 
@@ -182,8 +205,36 @@ def is_index_symbol(symbol: str) -> bool:
     return False
 
 
+def is_etf_symbol(symbol: str) -> bool:
+    """True for common CN ETF codes (tradeable funds on SH/SZ)."""
+    raw = (symbol or "").strip().upper()
+    m = SYMBOL_WITH_MARKET.match(raw)
+    if not m:
+        return False
+    code, market = m.group(1), m.group(2).upper()
+    if market == "SH" and code.startswith(("51", "56", "58")):
+        return True
+    if market == "SZ" and code.startswith("15"):
+        return True
+    return False
+
+
+def market_for_code(code: str) -> str:
+    """Infer SH/SZ from a bare 6-digit code (stocks, B-shares, ETFs)."""
+    c = (code or "").strip()
+    if not CODE_ONLY.match(c):
+        raise SymbolError(f"无法识别市场: {code}")
+    # 5xxxxx ETF / 6xxxxx A / 9xxxxx B → 沪市
+    if c.startswith(("5", "6", "9")):
+        return "SH"
+    # 0/1/2/3 → 深市（含 15xxxx ETF、200xxx B）
+    if c.startswith(("0", "1", "2", "3")):
+        return "SZ"
+    raise SymbolError(f"无法识别市场: {code}，请使用完整格式如 {code}.SH")
+
+
 def normalize_symbol(symbol: str) -> str:
-    """Normalize to 000001.SZ / 600519.SH / 000001.SH (stocks + CN indices)."""
+    """Normalize to 000001.SZ / 600519.SH / 510300.SH (stocks, ETFs, indices)."""
     raw = (symbol or "").strip()
     if not raw:
         raise SymbolError("代码不能为空")
@@ -201,15 +252,9 @@ def normalize_symbol(symbol: str) -> str:
         return f"{m.group(1)}.{m.group(2).upper()}"
 
     if CODE_ONLY.match(upper):
-        code = upper
-        if code.startswith(("6", "9")):
-            return f"{code}.SH"
-        if code.startswith(("0", "3")):
-            # bare 000001 → 个股平安银行；上证指数请用 000001.SH 或「上证指数」
-            return f"{code}.SZ"
-        raise SymbolError(f"无法识别市场: {code}，请使用完整格式如 {code}.SH")
+        return f"{upper}.{market_for_code(upper)}"
 
-    raise SymbolError(f"无效代码: {raw}，请使用股票如 000001.SZ、600519 或中文名如 茅台")
+    raise SymbolError(f"无效代码: {raw}，请使用股票/ETF 如 000001.SZ、510300、600519 或中文名如 茅台")
 
 
 def parse_symbol(symbol: str) -> tuple[str, str]:

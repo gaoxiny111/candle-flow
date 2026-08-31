@@ -190,11 +190,30 @@ export const registerAccount = (phone: string, password: string) =>
 export const fetchMe = () =>
   api.get<ApiResponse<{ username: string; token: string; watchlist: string[]; membership?: MembershipInfo }>>('/auth/me')
 
-export const fetchWatchlist = () =>
-  api.get<ApiResponse<{ symbols: string[]; limit?: number }>>('/config/watchlist')
+export interface WatchlistGroup {
+  id: string
+  name: string
+  symbols: string[]
+}
 
-export const saveWatchlist = (body: { symbols?: string[]; add?: string; remove?: string }) =>
-  api.post<ApiResponse<{ symbols: string[]; limit?: number }>>('/config/watchlist', body)
+export const fetchWatchlist = () =>
+  api.get<ApiResponse<{ symbols: string[]; groups?: WatchlistGroup[]; limit?: number }>>('/config/watchlist')
+
+export const saveWatchlist = (body: {
+  symbols?: string[]
+  add?: string
+  remove?: string
+  group_id?: string
+  group_name?: string
+  create_group?: string
+  rename_group?: { id: string; name: string }
+  delete_group?: string
+  move?: { symbol: string; group_id: string }
+}) =>
+  api.post<ApiResponse<{ symbols: string[]; groups?: WatchlistGroup[]; limit?: number }>>(
+    '/config/watchlist',
+    body,
+  )
 
 export interface MembershipInfo {
   plan: 'free' | 'month' | 'year' | 'lifetime'
@@ -464,6 +483,239 @@ export const fetchValuations = async (symbols: string[]) => {
     params: { symbols: symbols.join(',') },
     timeout: 20000,
   })
+  return { data: checkApi(res) }
+}
+
+export interface FundamentalCheck {
+  key: string
+  label: string
+  ok: boolean
+  detail: string
+}
+
+export interface FundamentalCandidate {
+  id: number
+  symbol: string
+  name: string
+  industry: string
+  themes: string[]
+  report_date: string
+  score: number
+  roe: number | null
+  roe_years_ok: number
+  revenue_yoy: number | null
+  profit_yoy: number | null
+  ocf_ps: number | null
+  debt_ratio: number | null
+  pe_ttm: number | null
+  pb: number | null
+  pe_percentile: number | null
+  pb_percentile: number | null
+  peg: number | null
+  price?: number | null
+  change_pct?: number | null
+  checks: FundamentalCheck[]
+  notes: string
+  pool_run_id: string
+  created_at?: string | null
+}
+
+export interface FundamentalTheme {
+  id: string
+  keywords: string[]
+  policy?: boolean
+}
+
+export interface ThemeScorecard {
+  theme: string
+  profit_ok: boolean
+  supply_ok: boolean
+  policy_ok: boolean
+  capital_ok: boolean
+  resonance: number
+  selected: boolean
+  conclusion: string
+  score: number
+  sample: number
+  median_rev: number | null
+  median_profit: number | null
+  details?: Record<string, string>
+  strong_share?: number
+}
+
+/** @deprecated use ThemeScorecard */
+export type ThemeProsperity = ThemeScorecard
+
+export const fetchFundamentalThemes = async () => {
+  const res = await api.get<
+    ApiResponse<{ themes: FundamentalTheme[]; defaults: string[]; note: string; auto?: boolean }>
+  >('/fundamentals/themes')
+  return { data: checkApi(res) }
+}
+
+export const fetchFundamentalPool = async () => {
+  const res = await api.get<
+    ApiResponse<{ pool_run_id: string; count: number; items: FundamentalCandidate[] }>
+  >('/fundamentals/pool')
+  return { data: checkApi(res) }
+}
+
+export const runFundamentalScreen = async (body: {
+  themes?: string[]
+  auto_themes?: boolean
+  top_themes?: number
+  pool_size?: number
+  roe_min?: number
+  growth_min?: number
+  debt_max?: number
+  pe_pct_max?: number
+  pb_pct_max?: number
+  peg_max?: number
+}) => {
+  const res = await api.post<
+    ApiResponse<{
+      pool_run_id: string
+      count: number
+      scanned_themes: string[]
+      theme_prosperity?: ThemeScorecard[]
+      theme_scorecards?: ThemeScorecard[]
+      auto_themes?: boolean
+      report_dates: string[]
+      items: FundamentalCandidate[]
+    }>
+  >('/fundamentals/screen', body, { timeout: 180000 })
+  return { data: checkApi(res) }
+}
+
+export type PositionZone = 'bottom' | 'top' | 'mid' | 'conflict'
+
+export interface PositionHit {
+  name: string
+  date: string
+  score: number
+  confirmed: boolean
+  timeframe: string
+}
+
+export interface PositionInfo {
+  zone: PositionZone
+  label: string
+  action: string
+  valuation_bias: string
+  pe_percentile: number | null
+  weekly_patterns: PositionHit[]
+  monthly_patterns: PositionHit[]
+  notes: string
+  error?: string | null
+}
+
+export interface PositionedCandidate extends FundamentalCandidate {
+  position: PositionInfo
+}
+
+export const runFundamentalPosition = async () => {
+  const res = await api.post<
+    ApiResponse<{
+      count: number
+      counts: Record<string, number>
+      items: PositionedCandidate[]
+      note?: string
+    }>
+  >('/fundamentals/position', {}, { timeout: 180000 })
+  return { data: checkApi(res) }
+}
+
+export type TacticsStatus =
+  | 'ready'
+  | 'wait_pullback'
+  | 'wait_confirm'
+  | 'avoid'
+  | 'not_eligible'
+  | 'no_signal'
+
+export interface TacticsInfo {
+  status: TacticsStatus
+  label: string
+  action: string
+  entry_patterns: Array<{
+    name: string
+    date: string
+    score: number
+    confirmed: boolean
+    tier: string
+    volume_ok: boolean
+  }>
+  supports: Array<{ name: string; price: number; detail: string }>
+  near_support: boolean
+  pullback_ok: boolean
+  volume_ratio: number | null
+  stop_loss: number | null
+  stop_basis: string
+  entry_hint: string
+  zone: string | null
+  warnings: string[]
+  notes: string
+  error?: string | null
+}
+
+export interface TacticsCandidate extends FundamentalCandidate {
+  tactics: TacticsInfo
+  position?: PositionInfo
+}
+
+export type HoldAction = 'add' | 'hold' | 'reduce' | 'exit'
+
+export interface HoldInfo {
+  action: HoldAction
+  label: string
+  signals: Array<{ kind: string; reason: string; strength: number }>
+  pe_percentile: number | null
+  above_ma200: boolean | null
+  open_rising_window: boolean
+  regime_hint: string
+  warnings: string[]
+  notes: string
+  error?: string | null
+}
+
+export interface HoldCandidate extends FundamentalCandidate {
+  hold: HoldInfo
+}
+
+export interface MarketRegime {
+  regime: string
+  fundamental: number
+  candle: number
+  tip: string
+  sample?: number
+  bull_share?: number
+  bear_share?: number
+}
+
+export const runFundamentalTactics = async () => {
+  const res = await api.post<
+    ApiResponse<{
+      count: number
+      counts: Record<string, number>
+      items: TacticsCandidate[]
+      iron_rules?: string[]
+      note?: string
+    }>
+  >('/fundamentals/tactics', {}, { timeout: 180000 })
+  return { data: checkApi(res) }
+}
+
+export const runFundamentalHold = async () => {
+  const res = await api.post<
+    ApiResponse<{
+      count: number
+      counts: Record<string, number>
+      items: HoldCandidate[]
+      regime?: MarketRegime
+      iron_rules?: string[]
+      note?: string
+    }>
+  >('/fundamentals/hold', {}, { timeout: 180000 })
   return { data: checkApi(res) }
 }
 

@@ -49,6 +49,18 @@ def test_parse_sina_suggest_bank():
     assert "601318.SH" in symbols
 
 
+def test_parse_sina_suggest_etf():
+    text = (
+        "var suggestvalue='沪深300ETF华泰柏瑞,22,510300,of510300,沪深300ETF华泰柏瑞,,"
+        "沪深300ETF华泰柏瑞,99,1,,,;"
+        "创业板ETF,22,159915,of159915,创业板ETF,,创业板ETF,99,1,,,';"
+    )
+    items = parse_sina_suggest(text)
+    symbols = {i["symbol"] for i in items}
+    assert "510300.SH" in symbols
+    assert "159915.SZ" in symbols
+
+
 def _memory_db():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)

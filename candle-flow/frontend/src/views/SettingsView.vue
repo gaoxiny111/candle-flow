@@ -14,6 +14,9 @@ const password = ref('')
 const message = ref('')
 const watchQuery = ref('')
 const busy = ref(false)
+const newGroupName = ref('')
+const renamingId = ref('')
+const renameDraft = ref('')
 
 onMounted(async () => {
   await config.restoreSession()
@@ -25,9 +28,43 @@ onMounted(async () => {
 async function addWatch(hit: { symbol: string; name: string }) {
   try {
     if (hit.name) rememberSymbol(hit.symbol, hit.name)
-    await watchlist.add(hit.symbol)
+    await watchlist.add(hit.symbol, watchlist.activeGroupId)
     watchQuery.value = ''
     message.value = ''
+  } catch (e) {
+    message.value = apiErrorText(e)
+  }
+}
+
+async function createGroup() {
+  try {
+    await watchlist.createGroup(newGroupName.value)
+    newGroupName.value = ''
+    message.value = '已新建分组'
+  } catch (e) {
+    message.value = apiErrorText(e)
+  }
+}
+
+function startRename(id: string, name: string) {
+  renamingId.value = id
+  renameDraft.value = name
+}
+
+async function commitRename() {
+  if (!renamingId.value) return
+  try {
+    await watchlist.renameGroup(renamingId.value, renameDraft.value)
+    renamingId.value = ''
+    renameDraft.value = ''
+  } catch (e) {
+    message.value = apiErrorText(e)
+  }
+}
+
+async function removeGroup(id: string) {
+  try {
+    await watchlist.deleteGroup(id)
   } catch (e) {
     message.value = apiErrorText(e)
   }
@@ -140,16 +177,73 @@ function logout() {
         这些标的已同步到 {{ maskPhone(config.username) }}（{{ watchlist.symbols.length }}/{{ watchlist.limit }}）。
       </p>
       <p v-else class="hint">当前未登录：关注只存在这台浏览器。登录后若账号还没有关注，会把本机列表上传到账号。</p>
-      <div class="watch-row">
+
+      <div class="group-toolbar">
+        <div class="group-tabs">
+          <button
+            v-for="g in watchlist.groups"
+            :key="g.id"
+            type="button"
+            class="group-tab"
+            :class="{ active: watchlist.activeGroupId === g.id }"
+            @click="watchlist.setActiveGroup(g.id)"
+          >
+            {{ g.name }}
+            <span class="group-count">{{ g.symbols.length }}</span>
+          </button>
+        </div>
+        <div class="new-group">
+          <input v-model="newGroupName" maxlength="20" placeholder="新建分组名" @keyup.enter="createGroup" />
+          <button class="btn-secondary" type="button" @click="createGroup">新建分组</button>
+        </div>
+      </div>
+
+      <div class="add-row">
+        <span class="add-hint">加入到「{{ watchlist.activeGroup?.name || '默认' }}」</span>
         <SymbolSearch v-model="watchQuery" placeholder="搜索并添加关注" @select="addWatch" @error="message = $event" />
       </div>
+
       <div v-if="!watchlist.symbols.length" class="empty-watch">暂无关注</div>
-      <ul v-else class="watch-list">
-        <li v-for="sym in watchlist.symbols" :key="sym">
-          <span>{{ formatSymbol(sym) }}</span>
-          <button class="btn-secondary" type="button" @click="watchlist.remove(sym)">取消</button>
-        </li>
-      </ul>
+      <div v-else class="group-blocks">
+        <section v-for="g in watchlist.groups" :key="g.id" class="group-block">
+          <header class="group-head">
+            <template v-if="renamingId === g.id">
+              <input v-model="renameDraft" maxlength="20" @keyup.enter="commitRename" @keyup.escape="renamingId = ''" />
+              <button class="btn-secondary" type="button" @click="commitRename">保存</button>
+            </template>
+            <template v-else>
+              <h3>{{ g.name }}</h3>
+              <div class="group-actions">
+                <button class="link-btn" type="button" @click="startRename(g.id, g.name)">重命名</button>
+                <button
+                  v-if="g.id !== 'default'"
+                  class="link-btn danger"
+                  type="button"
+                  @click="removeGroup(g.id)"
+                >
+                  删除
+                </button>
+              </div>
+            </template>
+          </header>
+          <p v-if="!g.symbols.length" class="empty-watch">该分组暂无股票</p>
+          <ul v-else class="watch-list">
+            <li v-for="sym in g.symbols" :key="sym">
+              <span>{{ formatSymbol(sym) }}</span>
+              <div class="row-actions">
+                <select
+                  :value="g.id"
+                  title="移动到分组"
+                  @change="watchlist.moveToGroup(sym, ($event.target as HTMLSelectElement).value)"
+                >
+                  <option v-for="opt in watchlist.groups" :key="opt.id" :value="opt.id">{{ opt.name }}</option>
+                </select>
+                <button class="btn-secondary" type="button" @click="watchlist.remove(sym)">取消</button>
+              </div>
+            </li>
+          </ul>
+        </section>
+      </div>
     </div>
 
     <div v-if="config.isAuthenticated" class="card">
@@ -181,7 +275,7 @@ function logout() {
 </template>
 
 <style scoped>
-.settings-view { max-width: 600px; }
+.settings-view { max-width: 640px; }
 .settings-view h1 { margin-bottom: var(--space-lg); }
 .auth-card, .card { margin-bottom: var(--space-lg); }
 .auth-card p { color: var(--text-secondary); margin: var(--space-md) 0; font-size: 14px; }
@@ -191,14 +285,63 @@ function logout() {
 .form-row { display: flex; flex-direction: column; gap: var(--space-md); margin-bottom: var(--space-lg); }
 .form-row label { display: flex; flex-direction: column; gap: var(--space-xs); font-size: 14px; }
 .hint { color: var(--text-secondary); font-size: 13px; margin-bottom: var(--space-md); }
-.watch-row { margin-bottom: var(--space-md); }
-.watch-row :deep(.symbol-search) { width: 100%; }
+.group-toolbar { display: flex; flex-direction: column; gap: 10px; margin-bottom: var(--space-md); }
+.group-tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+.group-tab {
+  border: 1px solid var(--border-color);
+  background: var(--bg-secondary, transparent);
+  color: var(--text-primary);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.group-tab.active {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+  background: color-mix(in srgb, var(--color-primary) 12%, transparent);
+}
+.group-count {
+  margin-left: 4px;
+  opacity: 0.7;
+  font-variant-numeric: tabular-nums;
+}
+.new-group { display: flex; gap: 8px; }
+.new-group input { flex: 1; min-width: 0; }
+.add-row { margin-bottom: var(--space-md); }
+.add-row :deep(.symbol-search) { width: 100%; }
+.add-hint { display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
 .empty-watch { color: var(--text-secondary); font-size: 13px; }
-.watch-list { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+.group-blocks { display: flex; flex-direction: column; gap: 14px; }
+.group-block { border-top: 1px solid var(--border-color); padding-top: 12px; }
+.group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.group-head h3 { margin: 0; font-size: 15px; }
+.group-head input { flex: 1; min-width: 0; }
+.group-actions { display: flex; gap: 8px; }
+.link-btn {
+  border: none;
+  background: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0;
+}
+.link-btn.danger { color: var(--color-danger, #c0392b); }
+.watch-list { list-style: none; display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 0; }
 .watch-list li { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 14px; }
+.row-actions { display: flex; align-items: center; gap: 6px; }
+.row-actions select { font-size: 12px; max-width: 110px; }
 .message { color: var(--color-primary); font-size: 14px; margin-top: var(--space-md); }
 @media (max-width: 768px) {
   .auth-actions { flex-wrap: wrap; }
   .auth-actions button { flex: 1; }
+  .new-group { flex-wrap: wrap; }
+  .row-actions { flex-wrap: wrap; justify-content: flex-end; }
 }
 </style>

@@ -19,10 +19,16 @@ const config = useConfigStore()
 const addQuery = ref('')
 const loading = ref(false)
 const scanHint = ref('')
+const filterGroupId = ref('all')
 
 const displayed = computed(() => {
   const set = new Set(watchlist.symbols.map((s) => s.toUpperCase()))
   return signal.signals.filter((s) => set.has(s.symbol.toUpperCase()))
+})
+
+const chipGroups = computed(() => {
+  if (filterGroupId.value === 'all') return watchlist.groups.filter((g) => g.symbols.length)
+  return watchlist.groups.filter((g) => g.id === filterGroupId.value && g.symbols.length)
 })
 
 function guestSymbols() {
@@ -47,7 +53,7 @@ onMounted(async () => {
 async function addWatch(hit: { symbol: string; name: string }) {
   try {
     if (hit.name) rememberSymbol(hit.symbol, hit.name)
-    await watchlist.add(hit.symbol)
+    await watchlist.add(hit.symbol, watchlist.activeGroupId)
     addQuery.value = ''
     try {
       await pattern.scanPatterns(hit.symbol)
@@ -118,6 +124,24 @@ const levelClass = (level: string) => {
 
     <div class="watch-bar card">
       <div class="watch-search">
+        <div class="group-pick" v-if="watchlist.groups.length">
+          <label>
+            加入分组
+            <select
+              :value="watchlist.activeGroupId"
+              @change="watchlist.setActiveGroup(($event.target as HTMLSelectElement).value)"
+            >
+              <option v-for="g in watchlist.groups" :key="g.id" :value="g.id">{{ g.name }}</option>
+            </select>
+          </label>
+          <label>
+            筛选显示
+            <select v-model="filterGroupId">
+              <option value="all">全部分组</option>
+              <option v-for="g in watchlist.groups" :key="g.id" :value="g.id">{{ g.name }}</option>
+            </select>
+          </label>
+        </div>
         <SymbolSearch
           v-model="addQuery"
           placeholder="搜索并加入关注，如 茅台 / 600519"
@@ -128,17 +152,22 @@ const levelClass = (level: string) => {
       <p v-if="!watchlist.symbols.length" class="watch-hint">
         只显示已关注股票的信号。先搜索添加，或在 K 线图点击「关注」。
       </p>
-      <div v-else class="chips">
-        <button
-          v-for="sym in watchlist.symbols"
-          :key="sym"
-          class="chip"
-          type="button"
-          @click="router.push(`/chart/${sym}`)"
-        >
-          <span>{{ formatSymbol(sym) }}</span>
-          <span class="chip-x" title="取消关注" @click.stop="removeWatch(sym)">×</span>
-        </button>
+      <div v-else class="chips-by-group">
+        <div v-for="g in chipGroups" :key="g.id" class="chip-group">
+          <div v-if="chipGroups.length > 1 || filterGroupId !== 'all'" class="chip-group-name">{{ g.name }}</div>
+          <div class="chips">
+            <button
+              v-for="sym in g.symbols"
+              :key="sym"
+              class="chip"
+              type="button"
+              @click="router.push(`/chart/${sym}`)"
+            >
+              <span>{{ formatSymbol(sym) }}</span>
+              <span class="chip-x" title="取消关注" @click.stop="removeWatch(sym)">×</span>
+            </button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -192,8 +221,19 @@ const levelClass = (level: string) => {
 .header-actions { display: flex; gap: var(--space-sm); }
 .scan-hint { font-size: 13px; color: var(--text-secondary); margin: calc(-1 * var(--space-sm)) 0 var(--space-md); }
 .watch-bar { margin-bottom: var(--space-lg); display: flex; flex-direction: column; gap: var(--space-sm); }
-.watch-search { max-width: 420px; }
+.watch-search { max-width: 520px; display: flex; flex-direction: column; gap: 8px; }
 .watch-search :deep(.symbol-search) { width: 100%; }
+.group-pick { display: flex; flex-wrap: wrap; gap: 12px; }
+.group-pick label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.group-pick select { font-size: 13px; }
+.chips-by-group { display: flex; flex-direction: column; gap: 10px; }
+.chip-group-name { font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }
 .watch-hint { font-size: 13px; color: var(--text-secondary); }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; }
 .chip {

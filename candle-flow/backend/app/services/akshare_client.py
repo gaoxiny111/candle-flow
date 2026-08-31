@@ -10,6 +10,7 @@ from app.core.exceptions import DataSourceError
 from app.utils.symbol import (
     SymbolError,
     futures_sina_code,
+    is_etf_symbol,
     is_future,
     is_index_symbol,
     normalize_symbol,
@@ -107,6 +108,33 @@ class AKShareClient:
             start_date=start,
             end_date=end,
         )
+
+    def _fetch_etf(self, code: str, market: str, start: str, end: str) -> pd.DataFrame:
+        import akshare as ak
+
+        sina_sym = f"{market}{code}"
+        try:
+            df = ak.fund_etf_hist_em(
+                symbol=code,
+                period="daily",
+                start_date=start,
+                end_date=end,
+                adjust="qfq",
+            )
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            logger.warning("eastmoney etf hist failed for %s: %s; fallback to sina", code, e)
+
+        df = ak.fund_etf_hist_sina(symbol=sina_sym)
+        if df is None or df.empty:
+            raise ValueError(f"ETF 行情为空: {sina_sym}")
+        out = df.copy()
+        out["date"] = pd.to_datetime(out["date"]).dt.date
+        start_d = date(int(start[:4]), int(start[4:6]), int(start[6:8]))
+        end_d = date(int(end[:4]), int(end[4:6]), int(end[6:8]))
+        out = out[(out["date"] >= start_d) & (out["date"] <= end_d)]
+        return out[["date", "open", "high", "low", "close", "volume"]]
 
     def _fetch_index(self, code: str, market: str, start: str, end: str) -> pd.DataFrame:
         import akshare as ak
@@ -353,6 +381,8 @@ class AKShareClient:
                     df = self._fetch_future(futures_sina_code(symbol))
                 elif is_index_symbol(symbol):
                     df = self._fetch_index(code, market, start, end)
+                elif is_etf_symbol(symbol):
+                    df = self._fetch_etf(code, market, start, end)
                 elif _is_b_share(code):
                     df = self._fetch_b_share(code, market, start, end)
                 else:
