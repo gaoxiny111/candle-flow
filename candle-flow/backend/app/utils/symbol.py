@@ -114,9 +114,20 @@ NAME_ALIASES: dict[str, str] = {
     "平安": "601318.SH",
     "五粮液": "000858.SZ",
     "平安银行": "000001.SZ",
+    "上证指数": "000001.SH",
+    "上证": "000001.SH",
+    "大盘": "000001.SH",
+    "沪指": "000001.SH",
+    "深证成指": "399001.SZ",
+    "深成指": "399001.SZ",
+    "创业板指": "399006.SZ",
+    "创业板指数": "399006.SZ",
+    "沪深300": "000300.SH",
+    "上证50": "000016.SH",
+    "科创50": "000688.SH",
 }
 
-# 股票代码 -> 中文名称
+# 股票/指数代码 -> 中文名称
 SYMBOL_NAMES: dict[str, str] = {
     "000001.SZ": "平安银行",
     "600519.SH": "贵州茅台",
@@ -124,6 +135,12 @@ SYMBOL_NAMES: dict[str, str] = {
     "601318.SH": "中国平安",
     "601088.SH": "中国神华",
     "900948.SH": "伊泰B股",
+    "000001.SH": "上证指数",
+    "399001.SZ": "深证成指",
+    "399006.SZ": "创业板指",
+    "000300.SH": "沪深300",
+    "000016.SH": "上证50",
+    "000688.SH": "科创50",
 }
 
 
@@ -148,8 +165,25 @@ def futures_symbol(code: str) -> str | None:
     return None
 
 
+def is_index_symbol(symbol: str) -> bool:
+    """True for major CN indices (not tradeable stocks), e.g. 000001.SH / 399001.SZ."""
+    raw = (symbol or "").strip().upper()
+    if not raw:
+        return False
+    m = SYMBOL_WITH_MARKET.match(raw)
+    if not m:
+        return False
+    code, market = m.group(1), m.group(2).upper()
+    if market == "SH" and code.startswith("000"):
+        # 上证指数 / 上证50 / 沪深300 / 科创50 等均为 000xxx.SH
+        return True
+    if market == "SZ" and code.startswith("399"):
+        return True
+    return False
+
+
 def normalize_symbol(symbol: str) -> str:
-    """Normalize to 000001.SZ / 600519.SH (stocks only)."""
+    """Normalize to 000001.SZ / 600519.SH / 000001.SH (stocks + CN indices)."""
     raw = (symbol or "").strip()
     if not raw:
         raise SymbolError("代码不能为空")
@@ -171,6 +205,7 @@ def normalize_symbol(symbol: str) -> str:
         if code.startswith(("6", "9")):
             return f"{code}.SH"
         if code.startswith(("0", "3")):
+            # bare 000001 → 个股平安银行；上证指数请用 000001.SH 或「上证指数」
             return f"{code}.SZ"
         raise SymbolError(f"无法识别市场: {code}，请使用完整格式如 {code}.SH")
 

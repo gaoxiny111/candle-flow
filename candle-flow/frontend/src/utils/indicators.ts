@@ -14,15 +14,26 @@ export function barTime(k: KlineItem): string {
 }
 
 export function sanitizeKlines(data: KlineItem[]): KlineItem[] {
-  if (data.length < 8) return data
-  const recent = data.slice(-10).map((k) => Number(k.close)).sort((a, b) => a - b)
+  if (!data.length) return data
+  // Drop duplicate dates (keep last) — LWC requires strictly ascending times.
+  const byDay = new Map<string, KlineItem>()
+  for (const k of data) {
+    byDay.set(barTime(k), k)
+  }
+  const deduped = [...byDay.values()].sort((a, b) => barTime(a).localeCompare(barTime(b)))
+  if (deduped.length < 8) return deduped
+  const recent = deduped
+    .slice(-10)
+    .map((k) => Number(k.close))
+    .filter((c) => Number.isFinite(c))
+    .sort((a, b) => a - b)
   const anchor = recent[Math.floor(recent.length / 2)]
-  if (!anchor) return data
-  const filtered = data.filter((k) => {
+  if (!anchor) return deduped
+  const filtered = deduped.filter((k) => {
     const c = Number(k.close)
     return c >= anchor * 0.45 && c <= anchor * 2.2
   })
-  return filtered.length >= 8 ? filtered : data
+  return filtered.length >= 8 ? filtered : deduped
 }
 
 function ema(values: number[], period: number): (number | null)[] {

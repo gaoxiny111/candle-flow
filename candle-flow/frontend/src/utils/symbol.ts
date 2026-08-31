@@ -1,7 +1,7 @@
 import { ref } from 'vue'
 import { fetchSymbolNames } from '@/api'
 
-/** 股票代码 -> 中文名称 */
+/** 股票/指数代码 -> 中文名称 */
 export const SYMBOL_NAMES: Record<string, string> = {
   '000001.SZ': '平安银行',
   '600519.SH': '贵州茅台',
@@ -9,6 +9,12 @@ export const SYMBOL_NAMES: Record<string, string> = {
   '601318.SH': '中国平安',
   '601088.SH': '中国神华',
   '900948.SH': '伊泰B股',
+  '000001.SH': '上证指数',
+  '399001.SZ': '深证成指',
+  '399006.SZ': '创业板指',
+  '000300.SH': '沪深300',
+  '000016.SH': '上证50',
+  '000688.SH': '科创50',
 }
 
 /** Normalize A-share symbol to standard format */
@@ -21,10 +27,30 @@ const ALIASES: Record<string, string> = {
   平安: '601318.SH',
   五粮液: '000858.SZ',
   平安银行: '000001.SZ',
+  上证指数: '000001.SH',
+  上证: '000001.SH',
+  大盘: '000001.SH',
+  沪指: '000001.SH',
+  深证成指: '399001.SZ',
+  深成指: '399001.SZ',
+  创业板指: '399006.SZ',
+  创业板指数: '399006.SZ',
+  沪深300: '000300.SH',
+  上证50: '000016.SH',
+  科创50: '000688.SH',
 }
 
 function isFutureSymbol(symbol: string): boolean {
   return symbol.trim().toUpperCase().endsWith('.FUT')
+}
+
+export function isIndexSymbol(symbol: string): boolean {
+  const m = /^(\d{6})\.(SH|SZ)$/.exec(symbol.trim().toUpperCase())
+  if (!m) return false
+  const [, code, market] = m
+  if (market === 'SH' && code.startsWith('000')) return true
+  if (market === 'SZ' && code.startsWith('399')) return true
+  return false
 }
 
 export function normalizeSymbol(input: string): string {

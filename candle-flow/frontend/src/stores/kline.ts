@@ -18,7 +18,7 @@ export const useKlineStore = defineStore('kline', {
     },
     isRealData: (s) => s.klineList.length > 0 && s.dataSource === 'akshare',
   },
-  actions: {
+    actions: {
     async fetchKlineData(symbol?: string, refresh = false) {
       const sym = symbol || this.currentSymbol
       this.loading = true
@@ -37,11 +37,19 @@ export const useKlineStore = defineStore('kline', {
         this.loading = false
       }
     },
+    /**
+     * Open a symbol for the chart: load local bars and let GET /kline
+     * auto-backfill today's session. Full hist purge only when empty/broken.
+     */
     async switchSymbol(symbol: string): Promise<boolean> {
       this.currentSymbol = symbol
       this.loading = true
       this.error = null
       try {
+        await this.fetchKlineData(symbol, false)
+        if (this.klineList.length) {
+          return false
+        }
         const { data } = await syncKline(symbol, true)
         const purged = data.data?.purged ?? false
         await this.fetchKlineData(symbol, true)

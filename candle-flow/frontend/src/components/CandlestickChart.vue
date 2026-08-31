@@ -15,8 +15,10 @@ const props = withDefaults(
     showMa?: boolean
     showBoll?: boolean
     showRetrace?: boolean
+    /** daily | weekly — controls default zoom window */
+    period?: string
   }>(),
-  { showMa: true, showBoll: false, showRetrace: false }
+  { showMa: true, showBoll: false, showRetrace: false, period: 'daily' }
 )
 
 const emit = defineEmits<{
@@ -41,6 +43,11 @@ let bollDnSeries: ISeriesApi<'Line'> | null = null
 let windowSeries: ISeriesApi<'Line'>[] = []
 let retraceSeries: ISeriesApi<'Line'>[] = []
 let syncing = false
+/** Data identity for deciding default zoom vs preserve user pan. */
+let lastDataKey = ''
+/** ~3 calendar months of A-share sessions */
+const DAILY_VISIBLE_BARS = 63
+const WEEKLY_VISIBLE_BARS = 52
 
 function clearExtraSeries(list: ISeriesApi<'Line'>[]) {
   if (!chart) return
@@ -75,6 +82,8 @@ function drawWindows(bars: KlineItem[]) {
   for (const z of zones) {
     const start = bars[z.startIndex]
     if (!start || !last) continue
+    // Window on the last bar alone cannot form a 2-point line (same timestamp).
+    if (z.startIndex >= bars.length - 1) continue
     const rising = z.kind === 'rising'
     const color = rising ? '#d4380d' : '#389e0d'
     const keyTitle = rising ? '升窗下沿' : '降窗上沿'
@@ -82,6 +91,8 @@ function drawWindows(bars: KlineItem[]) {
     const otherPrice = rising ? z.top : z.bottom
     const from = barTime(start)
     const to = barTime(last)
+    if (!from || !to || from >= to) continue
+    if (!Number.isFinite(keyPrice) || !Number.isFinite(otherPrice)) continue
     const key = chart.addLineSeries({
       color,
       lineWidth: 2,
@@ -98,14 +109,24 @@ function drawWindows(bars: KlineItem[]) {
       lastValueVisible: false,
       crosshairMarkerVisible: false,
     })
-    key.setData([
-      { time: from, value: keyPrice },
-      { time: to, value: keyPrice },
-    ])
-    other.setData([
-      { time: from, value: otherPrice },
-      { time: to, value: otherPrice },
-    ])
+    try {
+      key.setData([
+        { time: from, value: keyPrice },
+        { time: to, value: keyPrice },
+      ])
+      other.setData([
+        { time: from, value: otherPrice },
+        { time: to, value: otherPrice },
+      ])
+    } catch {
+      try {
+        chart.removeSeries(key)
+        chart.removeSeries(other)
+      } catch {
+        /* ignore */
+      }
+      continue
+    }
     windowSeries.push(key, other)
     legend.push({ title: `${keyTitle} ${keyPrice.toFixed(2)}`, color })
   }
@@ -125,6 +146,10 @@ function drawRetracements(bars: KlineItem[]) {
   }
   const from = barTime(bars[Math.max(0, bars.length - 50)])
   const to = barTime(bars[bars.length - 1])
+  if (!from || !to || from >= to) {
+    retraceLegend.value = []
+    return
+  }
   const colors = ['#722ed1', '#13c2c2', '#eb2f96']
   const legend: { title: string; color: string }[] = []
   levels.forEach((lv, i) => {
@@ -210,10 +235,44 @@ function scrollToDate(dateStr: string) {
   })
 }
 
+function dataKeyOf(bars: KlineItem[]) {
+  if (!bars.length) return ''
+  return `${props.period}|${barTime(bars[0])}|${barTime(bars[bars.length - 1])}|${bars.length}`
+}
+
+function applyDefaultWindow(bars: KlineItem[]) {
+  if (!chart || !bars.length) return
+  const window = props.period === 'weekly' ? WEEKLY_VISIBLE_BARS : DAILY_VISIBLE_BARS
+  const toIdx = bars.length - 1
+  const fromIdx = Math.max(0, toIdx - (window - 1))
+  const from = barTime(bars[fromIdx])
+  const to = barTime(bars[toIdx])
+  syncing = true
+  try {
+    // Time-based range is more reliable than logical index after setData.
+    chart.timeScale().setVisibleRange({ from: from as never, to: to as never })
+  } catch {
+    chart.timeScale().setVisibleLogicalRange({ from: fromIdx, to: toIdx + 0.5 })
+  } finally {
+    syncing = false
+  }
+}
+
+function scheduleDefaultWindow(bars: KlineItem[]) {
+  applyDefaultWindow(bars)
+  // Beat Lightweight Charts internal fitContent after setData / layout.
+  requestAnimationFrame(() => applyDefaultWindow(bars))
+  setTimeout(() => applyDefaultWindow(bars), 50)
+  setTimeout(() => applyDefaultWindow(bars), 200)
+}
+
 function updateData(focusDate?: string) {
   if (!candleSeries || !props.klineData.length) return
   const bars = sanitizeKlines(props.klineData)
   if (!bars.length) return
+  const nextKey = dataKeyOf(bars)
+  const dataChanged = nextKey !== lastDataKey
+
   candleSeries.setData(toChartData(bars))
   if (volumeSeries) {
     volumeSeries.setData(
@@ -265,10 +324,30 @@ function updateData(focusDate?: string) {
   drawWindows(bars)
   drawRetracements(bars)
   candleSeries.priceScale().applyOptions({ autoScale: true, scaleMargins: { top: 0.08, bottom: 0.18 } })
+
   if (focusDate) {
-    scrollToDate(focusDate)
-  } else if (!props.highlightPatternId) {
-    chart?.timeScale().fitContent()
+    requestAnimationFrame(() => scrollToDate(focusDate))
+    lastDataKey = nextKey
+    return
+  }
+  // Always re-assert the default ~3m window when data/period changes;
+  // setData otherwise expands to full history.
+  if (dataChanged) {
+    lastDataKey = nextKey
+    scheduleDefaultWindow(bars)
+  } else {
+    // Marker-only refresh: keep current window if possible, else default.
+    const cur = chart?.timeScale().getVisibleLogicalRange()
+    if (cur && cur.to - cur.from <= DAILY_VISIBLE_BARS + 5) {
+      syncing = true
+      try {
+        chart?.timeScale().setVisibleLogicalRange(cur)
+      } finally {
+        syncing = false
+      }
+    } else {
+      scheduleDefaultWindow(bars)
+    }
   }
 }
 
@@ -362,6 +441,7 @@ defineExpose({
   fitContent: () => chart?.timeScale().fitContent(),
   scrollToDate,
   setLogicalRange,
+  getVisibleLogicalRange: () => chart?.timeScale().getVisibleLogicalRange() ?? null,
 })
 
 let ro: ResizeObserver | null = null
@@ -379,7 +459,17 @@ onUnmounted(() => {
 })
 
 watch(
-  () => [props.klineData, props.markers, props.highlightPatternId, props.showAllMarkers, props.showMa, props.showBoll, props.showRetrace] as const,
+  () =>
+    [
+      props.klineData,
+      props.markers,
+      props.highlightPatternId,
+      props.showAllMarkers,
+      props.showMa,
+      props.showBoll,
+      props.showRetrace,
+      props.period,
+    ] as const,
   () => {
     const highlighted = props.markers?.find((p) => p.id === props.highlightPatternId)
     updateData(highlighted?.candle_date)

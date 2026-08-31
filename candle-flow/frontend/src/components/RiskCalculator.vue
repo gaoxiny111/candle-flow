@@ -39,9 +39,9 @@ async function calc() {
 }
 
 watch(() => [props.entryPrice, props.stopLoss, props.capital], () => {
-  if (props.entryPrice) entry.value = props.entryPrice
-  if (props.stopLoss) stop.value = props.stopLoss
-  if (props.capital) capital.value = props.capital
+  if (props.entryPrice != null && Number.isFinite(props.entryPrice)) entry.value = props.entryPrice
+  if (props.stopLoss != null && Number.isFinite(props.stopLoss)) stop.value = props.stopLoss
+  if (props.capital != null && Number.isFinite(props.capital)) capital.value = props.capital
 })
 
 const saved = localStorage.getItem('risk_history')

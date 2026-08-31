@@ -159,7 +159,7 @@ def test_confluence_buy_at_low_agrees():
     assert "低点" in names or "RSI" in names or "放量" in names
 
 
-def test_confluence_blocks_chase_high():
+def test_confluence_soft_conflict_chase_high():
     from app.core.confluence import evaluate_confluence
 
     bars = []
@@ -168,8 +168,9 @@ def test_confluence_blocks_chase_high():
         price *= 1.02
         bars.append(_K(price, price * 1.01, price * 0.995, 1500))
     result = evaluate_confluence(bars, len(bars) - 1, "bullish")
-    assert not result.ok
-    assert result.blocked or result.count < 2
+    # Overbought chase is a soft warning, not a hard weekly veto.
+    assert any("高位" in c or "追涨" in c for c in result.soft_conflicts) or result.count < 2
+    assert not result.hard_conflicts
 
 
 def test_window_fill_by_close_not_wick():

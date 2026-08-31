@@ -20,6 +20,8 @@ from app.models.signal import TradingSignal
 from app.schemas.signal import SignalOut
 from app.services.kline_service import KlineService
 from app.services.risk_service import RiskService
+from app.utils.price_filter import is_price_outlier
+from app.utils.symbol import is_index_symbol, normalize_symbol
 
 # 英文形态名 -> 中文（与前端 labels 一致，用于关联旧信号）
 PATTERN_NAME_ZH = {
@@ -299,6 +301,43 @@ class SignalService:
         ).delete()
         self.db.commit()
 
+    def clear_open_signals(self, symbol: str) -> None:
+        """Remove pending/active signals so regenerate always mirrors latest scan."""
+        self.db.query(TradingSignal).filter(
+            TradingSignal.symbol == symbol,
+            TradingSignal.status.in_(["pending", "confirmed", "active"]),
+        ).delete()
+        self.db.commit()
+
+    def purge_outlier_signals(self, symbol: str) -> int:
+        """Drop open signals whose entry is far from the latest close (bad hist leftovers)."""
+        latest = KlineService(self.db).get_latest(symbol)
+        if not latest:
+            return 0
+        anchor = float(latest.close)
+        if anchor <= 0:
+            return 0
+        rows = (
+            self.db.query(TradingSignal)
+            .filter(
+                TradingSignal.symbol == symbol,
+                TradingSignal.status.in_(["pending", "confirmed", "active"]),
+            )
+            .all()
+        )
+        removed = 0
+        for s in rows:
+            try:
+                entry = float(s.entry_price)
+            except (TypeError, ValueError):
+                entry = 0.0
+            if entry <= 0 or is_price_outlier(entry, anchor):
+                self.db.delete(s)
+                removed += 1
+        if removed:
+            self.db.commit()
+        return removed
+
     def _create_signal_for_pattern(
         self,
         pattern: PatternRecord,
@@ -311,6 +350,7 @@ class SignalService:
         confluence_detail: str = "",
         klines: Optional[list] = None,
         kline_index: Optional[int] = None,
+        soft_warning: str = "",
     ) -> bool:
         signal_type = "buy" if pattern.direction == "bullish" else "sell"
         if signal_type == "buy" and stop >= entry:
@@ -332,6 +372,9 @@ class SignalService:
             tp1, tp2 = entry - risk_distance * 2, entry - risk_distance * 3
             notes = "蜡烛图不提供目标价；止盈按风险回报 2R/3R。"
 
+        if soft_warning:
+            notes = f"{notes} | 注意：{soft_warning}" if notes else f"注意：{soft_warning}"
+
         reward = abs(tp1 - entry)
         if reward / risk_distance < MIN_RISK_REWARD:
             return False
@@ -345,10 +388,15 @@ class SignalService:
         )
 
         combined = float(pattern.score) + confluence_count * 6
+        # Soft conflicts (e.g. overbought chase) warn but do not veto; cap level.
+        if soft_warning and combined < 90:
+            level = "medium"
+        else:
+            level = self._level_from_score(combined)
         signal = TradingSignal(
             symbol=pattern.symbol,
             signal_type=signal_type,
-            signal_level=self._level_from_score(combined),
+            signal_level=level,
             pattern_name=pattern.pattern_name,
             pattern_id=pattern.id,
             pattern_date=pattern.candle_date,
@@ -437,6 +485,7 @@ class SignalService:
             stop = pattern_stop(ordered, idx, p.direction, p.pattern_name)
             if stop is None:
                 continue
+            soft_warning = "；".join(confluence.soft_conflicts) if confluence.soft_conflicts else ""
             if self._create_signal_for_pattern(
                 p,
                 entry,
@@ -448,6 +497,7 @@ class SignalService:
                 confluence.details_json,
                 ordered,
                 idx,
+                soft_warning,
             ):
                 created += 1
         if created:
@@ -474,7 +524,7 @@ class SignalService:
                 best_by_name[p.pattern_name] = p
         return list(best_by_name.values())
 
-    SIGNAL_LOOKBACK_BARS = 20
+    SIGNAL_LOOKBACK_BARS = 7
 
     def generate_from_patterns(self, symbol: str, capital: float = 100000, risk_pct: float = 1.0):
         """为最近形态生成信号（近 20 个交易日）"""
@@ -488,9 +538,56 @@ class SignalService:
         self.generate_for_patterns(patterns, klines_by_date, capital, risk_pct)
         self.refresh_open_positions(symbol)
 
+    def expire_reached_pending(self, symbol: str) -> int:
+        """Close pending signals whose first target (or ~8% move) is already hit."""
+        latest = KlineService(self.db).get_latest(symbol)
+        if not latest:
+            return 0
+        close = float(latest.close)
+        rows = (
+            self.db.query(TradingSignal)
+            .filter(
+                TradingSignal.symbol == symbol,
+                TradingSignal.status == "pending",
+            )
+            .all()
+        )
+        closed = 0
+        for s in rows:
+            try:
+                entry = float(s.entry_price)
+                tp1 = float(s.take_profit_1) if s.take_profit_1 is not None else None
+            except (TypeError, ValueError):
+                continue
+            hit = False
+            if s.signal_type == "buy":
+                if tp1 is not None and close >= tp1:
+                    hit = True
+                elif entry > 0 and close >= entry * 1.08:
+                    hit = True
+            elif s.signal_type == "sell":
+                if tp1 is not None and close <= tp1:
+                    hit = True
+                elif entry > 0 and close <= entry * 0.92:
+                    hit = True
+            if hit:
+                s.status = "closed"
+                s.notes = ((s.notes or "") + " | 价格已达目标，自动失效").strip(" |")
+                s.closed_at = datetime.utcnow()
+                closed += 1
+        if closed:
+            self.db.commit()
+        return closed
+
     def regenerate(self, symbol: str, capital: float = 100000, risk_pct: float = 1.0) -> int:
-        """清除 pending 信号并按最新形态重新生成"""
-        self.clear_pending(symbol)
+        """按最新 K 线与形态全量重建未平仓信号。"""
+        try:
+            symbol = normalize_symbol(symbol)
+        except Exception:
+            pass
+        self.expire_reached_pending(symbol)
+        self.clear_open_signals(symbol)
+        self.purge_outlier_signals(symbol)
         kline_svc = KlineService(self.db)
         klines, _ = kline_svc.get_recent_klines(symbol, limit=120)
         if not klines:
@@ -498,4 +595,20 @@ class SignalService:
         klines_by_date = {k.date: k for k in klines}
         recent_dates = {k.date for k in klines[-self.SIGNAL_LOOKBACK_BARS :]}
         patterns = self._patterns_in_window(symbol, recent_dates)
-        return self.generate_for_patterns(patterns, klines_by_date, capital, risk_pct)
+        created = self.generate_for_patterns(patterns, klines_by_date, capital, risk_pct)
+        if created and is_index_symbol(symbol):
+            rows = (
+                self.db.query(TradingSignal)
+                .filter(
+                    TradingSignal.symbol == symbol,
+                    TradingSignal.status == "pending",
+                )
+                .all()
+            )
+            for row in rows:
+                note = (row.notes or "").strip()
+                tag = "指数点位仅供形态参考，非个股可交易报价"
+                if tag not in note:
+                    row.notes = f"{note} | {tag}" if note else tag
+            self.db.commit()
+        return created

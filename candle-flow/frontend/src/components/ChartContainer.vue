@@ -44,8 +44,8 @@ function resize() {
   atrRef.value?.resize()
 }
 
-function applyRange(range: LogicalRange) {
-  chartRef.value?.setLogicalRange(range)
+function applyRangeFromMain(range: LogicalRange) {
+  // Main candle chart is the only zoom source; panes follow (never the reverse).
   macdRef.value?.setLogicalRange(range)
   rsiRef.value?.setLogicalRange(range)
   stochRef.value?.setLogicalRange(range)
@@ -57,8 +57,14 @@ onMounted(() => {
   if (containerRef.value) ro.observe(containerRef.value)
 })
 
-watch(() => props.klineData, () => {
-  setTimeout(resize, 50)
+watch(() => props.klineData, async () => {
+  await nextTick()
+  setTimeout(() => {
+    resize()
+    const range = chartRef.value?.getVisibleLogicalRange?.()
+    // Only push to panes when main chart is already in a ~3m window (avoid re-expanding).
+    if (range && range.to - range.from <= 80) applyRangeFromMain(range)
+  }, 220)
 }, { deep: true })
 
 watch(() => [props.showMacd, props.showRsi, props.showStoch, props.showAtr, props.showBoll, props.showRetrace], async () => {
@@ -77,6 +83,7 @@ defineExpose({ resize, fitContent: () => chartRef.value?.fitContent() })
         <CandlestickChart
           ref="chartRef"
           :kline-data="klineData"
+          :period="period || 'daily'"
           :markers="patterns"
           :highlight-pattern-id="highlightPatternId"
           :show-all-markers="showAllMarkers"
@@ -84,32 +91,28 @@ defineExpose({ resize, fitContent: () => chartRef.value?.fitContent() })
           :show-boll="showBoll === true"
           :show-retrace="showRetrace === true"
           @crosshair-move="emit('crosshairMove', $event)"
-          @range-change="applyRange"
+          @range-change="applyRangeFromMain"
         />
       </div>
       <MacdPane
         v-if="showMacd"
         ref="macdRef"
         :kline-data="klineData"
-        @range-change="applyRange"
       />
       <RsiPane
         v-if="showRsi"
         ref="rsiRef"
         :kline-data="klineData"
-        @range-change="applyRange"
       />
       <StochPane
         v-if="showStoch"
         ref="stochRef"
         :kline-data="klineData"
-        @range-change="applyRange"
       />
       <AtrPane
         v-if="showAtr"
         ref="atrRef"
         :kline-data="klineData"
-        @range-change="applyRange"
       />
     </div>
   </div>

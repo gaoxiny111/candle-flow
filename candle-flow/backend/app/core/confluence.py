@@ -31,8 +31,17 @@ class ConfluenceResult:
         return len(self.hits)
 
     @property
+    def hard_conflicts(self) -> list[str]:
+        # Only weekly counter-trend is a hard veto; chase/overbought stays as warning.
+        return [c for c in self.conflicts if c.startswith("周线")]
+
+    @property
+    def soft_conflicts(self) -> list[str]:
+        return [c for c in self.conflicts if not c.startswith("周线")]
+
+    @property
     def blocked(self) -> bool:
-        return bool(self.conflicts)
+        return bool(self.hard_conflicts)
 
     @property
     def ok(self) -> bool:

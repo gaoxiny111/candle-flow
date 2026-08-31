@@ -13,7 +13,7 @@ import { useConfigStore } from '@/stores/config'
 import { useWatchlistStore } from '@/stores/watchlist'
 import { resolveSymbolQuery } from '@/api'
 import { patternNameZh } from '@/utils/labels'
-import { rememberSymbol, formatSymbol, tryNormalizeSymbol } from '@/utils/symbol'
+import { rememberSymbol, formatSymbol, tryNormalizeSymbol, isIndexSymbol } from '@/utils/symbol'
 import { mapPatternsToWeekly, toWeekly, weeklyBias } from '@/utils/timeframe'
 import type { SignalItem } from '@/api'
 
@@ -52,8 +52,12 @@ const quote = computed(() => {
   const change = lastPrice - prevClose
   const pct = prevClose ? (change / prevClose) * 100 : 0
   const barDate = String(last.date).slice(0, 10)
-  const now = new Date()
-  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+  const today = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date())
   return { lastPrice, change, pct, label: barDate === today ? '今日' : barDate.slice(5) }
 })
 
@@ -80,6 +84,11 @@ function formatQuoteChange() {
   return `${sign}${change.toFixed(2)} (${sign}${pct.toFixed(2)}%)`
 }
 
+function finiteNum(v: unknown): number | undefined {
+  const n = typeof v === 'number' ? v : Number(v)
+  return Number.isFinite(n) ? n : undefined
+}
+
 async function resolveInput(sym: string) {
   const asCode = tryNormalizeSymbol(sym)
   if (asCode) return asCode
@@ -99,6 +108,8 @@ async function loadAll(sym: string) {
   inputError.value = ''
   highlightPatternId.value = null
   selectedSignal.value = null
+  // Avoid persisted filters hiding all patterns ("共 0 个形态").
+  pattern.updateFilter('', '')
   try {
     const normalized = await resolveInput(sym)
     symbolInput.value = normalized
@@ -106,18 +117,13 @@ async function loadAll(sym: string) {
       await router.replace(`/chart/${normalized}`)
       return
     }
-    const purged = await kline.switchSymbol(normalized)
-    await pattern.fetchPatterns(normalized)
-    await signal.fetchSignals(normalized)
-    const missingDate = signal.signals.some((s) => s.status === 'pending' && !s.pattern_date)
-    if (purged || !pattern.patterns.length || missingDate) {
-      try {
-        await pattern.scanPatterns(normalized)
-        await signal.fetchSignals(normalized)
-      } catch {
-        /* 行情源暂时不可用时，继续展示本地已有形态/信号 */
-      }
+    await kline.switchSymbol(normalized)
+    try {
+      await pattern.scanPatterns(normalized)
+    } catch {
+      await pattern.fetchPatterns(normalized)
     }
+    await signal.fetchSignals(normalized)
   } catch (e) {
     inputError.value = e instanceof Error ? e.message : '无效股票代码'
   }
@@ -126,14 +132,6 @@ async function loadAll(sym: string) {
 async function onScan() {
   await pattern.scanPatterns(symbol.value)
   await signal.fetchSignals(symbol.value)
-}
-
-async function onSync() {
-  const purged = await kline.syncLatest()
-  if (purged || !pattern.patterns.length) {
-    await pattern.scanPatterns(symbol.value)
-    await signal.fetchSignals(symbol.value)
-  }
 }
 
 async function onConfirm(id: number) {
@@ -186,7 +184,6 @@ watch(symbol, (s) => loadAll(s))
         <button class="btn-primary" @click="loadAll(symbolInput)">加载</button>
       </div>
       <div class="toolbar-actions">
-        <button class="btn-secondary" @click="onSync">同步数据</button>
         <button class="btn-primary" :disabled="pattern.scanning" @click="onScan">
           {{ pattern.scanning ? '扫描中...' : '形态扫描' }}
         </button>
@@ -218,7 +215,7 @@ watch(symbol, (s) => loadAll(s))
     </div>
 
     <div v-if="kline.error && !kline.klineList.length" class="card empty-chart">
-      无法加载 K 线：{{ kline.error }}。请检查网络后点击「同步数据」重试。
+      无法加载 K 线：{{ kline.error }}。请检查网络后重新加载。
     </div>
 
     <div v-else class="main-layout">
@@ -247,13 +244,14 @@ watch(symbol, (s) => loadAll(s))
           :selected-id="selectedSignal?.id ?? null"
           :kline-data="kline.klineList"
           :patterns="pattern.patterns"
+          :is-index="isIndexSymbol(symbol)"
           @select-signal="onSignalSelect"
           @confirm-signal="onConfirm"
           @dismiss-signal="onDismiss"
         />
         <RiskCalculator
-          :entry-price="Number(selectedSignal?.entry_price ?? kline.latestKline?.close)"
-          :stop-loss="Number(selectedSignal?.stop_loss)"
+          :entry-price="finiteNum(selectedSignal?.entry_price ?? kline.latestKline?.close)"
+          :stop-loss="finiteNum(selectedSignal?.stop_loss)"
           :capital="config.defaultCapital"
         />
       </aside>
@@ -275,7 +273,7 @@ watch(symbol, (s) => loadAll(s))
         <input v-model="showPatternMarkers" type="checkbox" />
         显示全部标注
       </label>
-      <span class="pattern-count">共 {{ pattern.filteredPatterns.length }} 个形态</span>
+      <span class="pattern-count">共 {{ pattern.patterns.length }} 个形态</span>
     </div>
   </div>
 </template>

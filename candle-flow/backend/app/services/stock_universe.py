@@ -181,13 +181,16 @@ def refresh_universe(db: Session, force: bool = False) -> int:
 
 
 def _is_stock(item: StockInfo | dict) -> bool:
+    """Supported chart symbols: A/B shares and CN indices (not futures)."""
     if isinstance(item, dict):
         sym = str(item.get("symbol", "")).upper()
         market = str(item.get("market", "")).upper()
     else:
         sym = (item.symbol or "").upper()
         market = (item.market or "").upper()
-    return market != "FUT" and not sym.endswith(".FUT")
+    if market == "FUT" or sym.endswith(".FUT"):
+        return False
+    return True
 
 
 def _rank(item: StockInfo, q: str) -> tuple[int, int, str]:
@@ -306,9 +309,9 @@ def resolve_symbol(raw: str, db: Optional[Session] = None) -> str:
         db = SessionLocal()
     try:
         ensure_seeded(db)
-        hits = search_stocks(db, text, limit=8)
+        hits = [h for h in search_stocks(db, text, limit=8) if _is_stock(h)]
         if not hits:
-            raise SymbolError(f"未找到标的: {text}，可输入股票如 茅台、600519")
+            raise SymbolError(f"未找到标的: {text}，可输入股票如 茅台、600519，或指数如 上证指数")
         exact = [h for h in hits if h["name"] == text]
         if len(exact) == 1:
             return exact[0]["symbol"]

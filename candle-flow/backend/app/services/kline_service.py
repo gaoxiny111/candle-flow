@@ -1,6 +1,7 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import List, Optional, Tuple
+import logging
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -9,9 +10,11 @@ from app.core.exceptions import DataSourceError
 from app.models.kline import KlineData
 from app.models.pattern import PatternRecord
 from app.models.signal import TradingSignal
-from app.services.akshare_client import akshare_client
+from app.services.akshare_client import akshare_client, is_cn_weekday, trading_today
 from app.utils.price_filter import filter_inliers, is_price_outlier, price_anchor
-from app.utils.symbol import is_b_share, is_future, normalize_symbol, parse_symbol
+from app.utils.symbol import is_b_share, is_future, is_index_symbol, normalize_symbol, parse_symbol
+
+logger = logging.getLogger(__name__)
 
 
 class KlineService:
@@ -106,6 +109,21 @@ class KlineService:
         if is_future(symbol):
             return False
         code, _ = parse_symbol(symbol)
+        if is_index_symbol(symbol):
+            # 指数误用个股行情时会出现 ~10 元与 ~3000 点混杂
+            stats = (
+                self.db.query(
+                    func.min(KlineData.close),
+                    func.max(KlineData.close),
+                )
+                .filter(KlineData.symbol == symbol)
+                .first()
+            )
+            if stats and stats[0] and stats[1]:
+                lo, hi = float(stats[0]), float(stats[1])
+                if lo > 0 and hi / lo > 3:
+                    return True
+            return False
         if is_b_share(symbol):
             max_close = (
                 self.db.query(func.max(KlineData.close))
@@ -216,24 +234,46 @@ class KlineService:
         )
         return True
 
+    def latest_is_stale(self, symbol: str) -> bool:
+        """True when Shanghai trading day has no daily bar yet."""
+        today = trading_today()
+        if not is_cn_weekday(today):
+            return False
+        latest = self.get_latest(symbol)
+        return latest is None or latest.date < today
+
     def merge_today_spot(self, symbol: str) -> bool:
-        """日线源常不含当天，用东财现价补一根今日 K 线。"""
-        if date.today().weekday() >= 5:
+        """日线源常不含当天，用现价补一根今日 K 线（东财 / 腾讯 / 新浪）。"""
+        today = trading_today()
+        if not is_cn_weekday(today):
             return False
         spot = akshare_client.fetch_spot(symbol)
         if not spot:
+            return False
+        # Reject quotes stamped on a different calendar day (stale cache / holiday).
+        spot_date = spot["date"]
+        if isinstance(spot_date, datetime):
+            spot_date = spot_date.date()
+        if spot_date != today:
+            logger.warning(
+                "spot date mismatch for %s: quote=%s shanghai=%s",
+                symbol,
+                spot_date,
+                today,
+            )
             return False
         latest = self.get_latest(symbol)
         vol = int(spot["volume"] or 0)
         if latest and latest.volume and vol > 0 and vol * 50 < int(latest.volume):
             vol *= 100
-        if vol <= 0 and latest and latest.date == spot["date"]:
+        # Keep previous volume when spot reports 0 but we already have today's bar.
+        if vol <= 0 and latest and latest.date == spot_date:
+            vol = int(latest.volume or 0)
+        if vol <= 0 and latest and latest.date == spot_date and float(latest.close) == float(spot["close"]):
             return False
-        if vol <= 0 and latest and float(latest.close) == float(spot["close"]):
-            return False
-        created = self._upsert_bar(
+        self._upsert_bar(
             symbol,
-            spot["date"],
+            spot_date,
             spot["open"],
             spot["high"],
             spot["low"],
@@ -241,7 +281,14 @@ class KlineService:
             vol,
         )
         self.db.commit()
-        return created
+        return True
+
+    def ensure_today_bar(self, symbol: str) -> bool:
+        """Backfill today's bar when hist sync left the series one session behind."""
+        symbol = normalize_symbol(symbol)
+        if not self.latest_is_stale(symbol):
+            return False
+        return self.merge_today_spot(symbol)
 
     def sync(self, symbol: str, force: bool = False) -> tuple[int, bool]:
         symbol = normalize_symbol(symbol)

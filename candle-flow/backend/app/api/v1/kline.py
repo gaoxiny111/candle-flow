@@ -54,6 +54,13 @@ def list_kline(
         except DataSourceError as e:
             if not items:
                 return ApiResponse(code=e.code, message=e.message, data=None)
+    # Opening the chart should always try to attach/refresh today's bar (no Sync click).
+    merged = svc.merge_today_spot(symbol)
+    if not merged and svc.latest_is_stale(symbol):
+        merged = svc.ensure_today_bar(symbol)
+    if merged:
+        items, total = svc.get_klines(symbol, start_date, end_date, page, page_size)
+        items = svc.sanitize_rows(items)
     return ApiResponse(
         data=[KlineOut.model_validate(i) for i in items],
         meta=ResponseMeta(page=page, page_size=page_size, total=len(items)),
@@ -79,6 +86,9 @@ def latest_kline(symbol: str = Query(...), db: Session = Depends(get_db)):
         except DataSourceError as e:
             return ApiResponse(code=e.code, message=e.message, data=None)
         item = svc.get_latest(symbol)
+    elif svc.latest_is_stale(symbol):
+        svc.ensure_today_bar(symbol)
+        item = svc.get_latest(symbol)
     if not item:
         return ApiResponse(code=404101, message="symbol not found", data=None)
     return ApiResponse(data=KlineOut.model_validate(item))
@@ -88,16 +98,23 @@ def latest_kline(symbol: str = Query(...), db: Session = Depends(get_db)):
 def sync_kline(body: KlineSyncRequest, db: Session = Depends(get_db)):
     try:
         symbol = resolve_symbol(body.symbol, db)
-        svc = KlineService(db)
-        removed = svc.purge_outliers(symbol)
-        force = body.force or svc.is_contaminated(symbol)
-        if not force and removed:
-            return ApiResponse(data=KlineSyncResponse(synced_count=removed, purged=True))
+    except SymbolError as e:
+        return ApiResponse(code=400101, message=str(e), data=None)
+
+    svc = KlineService(db)
+    removed = svc.purge_outliers(symbol)
+    force = body.force or svc.is_contaminated(symbol)
+    if not force and removed:
+        return ApiResponse(data=KlineSyncResponse(synced_count=removed, purged=True))
+    try:
         count, purged = svc.sync(symbol, force=force)
-        return ApiResponse(data=KlineSyncResponse(synced_count=count, purged=purged or removed > 0))
     except SymbolError as e:
         return ApiResponse(code=400101, message=str(e), data=None)
     except DataSourceError as e:
         return ApiResponse(code=e.code, message=e.message, data=None)
     except Exception as e:
         return ApiResponse(code=500101, message=f"data source error: {e}", data=None)
+    # Even when hist sync "succeeds" with stale bars, retry spot backfill.
+    if svc.latest_is_stale(symbol):
+        svc.ensure_today_bar(symbol)
+    return ApiResponse(data=KlineSyncResponse(synced_count=count, purged=purged or removed > 0))

@@ -39,6 +39,9 @@ def list_signals(
     if watchlist_only:
         symbol_list = _watchlist_symbols(user, symbols)
         page_size = min(max(page_size, 100), 200)
+    if symbol:
+        svc.expire_reached_pending(symbol)
+        svc.purge_outlier_signals(symbol)
     svc.refresh_open_positions(None if symbol_list is not None else symbol)
     items, total = svc.get_signals(symbol, status, page, page_size, symbols=symbol_list)
     quotes: dict = {}
