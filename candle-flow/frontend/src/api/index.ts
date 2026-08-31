@@ -719,6 +719,46 @@ export const runFundamentalHold = async () => {
   return { data: checkApi(res) }
 }
 
+export interface HoldingsRow {
+  symbol: string
+  name: string
+  price?: number | null
+  change_pct?: number | null
+  pe_ttm?: number | null
+  pe_percentile?: number | null
+  pb_percentile?: number | null
+  hold: HoldInfo
+  score?: number
+  themes?: string[]
+  industry?: string
+}
+
+export const fetchHoldingsRules = async () => {
+  const res = await api.get<
+    ApiResponse<{
+      rules: Record<string, string[]>
+      iron_rules: string[]
+      note: string
+    }>
+  >('/holdings/rules')
+  return { data: checkApi(res) }
+}
+
+export const scanHoldings = async (body: { symbols?: string[]; guest_symbols?: string[] }) => {
+  const res = await api.post<
+    ApiResponse<{
+      count: number
+      counts: Record<string, number>
+      items: HoldingsRow[]
+      regime?: MarketRegime
+      rules?: Record<string, string[]>
+      iron_rules?: string[]
+      note?: string
+    }>
+  >('/holdings/scan', body, { timeout: 180000 })
+  return { data: checkApi(res) }
+}
+
 export const fetchHealth = () => api.get<ApiResponse<{ status: string; db: string; akshare: string }>>('/health')
 
 export interface FlowPoint {

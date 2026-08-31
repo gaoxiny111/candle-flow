@@ -25,6 +25,7 @@ const navItems = computed(() => [
   { path: chartPath.value, label: 'K线图表' },
   { path: '/flow', label: '宽基主力' },
   { path: '/fundamentals', label: '基本面池' },
+  { path: '/holdings', label: '持仓管理' },
   { path: '/bull-tactics', label: '主板战法' },
   { path: '/backtest', label: '回测' },
   { path: '/settings', label: '设置' },
@@ -34,6 +35,7 @@ const isActive = (path: string) => {
   if (path === '/') return route.path === '/'
   if (path === '/flow') return route.path.startsWith('/flow')
   if (path === '/fundamentals') return route.path.startsWith('/fundamentals')
+  if (path === '/holdings') return route.path.startsWith('/holdings')
   if (path === '/bull-tactics') return route.path.startsWith('/bull-tactics')
   return route.path.startsWith(path.split('/').slice(0, 2).join('/'))
 }

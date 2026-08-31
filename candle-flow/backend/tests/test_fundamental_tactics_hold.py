@@ -119,6 +119,28 @@ def test_hold_reduce_when_rich_and_hanging_like_environment():
     assert any(s.kind in {"reduce", "exit", "hold"} for s in r.signals)
 
 
+def test_hold_symbols_empty():
+    from app.services.fundamental_hold import hold_symbols
+    from unittest.mock import MagicMock
+
+    data = hold_symbols(MagicMock(), [])
+    assert data["count"] == 0
+    assert data["counts"]["hold"] == 0
+    assert "add" in data["rules"]
+    assert data["rules"]["add"]
+
+
+def test_hold_rules_cover_user_spec():
+    from app.services.fundamental_hold import HOLD_RULES
+
+    blob = " ".join(HOLD_RULES["add"] + HOLD_RULES["reduce"] + HOLD_RULES["exit"])
+    assert "三法" in blob
+    assert "窗口" in blob
+    assert "70%" in blob or "＞70" in blob
+    assert "200" in blob
+    assert "周线" in blob
+
+
 def test_regime_bull_vs_bear():
     start = datetime(2023, 1, 3)
 

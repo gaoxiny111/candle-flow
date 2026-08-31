@@ -81,6 +81,23 @@ ACTION_LABEL = {
     "exit": "清仓信号",
 }
 
+HOLD_RULES = {
+    "add": [
+        "上升趋势中出现三法（大阳 + 三根小实体回调 + 突破阳线）→ 回调结束，可加仓",
+        "向上跳空窗口未回补 → 趋势强劲，可持有或加仓",
+    ],
+    "reduce": [
+        "PE分位＞70% 后出现上吊线、流星线（射击之星）、黄昏星 → 分批减仓",
+        "日线连续长上影且量能萎缩 → 上方抛压加重，警惕",
+        "跌破关键窗口且3日内未回补 → 支撑失效，减仓",
+    ],
+    "exit": [
+        "基本面逻辑被破坏（业绩暴雷等）→ 不等蜡烛图，立即清仓",
+        "周线看跌吞没 / 黄昏星 / 三乌鸦 → 趋势反转确认，清仓",
+        "跌破200日均线且无法收回 → 长期趋势破坏，清仓",
+    ],
+}
+
 
 def _candle_date(c: Candle) -> str:
     ts = c.timestamp
@@ -365,17 +382,50 @@ def hold_one(
         )
 
 
-def hold_pool(db: Session) -> dict[str, Any]:
-    rows = list_pool(db)
-    quotes = {v["symbol"]: v for v in get_valuations([r.symbol for r in rows], db=db)} if rows else {}
+def hold_symbols(
+    db: Session,
+    symbols: list[str],
+    *,
+    profit_yoy_by_symbol: dict[str, float | None] | None = None,
+    names: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Scan arbitrary symbols (watchlist / holdings) for add·reduce·exit signals."""
+    from app.services.stock_universe import lookup_name
+    from app.utils.symbol import SymbolError, normalize_symbol
 
-    # Preload a few series for regime
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for raw in symbols:
+        try:
+            sym = normalize_symbol((raw or "").strip())
+        except (SymbolError, Exception):
+            continue
+        if sym in seen:
+            continue
+        seen.add(sym)
+        ordered.append(sym)
+
+    if not ordered:
+        return {
+            "count": 0,
+            "counts": {"add": 0, "hold": 0, "reduce": 0, "exit": 0},
+            "regime": detect_market_regime([]),
+            "items": [],
+            "rules": HOLD_RULES,
+            "iron_rules": IRON_RULES,
+            "note": "请先在设置中加入持仓/关注股票",
+        }
+
+    quotes = {v["symbol"]: v for v in get_valuations(ordered, db=db)}
+    yoy_map = profit_yoy_by_symbol or {}
+    name_map = names or {}
+
     sample: list[list[Candle]] = []
     series_cache: dict[str, tuple[list[Candle], list[Candle]]] = {}
-    for row in rows[:12]:
+    for sym in ordered[:12]:
         try:
-            daily, weekly = _load_series(db, row.symbol)
-            series_cache[row.symbol] = (daily, weekly)
+            daily, weekly = _load_series(db, sym)
+            series_cache[sym] = (daily, weekly)
             sample.append(daily)
         except Exception:
             continue
@@ -384,41 +434,57 @@ def hold_pool(db: Session) -> dict[str, Any]:
 
     items: list[dict[str, Any]] = []
     counts = {"add": 0, "hold": 0, "reduce": 0, "exit": 0}
-    for row in rows:
-        base = candidate_out(row, quotes.get(row.symbol))
-        pe = base.get("pe_percentile")
-        if pe is None and quotes.get(row.symbol):
-            pe = quotes[row.symbol].get("pe_percentile")
+    for sym in ordered:
+        q = quotes.get(sym) or {}
+        pe = q.get("pe_percentile")
+        price = q.get("price")
+        change_pct = q.get("change_pct")
+        nm = q.get("name") or name_map.get(sym) or ""
+        if not nm:
+            try:
+                nm = lookup_name(db, sym) or ""
+            except Exception:
+                nm = ""
         try:
-            if row.symbol in series_cache:
-                daily, weekly = series_cache[row.symbol]
+            if sym in series_cache:
+                daily, weekly = series_cache[sym]
             else:
-                daily, weekly = _load_series(db, row.symbol)
+                daily, weekly = _load_series(db, sym)
             hold = hold_from_candles(
                 daily,
                 weekly,
-                symbol=row.symbol,
+                symbol=sym,
                 pe_percentile=float(pe) if pe is not None else None,
-                profit_yoy=row.profit_yoy,
+                profit_yoy=yoy_map.get(sym),
                 regime=regime,
             )
         except Exception as e:
             hold = HoldResult(
-                symbol=row.symbol,
+                symbol=sym,
                 action="hold",
                 label=ACTION_LABEL["hold"],
                 notes=f"失败：{e}",
                 error=str(e),
             )
         counts[hold.action] = counts.get(hold.action, 0) + 1
-        base["hold"] = hold.to_dict()
-        items.append(base)
+        items.append(
+            {
+                "symbol": sym,
+                "name": nm,
+                "price": price,
+                "change_pct": change_pct,
+                "pe_ttm": q.get("pe_ttm"),
+                "pe_percentile": pe,
+                "pb_percentile": q.get("pb_percentile"),
+                "hold": hold.to_dict(),
+            }
+        )
 
     order = {"exit": 0, "reduce": 1, "add": 2, "hold": 3}
     items.sort(
         key=lambda x: (
             order.get((x.get("hold") or {}).get("action"), 9),
-            -(x.get("score") or 0),
+            (x.get("symbol") or ""),
         )
     )
     return {
@@ -426,6 +492,34 @@ def hold_pool(db: Session) -> dict[str, Any]:
         "counts": counts,
         "regime": regime_info,
         "items": items,
+        "rules": HOLD_RULES,
         "iron_rules": IRON_RULES,
-        "note": "第四层持仓管理：加仓（三法/窗口）· 减仓（高估+顶部形态/破窗）· 清仓（基本面/周线反转/破MA200）。",
+        "note": "持仓管理：加仓（三法/窗口）· 减仓（高估+顶部形态/破窗）· 清仓（基本面/周线反转/破MA200）。",
     }
+
+
+def hold_pool(db: Session) -> dict[str, Any]:
+    rows = list_pool(db)
+    yoy = {r.symbol: r.profit_yoy for r in rows}
+    names = {r.symbol: r.name for r in rows}
+    data = hold_symbols(
+        db,
+        [r.symbol for r in rows],
+        profit_yoy_by_symbol=yoy,
+        names=names,
+    )
+    # Enrich with pool scorecard fields when available
+    by_sym = {r.symbol: r for r in rows}
+    quotes = {v["symbol"]: v for v in get_valuations([r.symbol for r in rows], db=db)} if rows else {}
+    enriched = []
+    for item in data["items"]:
+        row = by_sym.get(item["symbol"])
+        if row:
+            base = candidate_out(row, quotes.get(row.symbol))
+            base["hold"] = item["hold"]
+            enriched.append(base)
+        else:
+            enriched.append(item)
+    data["items"] = enriched
+    data["note"] = "第四层持仓管理：加仓（三法/窗口）· 减仓（高估+顶部形态/破窗）· 清仓（基本面/周线反转/破MA200）。"
+    return data
