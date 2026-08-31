@@ -36,10 +36,46 @@ def test_fill_extras_manual_override_only_when_missing():
         dividend_yield=11.0,
     )
     _fill_extras(row, {}, "900948.SH")
-    assert row.dividend_yield == 11.0  # 已有不覆盖
-    # 增速/每股不再用硬编码兜底，避免盖住中报真值
-    assert row.deducted_profit_yoy is None
-    assert row.ocf_ps is None
+    assert row.dividend_yield == 11.0  # 已有股息不覆盖
+    # fill 仅补缺失；强制校准见 _calibrate_filing
+    assert row.profit_yoy == 82.45  # MANUAL 补缺失
+    assert row.deducted_profit_yoy == 26.89
+
+
+def test_calibrate_overrides_wrong_period_profit():
+    from app.services.fundamental_screen import _calibrate_filing
+
+    row = ScreenRow(
+        symbol="900948.SH",
+        name="伊泰B股",
+        industry="煤炭开采",
+        themes=[],
+        report_date="20260630",
+        revenue_yoy=13.5,
+        profit_yoy=-1.4,  # 错期
+        deducted_profit_yoy=None,
+    )
+    notes = _calibrate_filing(row)
+    assert abs(row.profit_yoy - 82.45) < 0.01
+    assert abs(row.deducted_profit_yoy - 26.89) < 0.01
+    assert any("校准" in n for n in notes)
+
+
+def test_anomaly_sentinel_revenue_up_profit_down():
+    from app.services.fundamental_screen import flag_data_anomaly
+
+    row = ScreenRow(
+        symbol="X.SH",
+        name="x",
+        industry="煤炭",
+        themes=[],
+        report_date="20260630",
+        revenue_yoy=13.5,
+        profit_yoy=-1.4,
+    )
+    assert flag_data_anomaly(row) is not None
+    row.profit_yoy = 82.0
+    assert flag_data_anomaly(row) is None
 
 
 def test_cyclical_extra_and_valuation_flag():

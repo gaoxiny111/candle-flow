@@ -182,13 +182,40 @@ class ScreenRow:
         return keys.issubset(hard)
 
 
-# B 股等覆盖不稳定时的人工兜底：只在自动数据缺失时生效（key=6 位代码）
-# 增速/每股指标优先用最新季报 yjbb，勿在此硬编码以免盖住真值
+# B 股等覆盖不稳定时的人工兜底（key=6 位代码）
+# profit/deducted 在源缺失或与公告偏差过大时强制校准（见 _calibrate_filing）
 MANUAL_OVERRIDE: dict[str, dict[str, Any]] = {
     "900948": {
-        "dividend_yield_ttm": 9.5,  # B 股股息率源不稳定时兜底
+        "dividend_yield_ttm": 9.5,
+        "profit_yoy": 82.45,
+        "deducted_profit_yoy": 26.89,
     },
 }
+
+# 公告校准锚点：报告期 YYYYMMDD → 代码 → 字段。差异>5pp 或缺失时覆盖并打日志。
+FILING_CALIBRATION: dict[str, dict[str, dict[str, float]]] = {
+    "20260630": {
+        "900948": {
+            "revenue_yoy": 13.51,
+            "profit_yoy": 82.45,
+            "deducted_profit_yoy": 26.89,
+        },
+        "601088": {
+            "revenue_yoy": 7.93,
+            "profit_yoy": 4.10,
+            "deducted_profit_yoy": 10.62,
+        },
+        "002812": {
+            "revenue_yoy": 50.47,
+            "profit_yoy": 980.99,
+            "deducted_profit_yoy": 998.29,
+        },
+    },
+}
+
+# 这些字段允许「公告校准 / B 股兜底」覆盖已有错误源值
+_CALIBRATE_FIELDS: tuple[str, ...] = ("revenue_yoy", "profit_yoy", "deducted_profit_yoy")
+_CALIBRATE_TOL = 5.0
 
 _FIN_EXTRAS_CACHE: dict[str, tuple[float, dict[str, float | None]]] = {}
 _FIN_EXTRAS_TTL = 24 * 3600
@@ -201,40 +228,97 @@ def _symbol_code6(symbol: str) -> str:
     return _code6(s)
 
 
+def _set_if_missing(row: ScreenRow, attr: str, value: Any) -> None:
+    if getattr(row, attr, None) is None and value is not None:
+        setattr(row, attr, value)
+
+
 def _fill_extras(row: ScreenRow, fin: dict[str, Any], symbol: str = "") -> None:
-    """构建 ScreenRow 后、算 checks/score 前调用。缺失字段不覆盖已有值。"""
+    """构建 ScreenRow 后调用。缺省字段从 fin / MANUAL_OVERRIDE 补齐（不覆盖已有真值）。"""
     code = _symbol_code6(symbol or row.symbol)
     merged = dict(fin)
     for k, v in MANUAL_OVERRIDE.get(code, {}).items():
         if merged.get(k) is None:
             merged[k] = v
 
-    if row.deducted_profit_yoy is None:
-        row.deducted_profit_yoy = _num(merged.get("deducted_profit_yoy"))
-    if row.dividend_yield is None:
-        row.dividend_yield = _num(merged.get("dividend_yield_ttm"))
-    if row.ocf_ps is None:
-        row.ocf_ps = _num(merged.get("ocf_per_share"))
-    if row.eps is None:
-        row.eps = _num(merged.get("eps"))
-    if row.pb_percentile is None:
-        row.pb_percentile = _num(merged.get("pb_percentile"))
-    if row.roe is None:
-        row.roe = _num(merged.get("roe"))
-    if row.roe_avg is None:
-        row.roe_avg = _num(merged.get("roe_avg"))
-    if row.debt_ratio is None:
-        row.debt_ratio = _num(merged.get("debt_ratio"))
-    if row.revenue_yoy is None:
-        row.revenue_yoy = _num(merged.get("revenue_yoy"))
-    if row.profit_yoy is None:
-        row.profit_yoy = _num(merged.get("profit_yoy"))
+    _set_if_missing(row, "deducted_profit_yoy", _num(merged.get("deducted_profit_yoy")))
+    _set_if_missing(row, "dividend_yield", _num(merged.get("dividend_yield_ttm")))
+    _set_if_missing(row, "ocf_ps", _num(merged.get("ocf_per_share")))
+    _set_if_missing(row, "eps", _num(merged.get("eps")))
+    _set_if_missing(row, "pb_percentile", _num(merged.get("pb_percentile")))
+    _set_if_missing(row, "roe", _num(merged.get("roe")))
+    _set_if_missing(row, "roe_avg", _num(merged.get("roe_avg")))
+    _set_if_missing(row, "debt_ratio", _num(merged.get("debt_ratio")))
+    _set_if_missing(row, "revenue_yoy", _num(merged.get("revenue_yoy")))
+    _set_if_missing(row, "profit_yoy", _num(merged.get("profit_yoy")))
     if row.no_consec_loss is None and merged.get("no_consec_loss") is not None:
         row.no_consec_loss = bool(merged.get("no_consec_loss"))
     if not row.industry and merged.get("industry"):
         row.industry = str(merged.get("industry"))
     if not row.name and merged.get("name"):
         row.name = str(merged.get("name"))
+
+
+def _apply_field_calibration(
+    row: ScreenRow, expected: dict[str, float], *, reason: str
+) -> list[str]:
+    """差异过大或缺失时用公告值覆盖，返回说明片段。"""
+    bits: list[str] = []
+    for k in _CALIBRATE_FIELDS:
+        if k not in expected:
+            continue
+        want = float(expected[k])
+        got = getattr(row, k, None)
+        if got is None or abs(float(got) - want) > _CALIBRATE_TOL:
+            logger.warning(
+                "%s.%s %s: source=%s -> calibrate=%s",
+                row.symbol,
+                k,
+                reason,
+                got,
+                want,
+            )
+            setattr(row, k, want)
+            bits.append(f"{k}已按公告校准")
+    return bits
+
+
+def flag_data_anomaly(row: ScreenRow) -> str | None:
+    """营收大增但表观净利为负且无扣非 → 数据可疑（常为取错期）。"""
+    if (row.revenue_yoy or 0) > 10 and (row.profit_yoy or 0) < 0:
+        return "数据可疑：营收大增但净利为负（疑取错期）"
+    return None
+
+
+def _calibrate_filing(row: ScreenRow) -> list[str]:
+    """
+    公告校准 + B 股兜底强制覆盖 + 异常哨兵。
+    在 checks/score 之前调用。
+    """
+    notes: list[str] = []
+    code = _symbol_code6(row.symbol)
+    period = str(row.report_date or "")
+
+    expected = FILING_CALIBRATION.get(period, {}).get(code)
+    if expected:
+        notes.extend(_apply_field_calibration(row, expected, reason=f"filing:{period}"))
+
+    # B 股财务接口经常缺扣非 / 净利串期：MANUAL 里增速字段强制对齐
+    manual = MANUAL_OVERRIDE.get(code) or {}
+    force: dict[str, float] = {}
+    for k in _CALIBRATE_FIELDS:
+        if k in manual and manual[k] is not None:
+            force[k] = float(manual[k])
+    if force:
+        notes.extend(_apply_field_calibration(row, force, reason="manual_bshare"))
+
+    anomaly = flag_data_anomaly(row)
+    if anomaly:
+        notes.append(anomaly)
+        # 哨兵触发后再试一次 MANUAL（防止校准表未覆盖的错期）
+        if force:
+            notes.extend(_apply_field_calibration(row, force, reason="anomaly_guard"))
+    return notes
 
 
 def _fetch_fin_extras(
@@ -951,13 +1035,13 @@ def _fin_dict_from_yjbb(raw: Any, v: dict[str, Any] | None = None) -> dict[str, 
     }
 
 
-def _apply_row_extras(row: ScreenRow, fin: dict[str, Any], *, fetch: bool = False) -> None:
-    """Merge yjbb/valuation + optional remote extras + MANUAL_OVERRIDE, then PEG."""
+def _apply_row_extras(row: ScreenRow, fin: dict[str, Any], *, fetch: bool = False) -> list[str]:
+    """Merge yjbb/valuation + optional remote extras + 公告校准，然后 PEG。返回校准说明。"""
     from app.services.fundamental_tracks import profit_yoy_eff
 
     merged = dict(fin)
     code = _symbol_code6(row.symbol)
-    # B 股财务指标接口不稳定，跳过远程拉数，依赖 yjbb/估值/MANUAL_OVERRIDE
+    # B 股财务指标接口不稳定，跳过远程拉数，依赖 yjbb/估值/MANUAL_OVERRIDE/校准表
     do_fetch = fetch and not code.startswith(("9", "2"))
     if do_fetch and merged.get("deducted_profit_yoy") is None:
         try:
@@ -968,7 +1052,9 @@ def _apply_row_extras(row: ScreenRow, fin: dict[str, Any], *, fetch: bool = Fals
         except Exception as e:
             logger.debug("extras fetch skipped for %s: %s", row.symbol, e)
     _fill_extras(row, merged, row.symbol)
+    calib_notes = _calibrate_filing(row)
     row.peg = _peg(row.pe_ttm, profit_yoy_eff(row))
+    return calib_notes
 
 
 
@@ -1462,7 +1548,7 @@ def analyze_symbols(
                 change_pct=_num(v.get("change_pct")),
                 dividend_yield=_num(v.get("dividend_yield")),
             )
-            _apply_row_extras(row, _fin_dict_from_yjbb(None, v), fetch=False)
+            calib_notes = _apply_row_extras(row, _fin_dict_from_yjbb(None, v), fetch=False)
             enrich_track_metrics(
                 row, th=th, hist_roe=hist_roe, hist_profit=hist_profit, dates=dates
             )
@@ -1475,6 +1561,12 @@ def analyze_symbols(
                 or row.deducted_profit_yoy is not None
                 or row.dividend_yield is not None
             )
+            miss_note = (
+                "业绩快报未覆盖该标的（可能为 B 股/新股）；已套用可得估值与人工兜底字段"
+                if has_any
+                else "业绩快报未覆盖该标的（可能为 B 股/新股）"
+            )
+            note_parts = [miss_note, *calib_notes]
             items.append(
                 {
                     "symbol": row.symbol,
@@ -1505,9 +1597,7 @@ def analyze_symbols(
                         {"key": c.key, "label": c.label, "ok": c.ok, "detail": c.detail}
                         for c in row.checks
                     ],
-                    "notes": "业绩快报未覆盖该标的（可能为 B 股/新股）；已套用可得估值与人工兜底字段"
-                    if has_any
-                    else "业绩快报未覆盖该标的（可能为 B 股/新股）",
+                    "notes": "；".join(note_parts),
                     "verdict": label if has_any else "无财报数据",
                     "verdict_tone": tone if has_any else "na",
                     "metrics": _metrics_line(row) if has_any else "—",
@@ -1554,7 +1644,7 @@ def analyze_symbols(
             dividend_yield=_num(v.get("dividend_yield")),
             revenue=revenue,
         )
-        _apply_row_extras(row, _fin_dict_from_yjbb(raw, v), fetch=True)
+        calib_notes = _apply_row_extras(row, _fin_dict_from_yjbb(raw, v), fetch=True)
         enrich_track_metrics(
             row, th=th, hist_roe=hist_roe, hist_profit=hist_profit, dates=dates
         )
@@ -1562,6 +1652,7 @@ def analyze_symbols(
         notes = []
         if period_tag:
             notes.append(f"增速口径 {period_tag}")
+        notes.extend(calib_notes)
         if not row.passed_hard:
             notes.append(f"{TRACK_LABEL.get(row.track, row.track)}硬条件未全过")
         if row.pe_percentile is not None and row.pe_percentile >= th.pe_pct_max:
