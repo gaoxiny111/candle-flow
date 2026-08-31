@@ -385,19 +385,20 @@ export interface BullTacticRule {
 export const fetchBullTacticRules = () =>
   api.get<ApiResponse<{ tactics: BullTacticRule[]; universe: string }>>('/bull-tactics/rules')
 
-export const scanBullTacticsSymbol = (symbol: string, recentBars = 30) =>
+export const scanBullTacticsSymbol = (symbol: string, recentBars = 30, tactic?: string) =>
   api.get<ApiResponse<BullTacticScanRow>>(`/bull-tactics/scan/${encodeURIComponent(symbol)}`, {
-    params: { recent_bars: recentBars },
+    params: { recent_bars: recentBars, tactic: tactic || undefined },
     timeout: 120000,
   })
 
-export const scanBullTacticsWatchlist = (symbols?: string[], recentBars = 30) =>
-  api.post<ApiResponse<{ items: BullTacticScanRow[]; skipped: string[]; count: number }>>(
+export const scanBullTacticsWatchlist = (symbols?: string[], recentBars = 30, tactic?: string) =>
+  api.post<ApiResponse<{ items: BullTacticScanRow[]; skipped: string[]; count: number; tactic?: string }>>(
     '/bull-tactics/scan/watchlist',
     null,
     {
       params: {
         recent_bars: recentBars,
+        tactic: tactic || undefined,
         symbols: symbols?.length ? symbols.join(',') : undefined,
       },
       timeout: 180000,
@@ -411,11 +412,12 @@ export interface BullTacticMarketScanResult {
   skipped: number
   errors: number
   count: number
+  tactic?: string
 }
 
-export const scanBullTacticsMarket = (recentBars = 30) =>
+export const scanBullTacticsMarket = (recentBars = 30, tactic?: string) =>
   api.post<ApiResponse<BullTacticMarketScanResult>>('/bull-tactics/scan/market', null, {
-    params: { recent_bars: recentBars },
+    params: { recent_bars: recentBars, tactic: tactic || undefined },
     timeout: 900000,
   })
 

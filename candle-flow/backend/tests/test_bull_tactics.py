@@ -8,10 +8,13 @@ from app.core.bull_tactics import (
     is_st_name,
     is_strict_limit_up,
     is_yizi_limit,
+    kline_limit_for_tactics,
     limit_price,
+    normalize_tactics,
     scan_heima_kualan,
     scan_n_fanbao,
     scan_niu_sanjue,
+    scan_tactics,
 )
 from app.core.candle import Candle
 
@@ -89,7 +92,44 @@ def test_niu_sanjue_gap_hold():
     assert hits[0].tactic == NIU_SAN
 
 
+def test_normalize_tactics():
+    assert normalize_tactics(None) == [HEIMA, N_FAN, NIU_SAN]
+    assert normalize_tactics([]) == [HEIMA, N_FAN, NIU_SAN]
+    assert normalize_tactics([HEIMA]) == [HEIMA]
+    assert normalize_tactics([HEIMA, "无效", N_FAN]) == [HEIMA, N_FAN]
+    assert normalize_tactics(["  N字反包  "]) == [N_FAN]
+    assert normalize_tactics(["无效"]) == []
+
+
+def test_kline_limit_for_tactics():
+    assert kline_limit_for_tactics([HEIMA]) == 80
+    assert kline_limit_for_tactics([N_FAN]) == 80
+    assert kline_limit_for_tactics([NIU_SAN]) == 280
+    assert kline_limit_for_tactics([HEIMA, NIU_SAN]) == 280
+    assert kline_limit_for_tactics(None) == 280
+
+
+def test_scan_tactics_filters_by_name():
+    candles = [_c(i, 10.0, 10.4, 9.9, 10.0, 900_000) for i in range(30)]
+    candles.append(_c(30, 10.0, 11.0, 10.0, 11.0, 2_000_000))
+    candles.append(_c(31, 11.0, 12.1, 11.0, 12.1, 2_100_000))
+    candles.append(_c(32, 12.1, 13.31, 12.0, 13.0, 1_900_000))
+    candles.append(_c(33, 12.9, 13.0, 12.55, 12.75, 1_100_000))
+    candles.append(_c(34, 11.8, 12.0, 11.35, 11.55, 950_000))
+    heima_hits = scan_tactics(candles, recent_bars=30, tactics=[HEIMA])
+    assert heima_hits
+    assert all(h.tactic == HEIMA for h in heima_hits)
+    n_fan_hits = scan_tactics(candles, recent_bars=30, tactics=[N_FAN])
+    assert n_fan_hits
+    assert all(h.tactic == N_FAN for h in n_fan_hits)
+    assert not scan_tactics(candles, recent_bars=30, tactics=[NIU_SAN])
+    assert not scan_tactics(candles, recent_bars=30, tactics=["无效"])
+
+
 def test_scan_market_filters_main_board(monkeypatch):
+    from datetime import date as dt
+
+    from app.models.kline import KlineData
     from app.models.stock import StockInfo
     from app.services.bull_tactics_service import BullTacticsService
     from sqlalchemy import create_engine
@@ -109,33 +149,24 @@ def test_scan_market_filters_main_board(monkeypatch):
             StockInfo(symbol="000001.SZ", code="000001", name="ST测试", market="SZ"),
         ]
     )
+    for i in range(40):
+        db.add(
+            KlineData(
+                symbol="600519.SH",
+                date=dt(2026, 1, 1) + timedelta(days=i),
+                open=10.0,
+                high=10.4,
+                low=9.9,
+                close=10.0,
+                volume=1_000_000,
+            )
+        )
     db.commit()
 
     monkeypatch.setattr("app.services.bull_tactics_service.refresh_universe", lambda db, force=False: 0)
-    monkeypatch.setattr("app.services.bull_tactics_service.akshare_client.is_available", lambda: True)
-
-    def fake_fetch(symbol, start_date=None, end_date=None):
-        import pandas as pd
-        from datetime import date as dt
-
-        rows = []
-        for i in range(40):
-            rows.append(
-                {
-                    "date": dt(2026, 1, 1) + timedelta(days=i),
-                    "open": 10.0,
-                    "high": 10.4,
-                    "low": 9.9,
-                    "close": 10.0,
-                    "volume": 1_000_000,
-                }
-            )
-        return pd.DataFrame(rows)
-
-    monkeypatch.setattr("app.services.bull_tactics_service.akshare_client.fetch_daily", fake_fetch)
     monkeypatch.setattr(
-        "app.services.bull_tactics_service.scan_all_tactics",
-        lambda candles, recent_bars=30: [],
+        "app.services.bull_tactics_service.scan_tactics",
+        lambda candles, recent_bars=30, tactics=None: [],
     )
 
     svc = BullTacticsService(db)

@@ -292,16 +292,56 @@ def scan_niu_sanjue(candles: list[Candle]) -> list[TacticHit]:
     return hits
 
 
-def scan_all_tactics(candles: list[Candle], recent_bars: int = 30) -> list[TacticHit]:
-    """合并三种战法，同一买点去重保留最高分，仅保留近期买点。"""
+TACTIC_SCANNERS = {
+    HEIMA: scan_heima_kualan,
+    N_FAN: scan_n_fanbao,
+    NIU_SAN: scan_niu_sanjue,
+}
+
+# Minimum bars needed per tactic (+ buffer for MA / lookback windows).
+TACTIC_KLINE_LIMITS: dict[str, int] = {
+    HEIMA: 80,
+    N_FAN: 80,
+    NIU_SAN: 280,
+}
+
+MIN_SCAN_BARS = 32
+
+
+def normalize_tactics(tactics: list[str] | None) -> list[str]:
+    if not tactics:
+        return list(TACTIC_NAMES)
+    out: list[str] = []
+    for raw in tactics:
+        name = (raw or "").strip()
+        if name in TACTIC_SCANNERS and name not in out:
+            out.append(name)
+    return out
+
+
+def kline_limit_for_tactics(tactics: list[str] | None) -> int:
+    """How many recent daily bars to load for the selected tactic(s)."""
+    selected = normalize_tactics(tactics)
+    if not selected:
+        return max(TACTIC_KLINE_LIMITS.values())
+    return max(TACTIC_KLINE_LIMITS[name] for name in selected)
+
+
+def scan_tactics(
+    candles: list[Candle],
+    recent_bars: int = 30,
+    tactics: list[str] | None = None,
+) -> list[TacticHit]:
+    """Scan selected tactics; default all three."""
     if not candles:
         return []
+    selected = normalize_tactics(tactics)
+    if not selected:
+        return []
     cutoff = len(candles) - recent_bars - 1
-    all_hits = [
-        *scan_heima_kualan(candles),
-        *scan_n_fanbao(candles),
-        *scan_niu_sanjue(candles),
-    ]
+    all_hits: list[TacticHit] = []
+    for name in selected:
+        all_hits.extend(TACTIC_SCANNERS[name](candles))
     by_key: dict[tuple[str, int], TacticHit] = {}
     for hit in all_hits:
         if hit.buy_index < cutoff:
@@ -313,3 +353,7 @@ def scan_all_tactics(candles: list[Candle], recent_bars: int = 30) -> list[Tacti
     out = list(by_key.values())
     out.sort(key=lambda h: h.buy_index, reverse=True)
     return out
+
+
+def scan_all_tactics(candles: list[Candle], recent_bars: int = 30) -> list[TacticHit]:
+    return scan_tactics(candles, recent_bars=recent_bars, tactics=None)

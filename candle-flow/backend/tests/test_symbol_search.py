@@ -12,23 +12,22 @@ from app.services.stock_universe import (
 from app.utils.symbol import SymbolError, normalize_symbol
 
 
-def test_parse_sina_suggest_futures():
+def test_parse_sina_suggest_ignores_futures():
     text = "var suggestvalue='螺纹钢连续,8,RB0,RB0,螺纹钢连续,lwg,螺纹钢连续;';"
-    items = parse_sina_suggest(text)
-    assert items[0]["symbol"] == "RB0.FUT"
-    assert "螺纹" in items[0]["name"]
-    assert items[0]["market"] == "FUT"
+    assert parse_sina_suggest(text) == []
 
 
-def test_search_local_futures():
+def test_search_local_excludes_futures():
     db = _memory_db()
     from app.services.stock_universe import ensure_seeded
 
     ensure_seeded(db)
-    hits = search_local(db, "螺纹")
-    assert hits[0].symbol == "RB0.FUT"
-    hits = search_local(db, "RB0")
-    assert any(h.symbol == "RB0.FUT" for h in hits)
+    _upsert(
+        db,
+        [{"symbol": "RB0.FUT", "code": "RB0", "name": "螺纹钢连续", "market": "FUT"}],
+    )
+    assert not search_local(db, "螺纹")
+    assert not search_local(db, "RB0")
 
 
 def test_parse_sina_suggest_maotai():

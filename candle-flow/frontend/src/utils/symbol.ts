@@ -9,25 +9,6 @@ export const SYMBOL_NAMES: Record<string, string> = {
   '601318.SH': '中国平安',
   '601088.SH': '中国神华',
   '900948.SH': '伊泰B股',
-  'RB0.FUT': '螺纹钢连续',
-  'HC0.FUT': '热卷连续',
-  'I0.FUT': '铁矿石连续',
-  'J0.FUT': '焦炭连续',
-  'JM0.FUT': '焦煤连续',
-  'CU0.FUT': '沪铜连续',
-  'AU0.FUT': '沪金连续',
-  'AG0.FUT': '沪银连续',
-  'IF0.FUT': '沪深300股指连续',
-  'IH0.FUT': '上证50股指连续',
-  'IC0.FUT': '中证500股指连续',
-  'IM0.FUT': '中证1000股指连续',
-  'M0.FUT': '豆粕连续',
-  'Y0.FUT': '豆油连续',
-  'SC0.FUT': '原油连续',
-  'TA0.FUT': 'PTA连续',
-  'SA0.FUT': '纯碱连续',
-  'SI0.FUT': '工业硅连续',
-  'LC0.FUT': '碳酸锂连续',
 }
 
 /** Normalize A-share symbol to standard format */
@@ -40,41 +21,23 @@ const ALIASES: Record<string, string> = {
   平安: '601318.SH',
   五粮液: '000858.SZ',
   平安银行: '000001.SZ',
-  螺纹: 'RB0.FUT',
-  螺纹钢: 'RB0.FUT',
-  热卷: 'HC0.FUT',
-  铁矿: 'I0.FUT',
-  铁矿石: 'I0.FUT',
-  焦炭: 'J0.FUT',
-  焦煤: 'JM0.FUT',
-  沪铜: 'CU0.FUT',
-  沪金: 'AU0.FUT',
-  黄金: 'AU0.FUT',
-  沪银: 'AG0.FUT',
-  白银: 'AG0.FUT',
-  股指: 'IF0.FUT',
-  期指: 'IF0.FUT',
-  豆粕: 'M0.FUT',
-  豆油: 'Y0.FUT',
-  原油: 'SC0.FUT',
-  PTA: 'TA0.FUT',
-  纯碱: 'SA0.FUT',
-  工业硅: 'SI0.FUT',
-  碳酸锂: 'LC0.FUT',
+}
+
+function isFutureSymbol(symbol: string): boolean {
+  return symbol.trim().toUpperCase().endsWith('.FUT')
 }
 
 export function normalizeSymbol(input: string): string {
   const raw = input.trim()
   if (!raw) throw new Error('股票代码不能为空')
+  if (isFutureSymbol(raw) || /^[A-Z]{1,2}(0|\d{3,4})$/i.test(raw)) {
+    throw new Error(`不支持期货代码: ${raw}`)
+  }
   if (ALIASES[raw]) return ALIASES[raw]
 
   const upper = raw.toUpperCase()
   const withMarket = /^(\d{6})\.(SH|SZ)$/.exec(upper)
   if (withMarket) return `${withMarket[1]}.${withMarket[2]}`
-
-  const futMarket = /^([A-Z]{1,2}(?:0|\d{3,4}))\.FUT$/.exec(upper)
-  if (futMarket) return `${futMarket[1]}.FUT`
-  if (/^[A-Z]{1,2}(0|\d{3,4})$/.test(upper)) return `${upper}.FUT`
 
   if (/^\d{6}$/.test(upper)) {
     if (upper.startsWith('6') || upper.startsWith('9')) return `${upper}.SH`
@@ -82,7 +45,7 @@ export function normalizeSymbol(input: string): string {
     throw new Error(`无法识别市场: ${upper}`)
   }
 
-  throw new Error(`无效代码: ${raw}，请使用如 000001.SZ、600519，或期货 螺纹钢 / RB0`)
+  throw new Error(`无效代码: ${raw}，请使用如 000001.SZ、600519 或中文名如 茅台`)
 }
 
 export function tryNormalizeSymbol(input: string): string | null {
@@ -132,7 +95,7 @@ function persistExtraNames() {
 }
 
 export function rememberSymbol(symbol: string, name?: string) {
-  if (!symbol || !name) return
+  if (!symbol || !name || isFutureSymbol(symbol)) return
   const key = symbol.trim().toUpperCase()
   const value = name.trim()
   if (!key || extraNames[key] === value) return
@@ -151,14 +114,13 @@ export function symbolName(symbol: string): string {
 /** 标的显示：代码 + 名称 */
 export function formatSymbol(symbol: string): string {
   const name = symbolName(symbol)
-  const shown = symbol.toUpperCase().endsWith('.FUT') ? symbol.slice(0, -4) : symbol
-  return name ? `${shown} ${name}` : shown
+  return name ? `${symbol} ${name}` : symbol
 }
 
 /** 从服务器补全关注列表里还没有中文名的代码，刷新后也能显示 */
 export async function hydrateSymbolNames(symbols: string[]) {
   const missing = [...new Set(symbols.map((s) => s.trim().toUpperCase()).filter(Boolean))].filter(
-    (s) => !symbolName(s),
+    (s) => !isFutureSymbol(s) && !symbolName(s),
   )
   if (!missing.length) return
   try {
@@ -180,7 +142,7 @@ export function searchLocalSymbols(query: string): { symbol: string; name: strin
 
   const add = (symbol: string, name: string) => {
     const key = symbol.toUpperCase()
-    if (!key || seen.has(key)) return
+    if (!key || isFutureSymbol(key) || seen.has(key)) return
     seen.add(key)
     const [code, market] = key.split('.')
     hits.push({ symbol: key, name, code: code || key, market: market || '' })
@@ -194,6 +156,7 @@ export function searchLocalSymbols(query: string): { symbol: string; name: strin
 
   const upper = text.toUpperCase()
   for (const [symbol, name] of Object.entries({ ...SYMBOL_NAMES, ...extraNames })) {
+    if (isFutureSymbol(symbol)) continue
     if (name.includes(text) || symbol.includes(upper) || symbol.split('.')[0].startsWith(upper.replace(/\.(SH|SZ)$/, ''))) {
       add(symbol, name)
     }

@@ -10,7 +10,7 @@ const props = withDefaults(
     placeholder?: string
     watchable?: boolean
   }>(),
-  { placeholder: '输入名称或代码，如 茅台 / 螺纹钢 / RB0', watchable: true },
+  { placeholder: '输入名称或代码，如 茅台 / 600519', watchable: true },
 )
 
 const emit = defineEmits<{
@@ -51,7 +51,8 @@ function mergeHits(q: string, remote: { symbol: string; name: string; code?: str
   const local = searchLocalSymbols(q)
   const seen = new Set(local.map((h) => h.symbol))
   const extra = remote
-    .filter((h) => h.symbol && !seen.has(h.symbol.toUpperCase()))
+    .filter((h) => h.symbol && !h.symbol.toUpperCase().endsWith('.FUT') && h.market !== 'FUT')
+    .filter((h) => !seen.has(h.symbol.toUpperCase()))
     .map((h) => ({
       symbol: h.symbol,
       name: h.name,

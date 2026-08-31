@@ -25,17 +25,17 @@ def test_normalize_alias():
     assert normalize_symbol("神华") == "601088.SH"
     assert normalize_symbol("中国神华") == "601088.SH"
     assert normalize_symbol("伊泰B股") == "900948.SH"
-    assert normalize_symbol("螺纹钢") == "RB0.FUT"
-    assert normalize_symbol("螺纹") == "RB0.FUT"
 
 
-def test_normalize_futures():
-    assert normalize_symbol("RB0") == "RB0.FUT"
-    assert normalize_symbol("rb0.fut") == "RB0.FUT"
-    assert normalize_symbol("IF0") == "IF0.FUT"
-    assert normalize_symbol("rb2501") == "RB2501.FUT"
-    assert parse_symbol("RB0") == ("RB0", "fut")
-    assert is_future("螺纹钢") is True
+def test_normalize_rejects_futures():
+    with pytest.raises(SymbolError):
+        normalize_symbol("螺纹钢")
+    with pytest.raises(SymbolError):
+        normalize_symbol("RB0")
+    with pytest.raises(SymbolError):
+        normalize_symbol("RB0.FUT")
+    assert parse_symbol("RB0.FUT") == ("RB0", "fut")
+    assert is_future("RB0.FUT") is True
     assert is_future("600519.SH") is False
     assert futures_sina_code("RB0.FUT") == "RB0"
     assert is_b_share("RB0.FUT") is False

@@ -15,19 +15,16 @@ from app.database import SessionLocal
 from app.models.stock import StockInfo
 from app.utils.symbol import (
     CODE_ONLY,
-    FUTURE_ALIASES,
-    FUTURE_NAMES,
     NAME_ALIASES,
     SYMBOL_NAMES,
     SYMBOL_WITH_MARKET,
     SymbolError,
-    futures_symbol,
     normalize_symbol,
 )
 
 logger = logging.getLogger(__name__)
 
-SINA_SUGGEST_URL = "https://suggest3.sinajs.cn/suggest/type=11,12,13,8&key={key}"
+SINA_SUGGEST_URL = "https://suggest3.sinajs.cn/suggest/type=11,12,13&key={key}"
 REFRESH_TTL = timedelta(hours=24)
 _refresh_lock = threading.Lock()
 _last_refresh: datetime | None = None
@@ -37,9 +34,6 @@ _MARKET_CODE = re.compile(r"^(sh|sz)(\d{6})$", re.I)
 
 def code_to_symbol(code: str, market: str | None = None) -> str | None:
     raw = (code or "").strip()
-    fut = futures_symbol(raw)
-    if fut:
-        return fut
     code = raw.zfill(6) if raw.isdigit() else raw
     if not CODE_ONLY.match(code):
         return None
@@ -73,23 +67,6 @@ def parse_sina_suggest(text: str) -> list[dict]:
             continue
         kind = parts[1] if len(parts) > 1 else ""
         code = parts[2] if len(parts) > 2 else ""
-        if kind == "8" or futures_symbol(code):
-            symbol = futures_symbol(code)
-            if not symbol or symbol in seen:
-                continue
-            name = parts[4] if len(parts) > 4 else parts[0]
-            if not name or name.isdigit():
-                name = parts[0]
-            items.append(
-                {
-                    "symbol": symbol,
-                    "name": name,
-                    "code": symbol.split(".")[0],
-                    "market": "FUT",
-                }
-            )
-            seen.add(symbol)
-            continue
         if kind not in ("11", "12", "13"):
             continue
         market_token = next((p for p in parts if _MARKET_CODE.match(p)), "")
@@ -118,9 +95,6 @@ def _seed_rows() -> list[dict]:
         if symbol not in rows:
             code, market = symbol.rsplit(".", 1)
             rows[symbol] = {"symbol": symbol, "code": code, "name": name, "market": market}
-    for symbol, name in FUTURE_NAMES.items():
-        code = symbol.split(".")[0]
-        rows[symbol] = {"symbol": symbol, "code": code, "name": name, "market": "FUT"}
     return list(rows.values())
 
 
@@ -148,13 +122,8 @@ def _upsert(db: Session, rows: Iterable[dict]) -> int:
 
 
 def ensure_seeded(db: Session) -> None:
-    seeds = _seed_rows()
     if db.query(StockInfo).count() == 0:
-        _upsert(db, seeds)
-        return
-    missing = [row for row in seeds if row["market"] == "FUT" and db.get(StockInfo, row["symbol"]) is None]
-    if missing:
-        _upsert(db, missing)
+        _upsert(db, _seed_rows())
 
 
 def fetch_sina_suggest(query: str) -> list[dict]:
@@ -211,17 +180,21 @@ def refresh_universe(db: Session, force: bool = False) -> int:
         return n
 
 
+def _is_stock(item: StockInfo | dict) -> bool:
+    if isinstance(item, dict):
+        sym = str(item.get("symbol", "")).upper()
+        market = str(item.get("market", "")).upper()
+    else:
+        sym = (item.symbol or "").upper()
+        market = (item.market or "").upper()
+    return market != "FUT" and not sym.endswith(".FUT")
+
+
 def _rank(item: StockInfo, q: str) -> tuple[int, int, str]:
     name = item.name or ""
     code = item.code or ""
     symbol = item.symbol or ""
     qu = q.upper()
-    alias = FUTURE_ALIASES.get(q) or next(
-        (v for k, v in FUTURE_ALIASES.items() if k.upper() == qu),
-        None,
-    )
-    if alias and symbol == alias:
-        return (-1, 0, symbol)
     if name == q:
         return (0, 0, symbol)
     if name.startswith(q):
@@ -262,15 +235,20 @@ def search_local(db: Session, query: str, limit: int = 10) -> list[StockInfo]:
     by_symbol = {r.symbol: r for r in rows}
     for r in extra:
         by_symbol[r.symbol] = r
-    alias = NAME_ALIASES.get(q) or NAME_ALIASES.get(q.lower()) or FUTURE_ALIASES.get(q)
-    if not alias:
-        alias = next((v for k, v in FUTURE_ALIASES.items() if k.upper() == q.upper()), None)
+    alias = NAME_ALIASES.get(q) or NAME_ALIASES.get(q.lower())
     if alias:
         row = db.get(StockInfo, alias)
         if row:
             by_symbol[row.symbol] = row
-    ranked = sorted(by_symbol.values(), key=lambda r: _rank(r, q))
+    ranked = sorted(
+        (r for r in by_symbol.values() if _is_stock(r)),
+        key=lambda r: _rank(r, q),
+    )
     return ranked[:limit]
+
+
+def _stock_hit(row: StockInfo) -> dict:
+    return {"symbol": row.symbol, "name": row.name, "code": row.code, "market": row.market}
 
 
 def search_stocks(db: Session, query: str, limit: int = 10) -> list[dict]:
@@ -279,22 +257,17 @@ def search_stocks(db: Session, query: str, limit: int = 10) -> list[dict]:
         return []
     ensure_seeded(db)
     local = search_local(db, q, limit=limit)
-    # 本地已有结果时不要等新浪，否则输入「茅台」会卡住几秒看不到下拉
     if local:
-        return [
-            {"symbol": r.symbol, "name": r.name, "code": r.code, "market": r.market}
-            for r in local[:limit]
-        ]
+        return [_stock_hit(r) for r in local[:limit]]
     remote = fetch_sina_suggest(q)
     if remote:
-        _upsert(db, remote)
+        stock_remote = [r for r in remote if _is_stock(r)]
+        if stock_remote:
+            _upsert(db, stock_remote)
         local = search_local(db, q, limit=limit)
     else:
         threading.Thread(target=_refresh_in_background, daemon=True).start()
-    return [
-        {"symbol": r.symbol, "name": r.name, "code": r.code, "market": r.market}
-        for r in local[:limit]
-    ]
+    return [_stock_hit(r) for r in local[:limit]]
 
 
 def _refresh_in_background() -> None:
@@ -335,7 +308,7 @@ def resolve_symbol(raw: str, db: Optional[Session] = None) -> str:
         ensure_seeded(db)
         hits = search_stocks(db, text, limit=8)
         if not hits:
-            raise SymbolError(f"未找到标的: {text}，可输入股票如 茅台，或期货如 螺纹钢、RB0")
+            raise SymbolError(f"未找到标的: {text}，可输入股票如 茅台、600519")
         exact = [h for h in hits if h["name"] == text]
         if len(exact) == 1:
             return exact[0]["symbol"]

@@ -16,6 +16,15 @@ from app.utils.symbol import SymbolError
 router = APIRouter()
 
 
+def _parse_tactic(tactic: Optional[str]) -> list[str] | None:
+    name = (tactic or "").strip()
+    if not name:
+        return None
+    if name not in TACTIC_NAMES:
+        raise HTTPException(status_code=400, detail=f"无效战法，可选：{'、'.join(TACTIC_NAMES)}")
+    return [name]
+
+
 @router.get("/bull-tactics/rules")
 def bull_tactics_rules():
     return ApiResponse(
@@ -33,21 +42,24 @@ def bull_tactics_rules():
 def scan_bull_tactics_symbol(
     symbol: str,
     recent_bars: int = Query(30, ge=5, le=120),
+    tactic: Optional[str] = Query(None, description="黑马跨栏 / N字反包 / 牛股三绝，留空则扫全部"),
     db: Session = Depends(get_db),
 ):
     try:
         symbol = resolve_symbol(symbol, db)
     except SymbolError as e:
         return ApiResponse(code=400101, message=str(e), data=None)
-    row = BullTacticsService(db).scan_symbol(symbol, recent_bars=recent_bars)
+    tactics = _parse_tactic(tactic)
+    row = BullTacticsService(db).scan_symbol(symbol, recent_bars=recent_bars, tactics=tactics)
     if not row:
-        return ApiResponse(data={"symbol": symbol, "name": "", "hits": [], "eligible": False})
-    return ApiResponse(data={**row, "eligible": True})
+        return ApiResponse(data={"symbol": symbol, "name": "", "hits": [], "eligible": False, "tactic": tactic})
+    return ApiResponse(data={**row, "eligible": True, "tactic": tactic or None})
 
 
 @router.post("/bull-tactics/scan/watchlist")
 def scan_bull_tactics_watchlist(
     recent_bars: int = Query(30, ge=5, le=120),
+    tactic: Optional[str] = Query(None),
     symbols: Optional[str] = None,
     db: Session = Depends(get_db),
     user: UserConfig | None = Depends(get_optional_user),
@@ -59,19 +71,23 @@ def scan_bull_tactics_watchlist(
         watch = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     if not watch:
         raise HTTPException(status_code=400, detail="还没有关注股票，请先添加自选")
-    data = BullTacticsService(db).scan_symbols(watch, recent_bars=recent_bars)
+    tactics = _parse_tactic(tactic)
+    data = BullTacticsService(db).scan_symbols(watch, recent_bars=recent_bars, tactics=tactics)
     return ApiResponse(data=data)
 
 
 @router.post("/bull-tactics/scan/market")
 def scan_bull_tactics_market(
     recent_bars: int = Query(30, ge=5, le=120),
+    tactic: Optional[str] = Query(None),
     refresh_universe: bool = Query(True, description="扫描前刷新股票列表"),
     db: Session = Depends(get_db),
 ):
+    tactics = _parse_tactic(tactic)
     data = BullTacticsService(db).scan_market(
         recent_bars=recent_bars,
         refresh_list=refresh_universe,
+        tactics=tactics,
     )
     if data.get("error"):
         raise HTTPException(status_code=503, detail=data["error"])

@@ -16,24 +16,47 @@ import { useWatchlistStore } from '@/stores/watchlist'
 import { formatSymbol, rememberSymbol, tryNormalizeSymbol } from '@/utils/symbol'
 import SymbolSearch from '@/components/SymbolSearch.vue'
 
+const TACTIC_IDS = ['黑马跨栏', 'N字反包', '牛股三绝'] as const
+type TacticId = (typeof TACTIC_IDS)[number]
+
 const config = useConfigStore()
 const watchlist = useWatchlistStore()
 
 const rules = ref<BullTacticRule[]>([])
 const universe = ref('')
 const symbol = ref('')
+const selectedTactic = ref<TacticId>('黑马跨栏')
 const loading = ref(false)
+const scanningMarket = ref(false)
 const error = ref('')
 const message = ref('')
 const single = ref<BullTacticScanRow | null>(null)
 const batch = ref<BullTacticScanRow[]>([])
 const marketStats = ref<{ scanned: number; universe_size: number; count: number } | null>(null)
-const scanningMarket = ref(false)
 
 const hasResults = computed(() => Boolean(single.value?.hits.length || batch.value.length))
+const currentRule = computed(() => ruleFor(selectedTactic.value))
+
+function ruleFor(name: TacticId) {
+  return rules.value.find((r) => r.id === name || r.name === name)
+}
 
 function guestSymbols() {
   return config.isAuthenticated ? undefined : watchlist.symbols
+}
+
+function clearResults() {
+  single.value = null
+  batch.value = []
+  marketStats.value = null
+}
+
+function selectTactic(tactic: TacticId) {
+  if (loading.value || selectedTactic.value === tactic) return
+  selectedTactic.value = tactic
+  error.value = ''
+  message.value = ''
+  clearResults()
 }
 
 async function loadRules() {
@@ -42,56 +65,61 @@ async function loadRules() {
     rules.value = data.data?.tactics || []
     universe.value = data.data?.universe || ''
   } catch {
-    rules.value = []
+    rules.value = TACTIC_IDS.map((id) => ({ id, name: id, rule: '' }))
   }
 }
 
 async function scanOne() {
+  const tactic = selectedTactic.value
+  if (!symbol.value.trim()) {
+    error.value = '请先输入股票代码或名称'
+    return
+  }
   loading.value = true
+  scanningMarket.value = false
   error.value = ''
   message.value = ''
-  batch.value = []
-  marketStats.value = null
+  clearResults()
   try {
     let sym = symbol.value.trim()
     const asCode = tryNormalizeSymbol(sym)
     if (asCode) sym = asCode
-    const { data } = await scanBullTacticsSymbol(sym)
+    const { data } = await scanBullTacticsSymbol(sym, 30, tactic)
     single.value = data.data || null
     if (single.value?.name) rememberSymbol(single.value.symbol, single.value.name)
     if (!single.value?.eligible) {
       message.value = '仅扫描沪深主板非 ST 股票'
     } else if (!single.value.hits.length) {
-      message.value = '近期暂无战法买点'
+      message.value = '近期暂无买点'
     }
   } catch (e) {
     error.value = apiErrorText(e, '扫描失败')
-    single.value = null
   } finally {
     loading.value = false
   }
 }
 
 async function scanWatchlist() {
+  const tactic = selectedTactic.value
   loading.value = true
+  scanningMarket.value = false
   error.value = ''
   message.value = ''
-  single.value = null
-  marketStats.value = null
+  clearResults()
   try {
     const syms = guestSymbols()
     if (!syms?.length && !watchlist.symbols.length) {
       error.value = '请先在设置或仪表盘添加关注股票'
       return
     }
-    const { data } = await scanBullTacticsWatchlist(syms)
+    const { data } = await scanBullTacticsWatchlist(syms, 30, tactic)
     batch.value = data.data?.items || []
     for (const row of batch.value) {
       if (row.name) rememberSymbol(row.symbol, row.name)
     }
     message.value = batch.value.length
       ? `在 ${batch.value.length} 只标的中发现买点`
-      : '关注列表中暂无近期战法买点'
+      : '关注列表中暂无近期买点'
   } catch (e) {
     error.value = apiErrorText(e, '扫描失败')
     batch.value = []
@@ -101,15 +129,14 @@ async function scanWatchlist() {
 }
 
 async function scanMarket() {
+  const tactic = selectedTactic.value
   loading.value = true
   scanningMarket.value = true
   error.value = ''
-  message.value = '正在扫描全市场主板，约需数分钟，请勿关闭页面…'
-  single.value = null
-  batch.value = []
-  marketStats.value = null
+  message.value = '正在扫描全市场主板，约需数分钟…'
+  clearResults()
   try {
-    const { data } = await scanBullTacticsMarket()
+    const { data } = await scanBullTacticsMarket(30, tactic)
     const body = data.data
     batch.value = body?.items || []
     marketStats.value = body
@@ -120,7 +147,7 @@ async function scanMarket() {
     }
     message.value = body?.count
       ? `全市场 ${body.scanned}/${body.universe_size} 只已扫描，${body.count} 只有买点`
-      : `全市场 ${body?.scanned ?? 0}/${body?.universe_size ?? 0} 只已扫描，暂无近期买点`
+      : `全市场 ${body?.scanned ?? 0}/${body?.universe_size ?? 0} 只已扫描，暂无买点`
   } catch (e) {
     error.value = apiErrorText(e, '全市场扫描失败')
     batch.value = []
@@ -151,30 +178,48 @@ onMounted(async () => {
 <template>
   <div class="bull-view">
     <h1>主板战法扫描</h1>
-    <p class="lead">{{ universe || '沪深主板非 ST' }}。扫描近期（约 30 个交易日）出现的买点。</p>
+    <p class="lead">{{ universe || '沪深主板非 ST' }}，扫描近 30 个交易日内买点。</p>
 
-    <div class="rules card">
-      <h2>战法说明</h2>
-      <ul>
-        <li v-for="r in rules" :key="r.id">
-          <strong>{{ r.name }}</strong> — {{ r.rule }}
-        </li>
-      </ul>
+    <div class="tabs" role="tablist" aria-label="战法切换">
+      <button
+        v-for="tactic in TACTIC_IDS"
+        :key="tactic"
+        type="button"
+        role="tab"
+        class="tab"
+        :class="{ active: selectedTactic === tactic }"
+        :aria-selected="selectedTactic === tactic"
+        :disabled="loading"
+        @click="selectTactic(tactic)"
+      >
+        {{ tactic }}
+      </button>
     </div>
 
-    <div class="toolbar card">
-      <SymbolSearch v-model="symbol" placeholder="输入股票代码或名称" @select="(h) => { symbol = h.symbol; scanOne() }" />
-      <button class="btn-primary" type="button" :disabled="loading || !symbol.trim()" @click="scanOne">
-        {{ loading ? '扫描中…' : '扫描单票' }}
-      </button>
-      <button class="btn-secondary" type="button" :disabled="loading" @click="scanWatchlist">
-        扫描关注列表
-      </button>
-      <button class="btn-secondary market-btn" type="button" :disabled="loading" @click="scanMarket">
-        {{ loading && scanningMarket ? '全市场扫描中…' : '扫描全市场主板' }}
-      </button>
+    <div class="tactic-panel card" role="tabpanel">
+      <p class="rule">{{ currentRule?.rule || '加载中…' }}</p>
+
+      <div class="symbol-row">
+        <SymbolSearch v-model="symbol" placeholder="输入股票代码或名称" />
+        <button
+          class="btn-primary"
+          type="button"
+          :disabled="loading || !symbol.trim()"
+          @click="scanOne"
+        >
+          {{ loading && !scanningMarket ? '扫描中…' : '扫描单票' }}
+        </button>
+      </div>
+
+      <div class="tactic-actions">
+        <button class="btn-secondary" type="button" :disabled="loading" @click="scanWatchlist">
+          扫描关注列表
+        </button>
+        <button class="btn-secondary market-btn" type="button" :disabled="loading" @click="scanMarket">
+          {{ scanningMarket ? '全市场扫描中…' : '扫描全市场主板' }}
+        </button>
+      </div>
     </div>
-    <p v-if="loading && scanningMarket" class="hint">正在扫描全市场主板，约需数分钟，请勿关闭页面…</p>
 
     <p v-if="error" class="error">{{ error }}</p>
     <p v-if="message" class="message">{{ message }}</p>
@@ -187,7 +232,6 @@ onMounted(async () => {
       <table>
         <thead>
           <tr>
-            <th>战法</th>
             <th>买点日期</th>
             <th>买点价</th>
             <th>信号日</th>
@@ -198,7 +242,6 @@ onMounted(async () => {
         </thead>
         <tbody>
           <tr v-for="(h, i) in single.hits" :key="i">
-            <td>{{ h.tactic }}</td>
             <td>{{ h.buy_date }}</td>
             <td>{{ h.buy_price.toFixed(2) }}</td>
             <td>{{ h.setup_date }}</td>
@@ -223,7 +266,6 @@ onMounted(async () => {
         <table>
           <thead>
             <tr>
-              <th>战法</th>
               <th>买点</th>
               <th>价格</th>
               <th>得分</th>
@@ -232,7 +274,6 @@ onMounted(async () => {
           </thead>
           <tbody>
             <tr v-for="(h, i) in row.hits" :key="i">
-              <td>{{ h.tactic }}</td>
               <td>{{ h.buy_date }}</td>
               <td>{{ h.buy_price.toFixed(2) }}</td>
               <td>{{ h.score.toFixed(0) }}</td>
@@ -244,7 +285,7 @@ onMounted(async () => {
     </div>
 
     <div v-if="!loading && !hasResults && !error && !message" class="empty card">
-      输入股票或扫描关注列表，查找黑马跨栏、N字反包、牛股三绝买点。
+      切换战法后，扫描单票、关注列表或全市场主板。
     </div>
   </div>
 </template>
@@ -252,12 +293,50 @@ onMounted(async () => {
 <style scoped>
 .bull-view { max-width: 960px; }
 .bull-view h1 { margin-bottom: var(--space-sm); }
-.lead { color: var(--text-secondary); font-size: 14px; margin-bottom: var(--space-lg); line-height: 1.6; }
+.lead { color: var(--text-secondary); font-size: 14px; margin-bottom: var(--space-md); line-height: 1.6; }
 .card { margin-bottom: var(--space-lg); }
-.rules ul { margin: 0; padding-left: 1.2em; font-size: 14px; line-height: 1.7; color: var(--text-secondary); }
-.rules strong { color: var(--text-primary); }
-.toolbar { display: flex; flex-wrap: wrap; gap: var(--space-sm); align-items: center; }
-.toolbar :deep(.symbol-search) { flex: 1; min-width: 200px; }
+
+.tabs {
+  display: flex;
+  gap: 0;
+  margin-bottom: var(--space-md);
+  border-bottom: 1px solid var(--border-color);
+}
+.tab {
+  flex: 1;
+  padding: 12px 16px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  color: var(--text-secondary);
+  font-size: 14px;
+  font-weight: 500;
+  transition: color 0.15s, border-color 0.15s;
+}
+.tab:hover:not(:disabled) { color: var(--text-primary); }
+.tab.active {
+  color: var(--color-primary);
+  border-bottom-color: var(--color-primary);
+}
+.tab:disabled { opacity: 0.6; cursor: not-allowed; }
+
+.tactic-panel .rule {
+  font-size: 14px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  margin: 0 0 var(--space-md);
+}
+.symbol-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+  align-items: center;
+  margin-bottom: var(--space-md);
+}
+.symbol-row :deep(.symbol-search) { flex: 1; min-width: 200px; }
+.tactic-actions { display: flex; flex-wrap: wrap; gap: var(--space-sm); }
+
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border-color); }
 .detail { font-size: 13px; color: var(--text-secondary); max-width: 280px; }
@@ -267,6 +346,5 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border-c
 .empty { color: var(--text-secondary); text-align: center; padding: 32px; }
 .error { color: var(--color-danger, #c0392b); }
 .message { color: var(--color-primary); }
-.hint { color: var(--text-secondary); font-size: 13px; margin: 0 0 var(--space-md); }
 .market-btn { border-color: var(--color-primary); color: var(--color-primary); }
 </style>

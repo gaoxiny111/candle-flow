@@ -248,7 +248,7 @@ async function unfollow(sym: string) {
       <div class="hero-search">
         <SymbolSearch
           v-model="searchQuery"
-          placeholder="输入名称或代码，如 茅台、螺纹钢"
+          placeholder="输入名称或代码，如 茅台、600519"
           @select="onSelect"
           @watch="onWatchFromSearch"
           @error="followError = $event"

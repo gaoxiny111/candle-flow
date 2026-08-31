@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
-import time
-from datetime import date, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import Literal
 
 from sqlalchemy.orm import Session
 
@@ -12,22 +13,24 @@ from app.core.bull_tactics import (
     HEIMA,
     N_FAN,
     NIU_SAN,
+    MIN_SCAN_BARS,
     TACTIC_NAMES,
     is_main_board,
     is_st_name,
-    scan_all_tactics,
+    kline_limit_for_tactics,
+    normalize_tactics,
+    scan_tactics,
 )
 from app.core.pattern_engine import kline_to_candles
+from app.database import SessionLocal
 from app.models.stock import StockInfo
-from app.services.akshare_client import akshare_client
 from app.services.kline_service import KlineService
 from app.services.stock_universe import ensure_seeded, lookup_name, refresh_universe
 from app.utils.symbol import normalize_symbol, SymbolError
 
 logger = logging.getLogger(__name__)
 
-MARKET_SCAN_START = (date.today() - timedelta(days=400)).strftime("%Y%m%d")
-MARKET_SCAN_SLEEP_SEC = 0.08
+SCAN_WORKERS = 6
 
 
 TACTIC_RULES = {
@@ -35,6 +38,18 @@ TACTIC_RULES = {
     N_FAN: "放量涨停且非一字板；八日内缩量回踩，不破涨停阳线开盘价。",
     NIU_SAN: "年内倍量跳空高开大阳线或涨停；缩量回踩且不补缺口。",
 }
+
+
+@dataclass(frozen=True)
+class _ScanJob:
+    symbol: str
+    name: str
+    recent_bars: int
+    tactics: list[str] | None
+    kline_limit: int
+
+
+ScanOutcome = Literal["hit", "ok", "skipped", "error"]
 
 
 class BullTacticsService:
@@ -66,41 +81,101 @@ class BullTacticsService:
         out.sort(key=lambda r: r.symbol)
         return out
 
-    def _scan_candles(self, symbol: str, name: str, candles, recent_bars: int) -> dict:
-        hits = scan_all_tactics(candles, recent_bars=recent_bars)
+    def _scan_candles(
+        self,
+        symbol: str,
+        name: str,
+        candles,
+        recent_bars: int,
+        tactics: list[str] | None = None,
+    ) -> dict:
+        hits = scan_tactics(candles, recent_bars=recent_bars, tactics=tactics)
         return {
             "symbol": symbol,
             "name": name,
             "hits": [_hit_out(h) for h in hits],
         }
 
-    def scan_symbol(self, symbol: str, recent_bars: int = 30) -> dict | None:
+    def _scan_job(self, job: _ScanJob) -> tuple[dict | None, ScanOutcome]:
+        db = SessionLocal()
+        try:
+            klines, _ = KlineService(db).get_recent_klines(job.symbol, limit=job.kline_limit)
+            if len(klines) < MIN_SCAN_BARS:
+                return None, "skipped"
+            candles = kline_to_candles(klines)
+            result = BullTacticsService(db)._scan_candles(
+                job.symbol,
+                job.name,
+                candles,
+                job.recent_bars,
+                job.tactics,
+            )
+            if result["hits"]:
+                return result, "hit"
+            return result, "ok"
+        except Exception as exc:
+            logger.debug("tactic scan failed for %s: %s", job.symbol, exc)
+            return None, "error"
+        finally:
+            db.close()
+
+    def scan_symbol(self, symbol: str, recent_bars: int = 30, tactics: list[str] | None = None) -> dict | None:
         ok, symbol, name = self._eligible(symbol)
         if not ok:
             return None
-        klines, _ = KlineService(self.db).get_recent_klines(symbol, limit=280)
-        if len(klines) < 32:
+        kline_limit = kline_limit_for_tactics(tactics)
+        job = _ScanJob(symbol, name, recent_bars, tactics, kline_limit)
+        result, outcome = self._scan_job(job)
+        if outcome in ("skipped", "error"):
             return None
-        candles = kline_to_candles(klines)
-        return self._scan_candles(symbol, name, candles, recent_bars)
+        return result
 
-    def scan_symbols(self, symbols: list[str], recent_bars: int = 30) -> dict:
-        rows: list[dict] = []
+    def _parallel_scan_jobs(self, jobs: list[_ScanJob]) -> tuple[list[dict], int, int]:
+        if not jobs:
+            return [], 0, 0
+        items: list[dict] = []
+        skipped = 0
+        errors = 0
+        workers = min(SCAN_WORKERS, len(jobs))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(self._scan_job, job): job for job in jobs}
+            for fut in as_completed(futures):
+                result, outcome = fut.result()
+                if outcome == "hit" and result:
+                    items.append(result)
+                elif outcome == "error":
+                    errors += 1
+                elif outcome == "skipped":
+                    skipped += 1
+        items.sort(key=lambda r: max((h["score"] for h in r["hits"]), default=0), reverse=True)
+        return items, skipped, errors
+
+    def scan_symbols(self, symbols: list[str], recent_bars: int = 30, tactics: list[str] | None = None) -> dict:
+        kline_limit = kline_limit_for_tactics(tactics)
+        jobs: list[_ScanJob] = []
         skipped: list[str] = []
         for raw in symbols:
             sym = (raw or "").strip()
             if not sym:
                 continue
-            row = self.scan_symbol(sym, recent_bars=recent_bars)
-            if row and row["hits"]:
-                rows.append(row)
-            elif row is None:
+            ok, symbol, name = self._eligible(sym)
+            if not ok:
                 skipped.append(sym)
-        rows.sort(key=lambda r: max((h["score"] for h in r["hits"]), default=0), reverse=True)
-        return {"items": rows, "skipped": skipped, "count": len(rows)}
+                continue
+            jobs.append(_ScanJob(symbol, name, recent_bars, tactics, kline_limit))
+        items, scan_skipped, errors = self._parallel_scan_jobs(jobs)
+        selected = normalize_tactics(tactics)
+        return {
+            "items": items,
+            "skipped": skipped,
+            "count": len(items),
+            "tactic": selected[0] if len(selected) == 1 else None,
+            "scan_skipped": scan_skipped,
+            "errors": errors,
+        }
 
-    def scan_market(self, recent_bars: int = 30, refresh_list: bool = True) -> dict:
-        """Scan all main-board non-ST stocks; fetches klines on the fly (may take several minutes)."""
+    def scan_market(self, recent_bars: int = 30, refresh_list: bool = True, tactics: list[str] | None = None) -> dict:
+        """Scan all main-board non-ST stocks from local kline cache."""
         ensure_seeded(self.db)
         if refresh_list:
             try:
@@ -109,74 +184,22 @@ class BullTacticsService:
                 logger.warning("universe refresh skipped: %s", exc)
 
         stocks = self._main_board_stocks()
-        items: list[dict] = []
-        scanned = 0
-        skipped = 0
-        errors = 0
-
-        if not akshare_client.is_available():
-            return {
-                "items": [],
-                "scanned": 0,
-                "universe_size": len(stocks),
-                "skipped": 0,
-                "errors": 0,
-                "count": 0,
-                "error": "未安装 AKShare，无法拉取全市场行情",
-            }
-
-        end = date.today().strftime("%Y%m%d")
-        for row in stocks:
-            scanned += 1
-            try:
-                df = akshare_client.fetch_daily(
-                    row.symbol,
-                    start_date=MARKET_SCAN_START,
-                    end_date=end,
-                )
-                if df is None or df.empty or len(df) < 32:
-                    skipped += 1
-                    continue
-                candles = _df_to_candles(df)
-                result = self._scan_candles(row.symbol, row.name, candles, recent_bars)
-                if result["hits"]:
-                    items.append(result)
-            except Exception as exc:
-                errors += 1
-                logger.debug("market scan failed for %s: %s", row.symbol, exc)
-            if scanned % 40 == 0:
-                time.sleep(MARKET_SCAN_SLEEP_SEC)
-
-        items.sort(key=lambda r: max((h["score"] for h in r["hits"]), default=0), reverse=True)
+        kline_limit = kline_limit_for_tactics(tactics)
+        jobs = [
+            _ScanJob(row.symbol, row.name, recent_bars, tactics, kline_limit)
+            for row in stocks
+        ]
+        items, skipped, errors = self._parallel_scan_jobs(jobs)
+        selected = normalize_tactics(tactics)
         return {
             "items": items,
-            "scanned": scanned,
+            "scanned": len(jobs),
             "universe_size": len(stocks),
             "skipped": skipped,
             "errors": errors,
             "count": len(items),
+            "tactic": selected[0] if len(selected) == 1 else None,
         }
-
-
-def _df_to_candles(df) -> list:
-    from app.core.candle import Candle
-
-    candles: list[Candle] = []
-    for _, row in df.iterrows():
-        ts = row["date"]
-        if not isinstance(ts, datetime):
-            ts = datetime.combine(ts, datetime.min.time())
-        candles.append(
-            Candle(
-                open=float(row["open"]),
-                high=float(row["high"]),
-                low=float(row["low"]),
-                close=float(row["close"]),
-                volume=float(row["volume"] or 0),
-                timestamp=ts,
-            )
-        )
-    return candles
 
 
 def _hit_out(hit) -> dict:

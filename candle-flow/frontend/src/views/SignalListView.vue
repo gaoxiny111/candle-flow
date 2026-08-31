@@ -120,7 +120,7 @@ const levelClass = (level: string) => {
       <div class="watch-search">
         <SymbolSearch
           v-model="addQuery"
-          placeholder="搜索并加入关注，如 茅台 / 螺纹钢"
+          placeholder="搜索并加入关注，如 茅台 / 600519"
           @select="addWatch"
           @watch="onWatchFromSearch"
         />

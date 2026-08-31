@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from app.api import api_router
 from app.core.exceptions import AppException
 from app.database import init_db
+from app.services.main_board_kline_sync import start_kline_sync_scheduler, stop_kline_sync_scheduler
 from app.services.pay_qr import PAY_DIR, ensure_pay_qrs
 
 
@@ -19,7 +20,9 @@ async def lifespan(app: FastAPI):
     os.makedirs("data", exist_ok=True)
     init_db()
     ensure_pay_qrs()
+    start_kline_sync_scheduler()
     yield
+    stop_kline_sync_scheduler()
 
 
 app = FastAPI(title="Candle Flow", version="1.0.0", lifespan=lifespan)

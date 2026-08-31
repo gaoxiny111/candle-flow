@@ -114,10 +114,9 @@ NAME_ALIASES: dict[str, str] = {
     "平安": "601318.SH",
     "五粮液": "000858.SZ",
     "平安银行": "000001.SZ",
-    **FUTURE_ALIASES,
 }
 
-# 股票 / 期货代码 -> 中文名称
+# 股票代码 -> 中文名称
 SYMBOL_NAMES: dict[str, str] = {
     "000001.SZ": "平安银行",
     "600519.SH": "贵州茅台",
@@ -125,10 +124,7 @@ SYMBOL_NAMES: dict[str, str] = {
     "601318.SH": "中国平安",
     "601088.SH": "中国神华",
     "900948.SH": "伊泰B股",
-    **FUTURE_NAMES,
 }
-
-_FUTURE_ALIAS_UPPER = {key.upper(): value for key, value in FUTURE_ALIASES.items()}
 
 
 class SymbolError(ValueError):
@@ -153,26 +149,22 @@ def futures_symbol(code: str) -> str | None:
 
 
 def normalize_symbol(symbol: str) -> str:
-    """Normalize to 000001.SZ / 600519.SH / RB0.FUT"""
+    """Normalize to 000001.SZ / 600519.SH (stocks only)."""
     raw = (symbol or "").strip()
     if not raw:
         raise SymbolError("代码不能为空")
 
+    if futures_symbol(raw):
+        raise SymbolError(f"不支持期货代码: {raw}")
+
     if raw in NAME_ALIASES:
         return NAME_ALIASES[raw]
-    mapped = _FUTURE_ALIAS_UPPER.get(raw.upper())
-    if mapped:
-        return mapped
 
     upper = raw.upper()
 
     m = SYMBOL_WITH_MARKET.match(upper)
     if m:
         return f"{m.group(1)}.{m.group(2).upper()}"
-
-    fut = futures_symbol(upper)
-    if fut:
-        return fut
 
     if CODE_ONLY.match(upper):
         code = upper
@@ -182,14 +174,16 @@ def normalize_symbol(symbol: str) -> str:
             return f"{code}.SZ"
         raise SymbolError(f"无法识别市场: {code}，请使用完整格式如 {code}.SH")
 
-    raise SymbolError(
-        f"无效代码: {raw}，请使用股票如 000001.SZ、600519，或期货如 螺纹钢、RB0、IF0"
-    )
+    raise SymbolError(f"无效代码: {raw}，请使用股票如 000001.SZ、600519 或中文名如 茅台")
 
 
 def parse_symbol(symbol: str) -> tuple[str, str]:
-    """Return (code, market) e.g. ('000001', 'sz') or ('RB0', 'fut')"""
-    normalized = normalize_symbol(symbol)
+    """Return (code, market) e.g. ('000001', 'sz') or ('RB0', 'fut') for legacy entries."""
+    raw = (symbol or "").strip()
+    fut = futures_symbol(raw.upper())
+    if fut:
+        return fut.split(".")[0], "fut"
+    normalized = normalize_symbol(raw)
     code, market = normalized.rsplit(".", 1)
     return code, market.lower()
 
@@ -206,10 +200,10 @@ def is_future(symbol: str) -> bool:
 
 
 def futures_sina_code(symbol: str) -> str:
-    code, market = parse_symbol(symbol)
-    if market != "fut":
-        raise SymbolError(f"不是期货代码: {symbol}")
-    return code
+    fut = futures_symbol((symbol or "").strip().upper())
+    if fut:
+        return fut.split(".")[0]
+    raise SymbolError(f"不是期货代码: {symbol}")
 
 
 def is_b_share(symbol: str) -> bool:
