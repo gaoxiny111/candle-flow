@@ -33,22 +33,30 @@ install -m 644 "$APP/scripts/deploy/candle-flow.service" /etc/systemd/system/can
 systemctl daemon-reload
 systemctl enable --now candle-flow
 
-ARCH=$(uname -m)
-if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-  CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
-else
-  CF_URL="https://github.com/cloudflare/cloudflared/releases/download/2025.8.1/cloudflared-linux-amd64"
-fi
-if ! curl -fL --connect-timeout 20 --max-time 180 "https://ghfast.top/$CF_URL" -o /usr/local/bin/cloudflared; then
-  curl -fL --connect-timeout 20 --max-time 180 "$CF_URL" -o /usr/local/bin/cloudflared
-fi
-chmod +x /usr/local/bin/cloudflared
-
 mkdir -p /etc/cloudflared
-install -m 600 "$APP/scripts/deploy/tunnel-credentials.json" /etc/cloudflared/f3eb03d8-7017-488e-9176-79377668ea3f.json
+CRED_SRC="$APP/scripts/deploy/tunnel-credentials.json"
+if [ -f "$CRED_SRC" ]; then
+  install -m 600 "$CRED_SRC" /etc/cloudflared/f3eb03d8-7017-488e-9176-79377668ea3f.json
+fi
 install -m 644 "$APP/scripts/deploy/cloudflared.yml" /etc/cloudflared/config.yml
+
+if [ ! -x /usr/local/bin/cloudflared ]; then
+  ARCH=$(uname -m)
+  if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+    CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
+  else
+    CF_URL="https://github.com/cloudflare/cloudflared/releases/download/2025.8.1/cloudflared-linux-amd64"
+  fi
+  if ! curl -fL --connect-timeout 20 --max-time 180 "https://ghfast.top/$CF_URL" -o /usr/local/bin/cloudflared; then
+    curl -fL --connect-timeout 20 --max-time 180 "$CF_URL" -o /usr/local/bin/cloudflared
+  fi
+  chmod +x /usr/local/bin/cloudflared
+fi
+
 /usr/local/bin/cloudflared service install --config /etc/cloudflared/config.yml || true
 systemctl enable --now cloudflared
+systemctl restart candle-flow
+systemctl restart cloudflared || true
 
 sleep 2
 curl -fsS http://127.0.0.1:8002/api/v1/health || true
