@@ -46,13 +46,16 @@ def test_heima_kualan_detects_pattern():
     candles = [_c(i, 10.0, 10.4, 9.9, 10.0, 900_000) for i in range(30)]
     candles.append(_c(30, 10.0, 11.0, 10.0, 11.0, 2_000_000))
     candles.append(_c(31, 11.0, 12.1, 11.0, 12.1, 2_100_000))
-    candles.append(_c(32, 12.1, 13.31, 12.0, 13.0, 1_900_000))
-    candles.append(_c(33, 12.9, 13.0, 12.55, 12.75, 1_100_000))
-    candles.append(_c(34, 11.8, 12.0, 11.35, 11.55, 950_000))
+    # 第三天触板炸板：收盘 12.8，低于涨停价
+    candles.append(_c(32, 12.1, 13.31, 12.0, 12.8, 1_900_000))
+    candles.append(_c(33, 12.85, 13.0, 12.82, 12.9, 1_100_000))
+    # 缩量回踩：不破第三日收盘 12.8、不破 MA10
+    candles.append(_c(34, 12.88, 12.95, 12.81, 12.85, 950_000))
     hits = scan_heima_kualan(candles)
     assert hits
     assert hits[0].tactic == HEIMA
     assert hits[0].details["day3_zhaban"] is True
+    assert hits[0].details["floor_close"] == 12.8
 
 
 def test_n_fanbao_rejects_yizi():
@@ -79,17 +82,19 @@ def test_n_fanbao_detects_pullback():
 
 
 def test_niu_sanjue_gap_hold():
-    candles = [_c(i, 10.0, 10.4, 9.9, 10.0 + i * 0.02, 1_000_000) for i in range(30)]
+    candles = [_c(i, 10.0, 10.4, 9.9, 10.0 + i * 0.02, 1_000_000) for i in range(45)]
     prev = candles[-1]
     gap_open = prev.high + 0.2
     signal = Candle(gap_open, gap_open + 0.8, gap_open + 0.02, gap_open + 0.6, 2_500_000, datetime(2026, 3, 1))
     candles.append(signal)
+    # 缩量回踩：守开盘价、守 MA39
     candles.append(
-        Candle(signal.close - 0.1, signal.close, signal.close - 0.15, signal.close - 0.12, 1_100_000, datetime(2026, 3, 2))
+        Candle(signal.open + 0.05, signal.close, signal.open + 0.02, signal.open + 0.1, 1_100_000, datetime(2026, 3, 2))
     )
     hits = scan_niu_sanjue(candles)
     assert hits
     assert hits[0].tactic == NIU_SAN
+    assert hits[0].details["signal_open"] == gap_open
 
 
 def test_normalize_tactics():
@@ -104,24 +109,24 @@ def test_normalize_tactics():
 def test_kline_limit_for_tactics():
     assert kline_limit_for_tactics([HEIMA]) == 80
     assert kline_limit_for_tactics([N_FAN]) == 80
-    assert kline_limit_for_tactics([NIU_SAN]) == 280
-    assert kline_limit_for_tactics([HEIMA, NIU_SAN]) == 280
-    assert kline_limit_for_tactics(None) == 280
+    assert kline_limit_for_tactics([NIU_SAN]) == 120
+    assert kline_limit_for_tactics([HEIMA, NIU_SAN]) == 120
+    assert kline_limit_for_tactics(None) == 120
 
 
 def test_scan_tactics_filters_by_name():
     candles = [_c(i, 10.0, 10.4, 9.9, 10.0, 900_000) for i in range(30)]
     candles.append(_c(30, 10.0, 11.0, 10.0, 11.0, 2_000_000))
     candles.append(_c(31, 11.0, 12.1, 11.0, 12.1, 2_100_000))
-    candles.append(_c(32, 12.1, 13.31, 12.0, 13.0, 1_900_000))
-    candles.append(_c(33, 12.9, 13.0, 12.55, 12.75, 1_100_000))
-    candles.append(_c(34, 11.8, 12.0, 11.35, 11.55, 950_000))
+    candles.append(_c(32, 12.1, 13.31, 12.0, 12.8, 1_900_000))
+    candles.append(_c(33, 12.85, 13.0, 12.82, 12.9, 1_100_000))
+    candles.append(_c(34, 12.88, 12.95, 12.81, 12.85, 950_000))
     heima_hits = scan_tactics(candles, recent_bars=30, tactics=[HEIMA])
     assert heima_hits
     assert all(h.tactic == HEIMA for h in heima_hits)
-    n_fan_hits = scan_tactics(candles, recent_bars=30, tactics=[N_FAN])
-    assert n_fan_hits
-    assert all(h.tactic == N_FAN for h in n_fan_hits)
+    # 同组 K 线未必满足 N 字反包；过滤后不应混入其他战法
+    only_n = scan_tactics(candles, recent_bars=30, tactics=[N_FAN])
+    assert all(h.tactic == N_FAN for h in only_n)
     assert not scan_tactics(candles, recent_bars=30, tactics=[NIU_SAN])
     assert not scan_tactics(candles, recent_bars=30, tactics=["无效"])
 

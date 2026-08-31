@@ -5,13 +5,10 @@ import {
   apiErrorText,
   fetchFundamentalPool,
   fetchFundamentalThemes,
-  runFundamentalHold,
   runFundamentalPosition,
   runFundamentalScreen,
   runFundamentalTactics,
   type FundamentalCandidate,
-  type HoldCandidate,
-  type MarketRegime,
   type PositionedCandidate,
   type PositionHit,
   type TacticsCandidate,
@@ -30,7 +27,6 @@ const loading = ref(false)
 const screening = ref(false)
 const positioning = ref(false)
 const runningTactics = ref(false)
-const runningHold = ref(false)
 const error = ref('')
 const message = ref('')
 const expanded = ref<number | null>(null)
@@ -42,16 +38,12 @@ const positioned = ref<PositionedCandidate[] | null>(null)
 const positionCounts = ref<Record<string, number>>({})
 const tacticsItems = ref<TacticsCandidate[] | null>(null)
 const tacticsCounts = ref<Record<string, number>>({})
-const holdItems = ref<HoldCandidate[] | null>(null)
-const holdCounts = ref<Record<string, number>>({})
-const marketRegime = ref<MarketRegime | null>(null)
 const ironRules = ref<string[]>([])
 
-const busy = computed(() => screening.value || positioning.value || runningTactics.value || runningHold.value)
+const busy = computed(() => screening.value || positioning.value || runningTactics.value)
 const hasPool = computed(() => items.value.length > 0)
-const hasPosition = computed(() => !!positioned.value?.length && !tacticsItems.value && !holdItems.value)
-const hasTactics = computed(() => !!tacticsItems.value?.length && !holdItems.value)
-const hasHold = computed(() => !!holdItems.value?.length)
+const hasPosition = computed(() => !!positioned.value?.length && !tacticsItems.value)
+const hasTactics = computed(() => !!tacticsItems.value?.length)
 
 const ranked = computed(() =>
   [...items.value].sort((a, b) => (b.score || 0) - (a.score || 0)),
@@ -82,18 +74,6 @@ const tacOther = computed(() =>
     (r) => !['ready', 'wait_confirm', 'wait_pullback'].includes(r.tactics?.status),
   ),
 )
-
-const holdExit = computed(() => (holdItems.value || []).filter((r) => r.hold?.action === 'exit'))
-const holdReduce = computed(() => (holdItems.value || []).filter((r) => r.hold?.action === 'reduce'))
-const holdAdd = computed(() => (holdItems.value || []).filter((r) => r.hold?.action === 'add'))
-const holdKeep = computed(() => (holdItems.value || []).filter((r) => r.hold?.action === 'hold'))
-
-const regimeLabel: Record<string, string> = {
-  bull: '牛市/上升',
-  chop: '震荡市',
-  bear: '熊市/下降',
-  black_swan: '黑天鹅',
-}
 
 const selectedCards = computed(() => themeScorecards.value.filter((t) => t.selected))
 const visibleCards = computed(() =>
@@ -171,9 +151,6 @@ function clearLayers() {
   positionCounts.value = {}
   tacticsItems.value = null
   tacticsCounts.value = {}
-  holdItems.value = null
-  holdCounts.value = {}
-  marketRegime.value = null
   ironRules.value = []
 }
 
@@ -254,7 +231,6 @@ async function runPosition() {
   error.value = ''
   message.value = ''
   tacticsItems.value = null
-  holdItems.value = null
   try {
     const { data } = await runFundamentalPosition()
     positioned.value = data.data?.items || []
@@ -277,7 +253,6 @@ async function runTactics() {
   runningTactics.value = true
   error.value = ''
   message.value = ''
-  holdItems.value = null
   try {
     const { data } = await runFundamentalTactics()
     tacticsItems.value = data.data?.items || []
@@ -296,36 +271,6 @@ async function runTactics() {
     error.value = apiErrorText(e)
   } finally {
     runningTactics.value = false
-  }
-}
-
-async function runHold() {
-  runningHold.value = true
-  error.value = ''
-  message.value = ''
-  try {
-    const { data } = await runFundamentalHold()
-    holdItems.value = data.data?.items || []
-    holdCounts.value = data.data?.counts || {}
-    marketRegime.value = data.data?.regime || null
-    ironRules.value = data.data?.iron_rules || []
-    const c = holdCounts.value
-    const reg = marketRegime.value
-    const regText = reg
-      ? `${regimeLabel[reg.regime] || reg.regime}（基本面${Math.round(
-          (reg.fundamental || 0) * 100,
-        )}%/蜡烛${Math.round((reg.candle || 0) * 100)}%）`
-      : ''
-    message.value = `持仓管理：清仓 ${c.exit ?? 0} · 减仓 ${c.reduce ?? 0} · 加仓 ${c.add ?? 0} · 持有 ${
-      c.hold ?? 0
-    }${regText ? ` · ${regText}` : ''}`
-    if (holdItems.value.length) {
-      items.value = holdItems.value
-    }
-  } catch (e) {
-    error.value = apiErrorText(e)
-  } finally {
-    runningHold.value = false
   }
 }
 
@@ -369,8 +314,7 @@ onMounted(async () => {
     <header class="page-head">
       <h1>基本面候选池</h1>
       <p class="lead">
-        四层流程：① 基本面池 → ② 周/月线战略定位 → ③ 日线战术入场（等回调、确认、止损）→
-        ④ 持仓加减与退出。形态必须配合量能与关键位置。
+        三层流程：① 基本面池 → ② 周/月线战略定位 → ③ 日线战术入场（等回调、确认、止损）。形态必须配合量能与关键位置。
       </p>
       <p v-if="note" class="hint">{{ note }}</p>
     </header>
@@ -460,14 +404,6 @@ onMounted(async () => {
           >
             {{ runningTactics ? '日线扫描中…' : '③ 战术入场' }}
           </button>
-          <button
-            class="btn-primary ghost"
-            type="button"
-            :disabled="!hasPool || busy"
-            @click="runHold"
-          >
-            {{ runningHold ? '持仓扫描中…' : '④ 持仓管理' }}
-          </button>
           <button class="btn-secondary" type="button" :disabled="!hasPool || busy" @click="addAllWatch">
             全部加入关注
           </button>
@@ -486,20 +422,12 @@ onMounted(async () => {
       <div class="results-head">
         <div>
           <h2>
-            <template v-if="hasHold">持仓管理</template>
-            <template v-else-if="hasTactics">战术入场（日线）</template>
+            <template v-if="hasTactics">战术入场（日线）</template>
             <template v-else-if="hasPosition">战略定位分区</template>
             <template v-else>候选结果</template>
           </h2>
           <p class="sub">
             <template v-if="loading">加载中…</template>
-            <template v-else-if="hasHold">
-              清仓 {{ holdCounts.exit ?? 0 }} · 减仓 {{ holdCounts.reduce ?? 0 }} · 加仓
-              {{ holdCounts.add ?? 0 }} · 持有 {{ holdCounts.hold ?? 0 }}
-              <template v-if="marketRegime">
-                · {{ regimeLabel[marketRegime.regime] || marketRegime.regime }}
-              </template>
-            </template>
             <template v-else-if="hasTactics">
               可扣扳机 {{ tacticsCounts.ready ?? 0 }} · 等待
               {{ (tacticsCounts.wait_confirm ?? 0) + (tacticsCounts.wait_pullback ?? 0) }} · 其它
@@ -522,14 +450,7 @@ onMounted(async () => {
         </div>
       </div>
 
-      <div v-if="marketRegime && hasHold" class="regime-banner card">
-        <strong>{{ regimeLabel[marketRegime.regime] || marketRegime.regime }}</strong>
-        · 基本面权重 {{ Math.round((marketRegime.fundamental || 0) * 100) }}% /
-        蜡烛图 {{ Math.round((marketRegime.candle || 0) * 100) }}%
-        <span class="regime-tip">{{ marketRegime.tip }}</span>
-      </div>
-
-      <details v-if="ironRules.length && (hasTactics || hasHold)" class="iron-rules card">
+      <details v-if="ironRules.length && hasTactics" class="iron-rules card">
         <summary>六条铁律</summary>
         <ol>
           <li v-for="(r, i) in ironRules" :key="i">{{ r }}</li>
@@ -537,78 +458,8 @@ onMounted(async () => {
       </details>
 
       <div v-if="!loading && !ranked.length" class="empty card">
-        点击「① 季度筛选」生成候选池，再依次跑定位 / 入场 / 持仓。
+        点击「① 季度筛选」生成候选池，再依次跑定位 / 入场。
       </div>
-
-      <template v-else-if="hasHold">
-        <div
-          v-for="zone in [
-            { key: 'exit', title: '清仓信号', rows: holdExit, tone: 'top' },
-            { key: 'reduce', title: '分批减仓', rows: holdReduce, tone: 'mid' },
-            { key: 'add', title: '可加仓', rows: holdAdd, tone: 'bottom' },
-            { key: 'hold', title: '持有跟踪', rows: holdKeep, tone: 'mid' },
-          ]"
-          :key="zone.key"
-          class="zone-block"
-          :class="zone.tone"
-        >
-          <div class="zone-head">
-            <h3>{{ zone.title }}</h3>
-            <span class="zone-count">{{ zone.rows.length }} 只</span>
-          </div>
-          <p v-if="!zone.rows.length" class="zone-empty">暂无</p>
-          <div v-else class="stock-list">
-            <article v-for="(row, idx) in zone.rows" :key="row.id" class="stock-card">
-              <header class="stock-head">
-                <div class="stock-id">
-                  <span class="rank">#{{ idx + 1 }}</span>
-                  <div class="id-text">
-                    <div class="title-row">
-                      <span class="name">{{ row.name || '—' }}</span>
-                      <span class="code">{{ formatSymbol(row.symbol) }}</span>
-                      <span class="zone-badge" :class="row.hold?.action">{{ row.hold?.label }}</span>
-                    </div>
-                    <div class="tags">
-                      <span v-if="row.industry" class="tag muted">{{ row.industry }}</span>
-                      <span v-for="t in row.themes" :key="t" class="tag theme">{{ t }}</span>
-                    </div>
-                  </div>
-                </div>
-                <div class="stock-aside">
-                  <span class="score lg" :class="scoreTone(row.score || 0)">{{ fmt(row.score, 0) }}</span>
-                  <RouterLink class="chart-link" :to="`/chart/${row.symbol}`">看 K 线</RouterLink>
-                  <button
-                    class="watch-btn"
-                    type="button"
-                    :disabled="watchlist.has(row.symbol)"
-                    @click="addOne(row)"
-                  >
-                    {{ watchlist.has(row.symbol) ? '已关注' : '加关注' }}
-                  </button>
-                </div>
-              </header>
-              <dl class="metrics">
-                <div v-for="m in metricRows(row)" :key="m.label" class="metric">
-                  <dt>{{ m.label }}</dt>
-                  <dd :class="m.tone">
-                    {{ m.value }}
-                    <small v-if="m.sub" class="sub-chg">{{ m.sub }}</small>
-                  </dd>
-                </div>
-              </dl>
-              <div class="pos-hits">
-                <div v-for="(s, si) in row.hold?.signals || []" :key="si">
-                  <span class="pos-label">{{ s.kind }}</span>
-                  <span>{{ s.reason }}</span>
-                </div>
-                <p v-if="row.hold?.warnings?.length" class="pos-notes">
-                  {{ row.hold.warnings.join('；') }}
-                </p>
-              </div>
-            </article>
-          </div>
-        </div>
-      </template>
 
       <template v-else-if="hasTactics">
         <div

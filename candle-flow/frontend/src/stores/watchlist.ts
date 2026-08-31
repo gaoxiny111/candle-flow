@@ -160,6 +160,16 @@ export const useWatchlistStore = defineStore('watchlist', {
     async deleteGroup(id: string) {
       await this.persist({ delete_group: id })
     },
+    /** 解散命名分组：股票并入默认组后删除该分组（与独立板块列表不冲突） */
+    async dissolveNamedGroup(name: string) {
+      const target = this.groups.find((g) => g.name === name)
+      if (!target || target.id === DEFAULT_GROUP_ID) return false
+      await this.deleteGroup(target.id)
+      if (this.activeGroupId === target.id) {
+        this.activeGroupId = DEFAULT_GROUP_ID
+      }
+      return true
+    },
     async moveToGroup(symbol: string, groupId: string) {
       await this.persist({ move: { symbol, group_id: groupId } })
     },

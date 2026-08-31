@@ -560,6 +560,42 @@ export const fetchFundamentalPool = async () => {
   return { data: checkApi(res) }
 }
 
+export interface WatchFundamental {
+  symbol: string
+  name: string
+  industry?: string
+  themes?: string[]
+  report_date?: string
+  score: number
+  roe: number | null
+  roe_avg?: number | null
+  roe_years_ok: number
+  revenue_yoy: number | null
+  profit_yoy: number | null
+  ocf_ps: number | null
+  debt_ratio: number | null
+  pe_ttm: number | null
+  pb: number | null
+  pe_percentile: number | null
+  pb_percentile: number | null
+  peg: number | null
+  track?: 'growth' | 'cyclical' | 'value' | string
+  track_label?: string
+  dividend_yield?: number | null
+  checks: FundamentalCheck[]
+  notes: string
+  verdict: string
+  verdict_tone: 'strong' | 'mid' | 'weak' | 'na' | string
+  metrics: string
+}
+
+export const analyzeWatchFundamentals = async (symbols: string[]) => {
+  const res = await api.post<
+    ApiResponse<{ report_dates: string[]; items: WatchFundamental[] }>
+  >('/fundamentals/analyze', { symbols }, { timeout: 180000 })
+  return { data: checkApi(res) }
+}
+
 export const runFundamentalScreen = async (body: {
   themes?: string[]
   auto_themes?: boolean

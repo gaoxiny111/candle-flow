@@ -41,12 +41,6 @@ const router = createRouter({
       meta: { title: '主板战法', requiresAuth: false },
     },
     {
-      path: '/holdings',
-      name: 'holdings',
-      component: () => import('@/views/HoldingsView.vue'),
-      meta: { title: '持仓管理', requiresAuth: false },
-    },
-    {
       path: '/fundamentals',
       name: 'fundamentals',
       component: () => import('@/views/FundamentalPoolView.vue'),

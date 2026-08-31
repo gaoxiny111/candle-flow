@@ -93,7 +93,7 @@ function detailParts(hit: BullTacticHit): { label: string; value: string }[] {
     return [
       { label: '三连板', value: days },
       { label: '支撑收盘', value: String(d.floor_close ?? d.ref_close ?? '—') },
-      { label: 'MA7', value: String(d.ma7 ?? '—') },
+      { label: 'MA10', value: String(d.ma10 ?? '—') },
     ]
   }
   if (hit.tactic === 'N字反包') {
@@ -105,8 +105,8 @@ function detailParts(hit: BullTacticHit): { label: string; value: string }[] {
   }
   return [
     { label: '信号日', value: shortDate(hit.setup_date) },
-    { label: '缺口下沿', value: String(d.gap_low ?? '—') },
-    { label: '倍量', value: String(d.volume_ratio ?? '—') },
+    { label: '守开盘价', value: String(d.signal_open ?? '—') },
+    { label: 'MA39', value: String(d.ma39 ?? '—') },
   ]
 }
 

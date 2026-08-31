@@ -120,6 +120,10 @@ class ScreenThresholds:
     peg_max: float = 1.5
     require_ocf_positive: bool = True
     pool_size: int = 20
+    # cyclical / value track
+    cyclical_roe_avg_min: float = 10.0
+    cyclical_roe_years: int = 3
+    dividend_bonus_min: float = 4.0
 
 
 @dataclass
@@ -153,14 +157,42 @@ class ScreenRow:
     checks: list[CheckItem] = field(default_factory=list)
     score: float = 0.0
     notes: str = ""
+    track: str = "growth"  # growth | cyclical | value
+    roe_avg: float | None = None
+    no_consec_loss: bool | None = None
+    loss_years: int = 0
+    dividend_yield: float | None = None
+    profit_cv: float | None = None
+    profit_positive_years: int = 0
+    revenue: float | None = None
 
     @property
     def passed_hard(self) -> bool:
-        hard = {c.key for c in self.checks if c.key in HARD_KEYS and c.ok}
-        return HARD_KEYS.issubset(hard)
+        from app.services.fundamental_tracks import hard_keys_for
+
+        keys = hard_keys_for(self.track)
+        hard = {c.key for c in self.checks if c.key in keys and c.ok}
+        return keys.issubset(hard)
 
 
-HARD_KEYS = {"roe_streak", "growth", "ocf"}
+HARD_KEYS_GROWTH = frozenset({"roe_streak", "growth", "ocf"})
+HARD_KEYS_CYCLICAL = frozenset({"roe_avg", "no_consec_loss", "ocf", "debt"})
+HARD_KEYS_BY_TRACK: dict[str, frozenset[str]] = {
+    "growth": HARD_KEYS_GROWTH,
+    "cyclical": HARD_KEYS_CYCLICAL,
+    "value": HARD_KEYS_CYCLICAL,
+}
+# backward-compatible alias
+HARD_KEYS = HARD_KEYS_GROWTH
+
+# re-export classify for callers / tests
+from app.services.fundamental_tracks import TRACK_LABEL, sector_classify  # noqa: E402
+
+# Performance report frames are large; cache in-process to speed watchlist analyze.
+_YJBB_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
+_YJBB_TTL = 6 * 3600
+_DEBT_CACHE: dict[str, tuple[float, dict[str, float]]] = {}
+_DEBT_TTL = 6 * 3600
 
 
 def _num(v: Any) -> float | None:
@@ -642,11 +674,19 @@ def _fetch_yjbb(report_date: str, retries: int = 2) -> pd.DataFrame:
 
     import akshare as ak
 
+    now = time.time()
+    cached = _YJBB_CACHE.get(report_date)
+    if cached is not None:
+        ts, cached_df = cached
+        if now - ts < _YJBB_TTL and cached_df is not None and not cached_df.empty:
+            return cached_df
+
     last_err: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
             df = ak.stock_yjbb_em(date=report_date)
             if df is not None and not df.empty:
+                _YJBB_CACHE[report_date] = (now, df)
                 return df
             last_err = ValueError("empty")
         except Exception as e:
@@ -656,7 +696,9 @@ def _fetch_yjbb(report_date: str, retries: int = 2) -> pd.DataFrame:
             time.sleep(1.2 * attempt)
     if last_err:
         logger.warning("yjbb %s unavailable: %s", report_date, last_err)
-    return pd.DataFrame()
+    empty = pd.DataFrame()
+    _YJBB_CACHE[report_date] = (now, empty)
+    return empty
 
 
 def resolve_report_frames(need: int = 3, today: date | None = None) -> tuple[list[str], dict[str, pd.DataFrame]]:
@@ -682,25 +724,36 @@ def resolve_report_dates(need: int = 3, today: date | None = None) -> list[str]:
 
 def _fetch_debt_map(report_date: str) -> dict[str, float]:
     """资产负债率 from balance-sheet snapshot if available."""
+    import time
+
     import akshare as ak
+
+    now = time.time()
+    cached = _DEBT_CACHE.get(report_date)
+    if cached and now - cached[0] < _DEBT_TTL:
+        return cached[1]
 
     out: dict[str, float] = {}
     try:
         df = ak.stock_zcfz_em(date=report_date)
     except Exception as e:
         logger.warning("zcfz fetch failed %s: %s", report_date, e)
+        _DEBT_CACHE[report_date] = (now, out)
         return out
     if df is None or df.empty:
+        _DEBT_CACHE[report_date] = (now, out)
         return out
     code_col = next((c for c in df.columns if "代码" in str(c)), None)
     debt_col = next((c for c in df.columns if "资产负债率" in str(c)), None)
     if not code_col or not debt_col:
+        _DEBT_CACHE[report_date] = (now, out)
         return out
     for _, row in df.iterrows():
         sym = _to_symbol(row[code_col])
         d = _num(row[debt_col])
         if sym and d is not None:
             out[sym] = d
+    _DEBT_CACHE[report_date] = (now, out)
     return out
 
 
@@ -712,114 +765,15 @@ def _peg(pe: float | None, profit_yoy: float | None) -> float | None:
 
 
 def _score(row: ScreenRow, th: ScreenThresholds) -> float:
-    s = 0.0
-    if row.roe is not None:
-        s += min(row.roe, 40) * 0.8
-    if row.roe_years_ok >= th.roe_years:
-        s += 15
-    elif row.roe_years_ok == th.roe_years - 1:
-        s += 8
-    growth = max(row.revenue_yoy or -999, row.profit_yoy or -999)
-    if growth > 0:
-        s += min(growth, 50) * 0.5
-    if row.ocf_ps is not None and row.ocf_ps > 0:
-        s += 8
-    if row.debt_ratio is not None and row.debt_ratio < th.debt_max:
-        s += 6
-    if row.pe_percentile is not None and row.pe_percentile < th.pe_pct_max:
-        s += max(0, th.pe_pct_max - row.pe_percentile) * 0.35
-    if row.pb_percentile is not None and row.pb_percentile < th.pb_pct_max:
-        s += max(0, th.pb_pct_max - row.pb_percentile) * 0.25
-    if row.peg is not None and 0 < row.peg <= th.peg_max:
-        s += 10
-    return round(s, 2)
+    from app.services.fundamental_tracks import score_row
+
+    return score_row(row, th)
 
 
 def _build_checks(row: ScreenRow, th: ScreenThresholds) -> list[CheckItem]:
-    checks: list[CheckItem] = []
-    checks.append(
-        CheckItem(
-            "roe_streak",
-            f"ROE≥{th.roe_min}% 连续{th.roe_years}年",
-            row.roe_years_ok >= th.roe_years,
-            f"近{row.roe_years_ok}年达标" + (f"；最新 {row.roe:.1f}%" if row.roe is not None else ""),
-        )
-    )
-    growth_ok = (row.revenue_yoy is not None and row.revenue_yoy >= th.growth_min) or (
-        row.profit_yoy is not None and row.profit_yoy >= th.growth_min
-    )
-    checks.append(
-        CheckItem(
-            "growth",
-            f"营收或净利增速≥{th.growth_min}%",
-            growth_ok,
-            f"营收 {row.revenue_yoy}% / 净利 {row.profit_yoy}%"
-            if row.revenue_yoy is not None or row.profit_yoy is not None
-            else "无增速数据",
-        )
-    )
-    ocf_ok = (not th.require_ocf_positive) or (row.ocf_ps is not None and row.ocf_ps > 0)
-    checks.append(
-        CheckItem(
-            "ocf",
-            "经营现金流（每股）为正",
-            ocf_ok,
-            f"每股经营现金流 {row.ocf_ps}" if row.ocf_ps is not None else "无数据",
-        )
-    )
-    debt_ok = row.debt_ratio is None or row.debt_ratio < th.debt_max
-    checks.append(
-        CheckItem(
-            "debt",
-            f"资产负债率＜{th.debt_max}%",
-            debt_ok if row.debt_ratio is not None else False,
-            f"{row.debt_ratio:.1f}%" if row.debt_ratio is not None else "未取到负债率（软条件）",
-        )
-    )
-    pe_ok = row.pe_percentile is not None and row.pe_percentile < th.pe_pct_max
-    checks.append(
-        CheckItem(
-            "pe_pct",
-            f"PE历史分位＜{th.pe_pct_max}%",
-            pe_ok,
-            f"{row.pe_percentile:.1f}%" if row.pe_percentile is not None else "估值分位加载中/缺失",
-        )
-    )
-    pb_ok = row.pb_percentile is not None and row.pb_percentile < th.pb_pct_max
-    checks.append(
-        CheckItem(
-            "pb_pct",
-            f"PB历史分位＜{th.pb_pct_max}%",
-            pb_ok,
-            f"{row.pb_percentile:.1f}%" if row.pb_percentile is not None else "估值分位加载中/缺失",
-        )
-    )
-    peg_ok = row.peg is not None and 0 < row.peg <= th.peg_max
-    checks.append(
-        CheckItem(
-            "peg",
-            f"PEG＜{th.peg_max}",
-            peg_ok,
-            f"PEG {row.peg}" if row.peg is not None else "无法计算（需正增长与PE）",
-        )
-    )
-    checks.append(
-        CheckItem(
-            "integrity",
-            "管理层诚信（人工）",
-            True,
-            "系统无法自动核验，入池后请人工复核",
-        )
-    )
-    checks.append(
-        CheckItem(
-            "dividend",
-            "股息率＞行业均值（人工）",
-            True,
-            "暂无行业股息均值数据，请人工对比",
-        )
-    )
-    return checks
+    from app.services.fundamental_tracks import build_checks
+
+    return build_checks(row, th)
 
 
 def screen_fundamentals(
@@ -846,7 +800,7 @@ def screen_fundamentals(
         for d in dates:
             logger.info("yjbb %s rows=%s", d, len(frames[d]))
     else:
-        dates, frames = resolve_report_frames(th.roe_years)
+        dates, frames = resolve_report_frames(max(th.roe_years, 5))
 
     usable = [d for d in dates if frames.get(d) is not None and not frames[d].empty]
     if not usable:
@@ -881,16 +835,24 @@ def screen_fundamentals(
 
     debt_map = _fetch_debt_map(latest) if enrich_debt else {}
 
-    # Index older years by symbol → ROE
+    # Index older years by symbol → ROE / net profit
     hist_roe: dict[str, dict[str, float]] = {d: {} for d in dates}
+    hist_profit: dict[str, dict[str, float]] = {d: {} for d in dates}
     for d, df in frames.items():
         if df is None or df.empty:
             continue
         for _, row in df.iterrows():
             sym = _to_symbol(row.get("股票代码"))
+            if not sym:
+                continue
             roe = _num(row.get("净资产收益率"))
-            if sym and roe is not None:
+            if roe is not None:
                 hist_roe[d][sym] = roe
+            np_ = _num(row.get("净利润"))
+            if np_ is None:
+                np_ = _num(row.get("归母净利润"))
+            if np_ is not None:
+                hist_profit[d][sym] = np_
 
     candidates: list[ScreenRow] = []
     for _, row in base.iterrows():
@@ -967,17 +929,19 @@ def screen_fundamentals(
             r.peg = _peg(r.pe_ttm, r.profit_yoy)
 
     # Soft valuation filter: keep if PE/PB pct unknown OR under threshold
+    from app.services.fundamental_tracks import enrich_track_metrics
+
     filtered: list[ScreenRow] = []
     for r in shortlist:
         pe_block = r.pe_percentile is not None and r.pe_percentile >= th.pe_pct_max
         pb_block = r.pb_percentile is not None and r.pb_percentile >= th.pb_pct_max
         peg_block = r.peg is not None and r.peg > th.peg_max
-        # Allow through if at most one soft valuation miss (still show checks)
         soft_fails = sum([pe_block, pb_block, peg_block])
-        r.checks = _build_checks(r, th)
-        r.score = _score(r, th)
+        enrich_track_metrics(
+            r, th=th, hist_roe=hist_roe, hist_profit=hist_profit, dates=dates
+        )
         notes = []
-        if r.roe_years_ok < th.roe_years:
+        if r.track == "growth" and r.roe_years_ok < th.roe_years:
             notes.append(f"ROE 连续年数不足（{r.roe_years_ok}/{th.roe_years}）")
         if soft_fails:
             notes.append(f"估值软条件未全过（{soft_fails}项）")
@@ -985,7 +949,6 @@ def screen_fundamentals(
         if r.roe_years_ok >= th.roe_years and soft_fails <= 1:
             filtered.append(r)
         elif r.roe_years_ok >= th.roe_years and soft_fails > 1:
-            # still keep high quality if score strong
             if r.score >= 45:
                 filtered.append(r)
 
@@ -1125,6 +1088,246 @@ def screen_rows_out(rows: list[ScreenRow]) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def _verdict(row: ScreenRow) -> tuple[str, str]:
+    from app.services.fundamental_tracks import verdict
+
+    return verdict(row)
+
+
+def _metrics_line(row: ScreenRow) -> str:
+    from app.services.fundamental_tracks import metrics_line
+
+    return metrics_line(row)
+
+
+def _index_yjbb(df: pd.DataFrame) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if df is None or df.empty:
+        return out
+    for _, row in df.iterrows():
+        sym = _to_symbol(row.get("股票代码"))
+        if sym:
+            out[sym] = row
+    return out
+
+
+def analyze_symbols(
+    db: Session,
+    symbols: list[str],
+    *,
+    thresholds: ScreenThresholds | None = None,
+    enrich_valuation: bool = True,
+    enrich_debt: bool = True,
+) -> dict[str, Any]:
+    """
+    Fundamental snapshot for an arbitrary watchlist (no theme gate).
+    Reuses annual performance reports + valuation percentiles.
+    """
+    th = thresholds or ScreenThresholds()
+    wanted: list[str] = []
+    seen: set[str] = set()
+    for raw in symbols:
+        try:
+            sym = normalize_symbol(str(raw).strip())
+        except SymbolError:
+            continue
+        if is_index_symbol(sym) or is_etf_symbol(sym):
+            continue
+        key = sym.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        wanted.append(sym)
+        if len(wanted) >= 50:
+            break
+
+    if not wanted:
+        return {"report_dates": [], "items": []}
+
+    dates, frames = resolve_report_frames(max(th.roe_years, 5))
+    if not dates:
+        return {
+            "report_dates": [],
+            "items": [
+                {
+                    "symbol": s,
+                    "name": "",
+                    "industry": "",
+                    "report_date": "",
+                    "score": 0,
+                    "roe": None,
+                    "roe_years_ok": 0,
+                    "revenue_yoy": None,
+                    "profit_yoy": None,
+                    "ocf_ps": None,
+                    "debt_ratio": None,
+                    "pe_ttm": None,
+                    "pb": None,
+                    "pe_percentile": None,
+                    "pb_percentile": None,
+                    "peg": None,
+                    "track": "growth",
+                    "checks": [],
+                    "notes": "暂无业绩报表数据",
+                    "verdict": "无财报数据",
+                    "verdict_tone": "na",
+                    "metrics": "—",
+                }
+                for s in wanted
+            ],
+        }
+
+    latest = dates[0]
+    base_df = frames.get(latest)
+    if base_df is None:
+        base_df = pd.DataFrame()
+    base_index = _index_yjbb(base_df)
+    hist_roe: dict[str, dict[str, float]] = {d: {} for d in dates}
+    hist_profit: dict[str, dict[str, float]] = {d: {} for d in dates}
+    for d, df in frames.items():
+        if df is None or df.empty:
+            continue
+        for _, row in df.iterrows():
+            sym = _to_symbol(row.get("股票代码"))
+            if not sym:
+                continue
+            roe = _num(row.get("净资产收益率"))
+            if roe is not None:
+                hist_roe[d][sym] = roe
+            # absolute net profit (万元/元，口径随源；仅用于盈亏符号与波动)
+            np_ = _num(row.get("净利润"))
+            if np_ is None:
+                np_ = _num(row.get("归母净利润"))
+            if np_ is not None:
+                hist_profit[d][sym] = np_
+
+    debt_map = _fetch_debt_map(latest) if enrich_debt else {}
+    vals: dict[str, dict[str, Any]] = {}
+    if enrich_valuation:
+        try:
+            vals = {v["symbol"]: v for v in get_valuations(wanted, db=db)}
+        except Exception as e:
+            logger.warning("watchlist valuation enrich failed: %s", e)
+
+    from app.services.fundamental_tracks import enrich_track_metrics
+
+    theme_ids = list(THEME_KEYWORDS.keys())
+    items: list[dict[str, Any]] = []
+    for sym in wanted:
+        raw = base_index.get(sym)
+        v = vals.get(sym) or {}
+        if raw is None:
+            items.append(
+                {
+                    "symbol": sym,
+                    "name": str(v.get("name") or ""),
+                    "industry": "",
+                    "report_date": latest,
+                    "score": 0,
+                    "roe": None,
+                    "roe_years_ok": 0,
+                    "revenue_yoy": None,
+                    "profit_yoy": None,
+                    "ocf_ps": None,
+                    "debt_ratio": debt_map.get(sym),
+                    "pe_ttm": _num(v.get("pe_ttm")),
+                    "pb": _num(v.get("pb")),
+                    "pe_percentile": _num(v.get("pe_percentile")),
+                    "pb_percentile": _num(v.get("pb_percentile")),
+                    "peg": None,
+                    "track": sector_classify("", name=str(v.get("name") or ""), symbol=sym),
+                    "checks": [],
+                    "notes": "业绩快报未覆盖该标的（可能为 B 股/新股）",
+                    "verdict": "无财报数据",
+                    "verdict_tone": "na",
+                    "metrics": "—",
+                }
+            )
+            continue
+
+        industry = str(raw.get("所处行业") or "")
+        roe = _num(raw.get("净资产收益率"))
+        rev = _num(raw.get("营业总收入-同比增长"))
+        profit = _num(raw.get("净利润-同比增长"))
+        ocf = _num(raw.get("每股经营现金流量"))
+        revenue = _num(raw.get("营业总收入"))
+        years_ok = 0
+        for d in dates:
+            r = hist_roe.get(d, {}).get(sym)
+            if r is not None and r >= th.roe_min:
+                years_ok += 1
+            else:
+                break
+
+        row = ScreenRow(
+            symbol=sym,
+            name=str(raw.get("股票简称") or v.get("name") or ""),
+            industry=industry,
+            themes=match_themes(industry, theme_ids),
+            report_date=latest,
+            roe=roe,
+            roe_years_ok=years_ok,
+            revenue_yoy=rev,
+            profit_yoy=profit,
+            ocf_ps=ocf,
+            debt_ratio=debt_map.get(sym),
+            pe_ttm=_num(v.get("pe_ttm")),
+            pb=_num(v.get("pb")),
+            pe_percentile=_num(v.get("pe_percentile")),
+            pb_percentile=_num(v.get("pb_percentile")),
+            price=_num(v.get("price")),
+            change_pct=_num(v.get("change_pct")),
+            dividend_yield=_num(v.get("dividend_yield")),
+            revenue=revenue,
+        )
+        row.peg = _peg(row.pe_ttm, row.profit_yoy)
+        enrich_track_metrics(
+            row, th=th, hist_roe=hist_roe, hist_profit=hist_profit, dates=dates
+        )
+        label, tone = _verdict(row)
+        notes = []
+        if not row.passed_hard:
+            notes.append(f"{TRACK_LABEL.get(row.track, row.track)}硬条件未全过")
+        if row.pe_percentile is not None and row.pe_percentile >= th.pe_pct_max:
+            notes.append("PE 分位偏高")
+        if row.pb_percentile is not None and row.pb_percentile >= th.pb_pct_max:
+            notes.append("PB 分位偏高")
+        items.append(
+            {
+                "symbol": row.symbol,
+                "name": row.name,
+                "industry": row.industry,
+                "themes": list(row.themes),
+                "report_date": row.report_date,
+                "score": row.score,
+                "roe": row.roe,
+                "roe_avg": row.roe_avg,
+                "roe_years_ok": row.roe_years_ok,
+                "revenue_yoy": row.revenue_yoy,
+                "profit_yoy": row.profit_yoy,
+                "ocf_ps": row.ocf_ps,
+                "debt_ratio": row.debt_ratio,
+                "pe_ttm": row.pe_ttm,
+                "pb": row.pb,
+                "pe_percentile": row.pe_percentile,
+                "pb_percentile": row.pb_percentile,
+                "peg": row.peg,
+                "track": row.track,
+                "track_label": TRACK_LABEL.get(row.track, row.track),
+                "dividend_yield": row.dividend_yield,
+                "checks": [
+                    {"key": c.key, "label": c.label, "ok": c.ok, "detail": c.detail} for c in row.checks
+                ],
+                "notes": "；".join(notes),
+                "verdict": label,
+                "verdict_tone": tone,
+                "metrics": _metrics_line(row),
+            }
+        )
+
+    return {"report_dates": dates, "items": items}
 
 
 def themes_catalog() -> list[dict[str, Any]]:

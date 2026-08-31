@@ -7,6 +7,7 @@ from app.schemas.common import ApiResponse
 from app.services.fundamental_screen import (
     AUTO_THEME_TOP_N,
     ScreenThresholds,
+    analyze_symbols,
     clear_pool,
     list_pool,
     pool_items_out,
@@ -28,6 +29,12 @@ class ScreenRequest(BaseModel):
     pe_pct_max: float = 40.0
     pb_pct_max: float = 40.0
     peg_max: float = 1.5
+    enrich_valuation: bool = True
+    enrich_debt: bool = True
+
+
+class AnalyzeRequest(BaseModel):
+    symbols: list[str] = Field(default_factory=list, max_length=50)
     enrich_valuation: bool = True
     enrich_debt: bool = True
 
@@ -61,6 +68,23 @@ def get_pool(db: Session = Depends(get_db)):
 def delete_pool(db: Session = Depends(get_db)):
     n = clear_pool(db)
     return ApiResponse(data={"cleared": n})
+
+
+@router.post("/fundamentals/analyze")
+def analyze_watchlist(body: AnalyzeRequest, db: Session = Depends(get_db)):
+    """Watchlist fundamental snapshot (ROE / growth / debt / verdict)."""
+    if not body.symbols:
+        return ApiResponse(data={"report_dates": [], "items": []})
+    try:
+        data = analyze_symbols(
+            db,
+            body.symbols,
+            enrich_valuation=body.enrich_valuation,
+            enrich_debt=body.enrich_debt,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"基本面分析失败：{e}") from e
+    return ApiResponse(data=data)
 
 
 @router.post("/fundamentals/position")

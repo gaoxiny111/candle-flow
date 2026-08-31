@@ -6,9 +6,9 @@ import { usePatternStore } from '@/stores/pattern'
 import { useSignalStore } from '@/stores/signal'
 import { useConfigStore } from '@/stores/config'
 import { useWatchlistStore } from '@/stores/watchlist'
-import { apiErrorText, fetchHealth, fetchValuations, resolveSymbolQuery } from '@/api'
+import { apiErrorText, analyzeWatchFundamentals, fetchHealth, fetchValuations, resolveSymbolQuery, scanHoldings } from '@/api'
 import { maskPhone } from '@/utils/phone'
-import type { SymbolValuation } from '@/api'
+import type { HoldingsRow, SymbolValuation, WatchFundamental } from '@/api'
 import { directionZh, patternNameZh } from '@/utils/labels'
 import { rememberSymbol, symbolName, tryNormalizeSymbol } from '@/utils/symbol'
 import SymbolSearch from '@/components/SymbolSearch.vue'
@@ -25,7 +25,42 @@ const searchQuery = ref('')
 const followError = ref('')
 const valuations = ref<Record<string, SymbolValuation>>({})
 const valuationLoading = ref(false)
+const holdLoading = ref(false)
+const holdError = ref('')
+const holdBySymbol = ref<Record<string, HoldingsRow>>({})
+const fundLoading = ref(false)
+const fundError = ref('')
+const fundBySymbol = ref<Record<string, WatchFundamental>>({})
+/** 主视图：个人关注 vs 内蒙古上市股 */
+const boardMode = ref<'watch' | 'neimenggu'>('watch')
 let percentileTimer: ReturnType<typeof setTimeout> | null = null
+let holdScanToken = 0
+let fundScanToken = 0
+
+/** 内蒙古辖区主要 A/B 股（独立列表，不占用关注名额） */
+const NEIMENGGU_STOCKS: { symbol: string; name: string }[] = [
+  { symbol: '600887.SH', name: '伊利股份' },
+  { symbol: '600111.SH', name: '北方稀土' },
+  { symbol: '600010.SH', name: '包钢股份' },
+  { symbol: '000975.SZ', name: '山金国际' },
+  { symbol: '600988.SH', name: '赤峰黄金' },
+  { symbol: '000426.SZ', name: '兴业银锡' },
+  { symbol: '002128.SZ', name: '电投能源' },
+  { symbol: '001203.SZ', name: '大中矿业' },
+  { symbol: '601216.SH', name: '君正集团' },
+  { symbol: '600863.SH', name: '华能蒙电' },
+  { symbol: '600295.SH', name: '鄂尔多斯' },
+  { symbol: '000683.SZ', name: '博源化工' },
+  { symbol: '600201.SH', name: '生物股份' },
+  { symbol: '603367.SH', name: '金河生物' },
+  { symbol: '600328.SH', name: '中盐化工' },
+  { symbol: '600262.SH', name: '北方股份' },
+  { symbol: '600191.SH', name: '华资实业' },
+  { symbol: '900948.SH', name: '伊泰B股' },
+  { symbol: '001328.SZ', name: '骑士乳业' },
+]
+const NEIMENGGU_GROUP_NAME = '内蒙古'
+const NEIMENGGU_SYMBOLS = NEIMENGGU_STOCKS.map((s) => s.symbol.toUpperCase())
 
 const chartSymbol = computed(() => {
   const current = kline.currentSymbol
@@ -55,15 +90,20 @@ async function loadWatchlistData() {
   ])
 }
 
-async function loadValuations(opts?: { silent?: boolean; attempt?: number }) {
-  if (!watchlist.symbols.length) {
-    valuations.value = {}
+async function loadValuations(opts?: { silent?: boolean; attempt?: number; symbols?: string[] }) {
+  const syms = opts?.symbols || (
+    boardMode.value === 'neimenggu'
+      ? NEIMENGGU_SYMBOLS
+      : watchlist.symbols
+  )
+  if (!syms.length) {
+    if (boardMode.value === 'watch') valuations.value = {}
     return
   }
   if (!opts?.silent) valuationLoading.value = true
   try {
-    const { data } = await fetchValuations(watchlist.symbols)
-    const map: Record<string, SymbolValuation> = {}
+    const { data } = await fetchValuations(syms)
+    const map: Record<string, SymbolValuation> = { ...valuations.value }
     let pending = false
     for (const row of data.data || []) {
       map[row.symbol.toUpperCase()] = row
@@ -78,7 +118,7 @@ async function loadValuations(opts?: { silent?: boolean; attempt?: number }) {
     const attempt = opts?.attempt ?? 0
     if (pending && attempt < 6) {
       percentileTimer = setTimeout(() => {
-        loadValuations({ silent: true, attempt: attempt + 1 })
+        loadValuations({ silent: true, attempt: attempt + 1, symbols: syms })
       }, 1200 + attempt * 400)
     }
   } catch {
@@ -139,39 +179,134 @@ function pctClass(n: number | null | undefined) {
   return 'pct'
 }
 
+function holdDetailOf(row: HoldingsRow | undefined) {
+  if (!row?.hold) return ''
+  const signals = row.hold.signals || []
+  if (signals.length) return signals.map((s) => s.reason).slice(0, 2).join('；')
+  return row.hold.notes || ''
+}
+
 function rowOf(sym: string) {
-  const v = valuations.value[sym.toUpperCase()]
+  const key = sym.toUpperCase()
+  const v = valuations.value[key]
+  const holdRow = holdBySymbol.value[key]
+  const fund = fundBySymbol.value[key]
+  const action = holdRow?.hold?.action || null
   return {
     symbol: sym,
     code: tickerOf(sym),
-    name: v?.name || symbolName(sym) || '—',
-    price: fmtNum(v?.price),
-    change: fmtChange(v?.change_pct),
-    changeClass: changeClass(v?.change_pct),
-    pe: fmtPe(v?.pe_ttm),
-    pePct: fmtPct(v?.pe_percentile),
-    pePctClass: pctClass(v?.pe_percentile),
-    pb: fmtNum(v?.pb),
-    pbPct: fmtPct(v?.pb_percentile),
-    pbPctClass: pctClass(v?.pb_percentile),
+    name: v?.name || holdRow?.name || fund?.name || symbolName(sym) || '—',
+    price: fmtNum(v?.price ?? holdRow?.price),
+    change: fmtChange(v?.change_pct ?? holdRow?.change_pct),
+    changeClass: changeClass(v?.change_pct ?? holdRow?.change_pct),
+    pe: fmtPe(v?.pe_ttm ?? holdRow?.pe_ttm ?? fund?.pe_ttm),
+    pePct: fmtPct(v?.pe_percentile ?? holdRow?.pe_percentile ?? fund?.pe_percentile),
+    pePctClass: pctClass(v?.pe_percentile ?? holdRow?.pe_percentile ?? fund?.pe_percentile),
+    pb: fmtNum(v?.pb ?? fund?.pb),
+    pbPct: fmtPct(v?.pb_percentile ?? holdRow?.pb_percentile ?? fund?.pb_percentile),
+    pbPctClass: pctClass(v?.pb_percentile ?? holdRow?.pb_percentile ?? fund?.pb_percentile),
     cap: fmtCap(v?.market_cap),
+    holdAction: action,
+    holdLabel: holdRow?.hold?.label || '',
+    holdDetail: holdDetailOf(holdRow),
+    holdHighlight: action === 'add' || action === 'reduce' || action === 'exit',
+    fundVerdict: fund?.verdict || '',
+    fundTone: fund?.verdict_tone || '',
+    fundMetrics: fund?.metrics || '',
+    fundScore: fund?.score ?? null,
   }
 }
 
-const watchRows = computed(() => watchlist.symbols.map(rowOf))
-
-const watchGroups = computed(() =>
+/** 个人关注里的分组（不含内蒙古独立板块） */
+const watchGroupTabs = computed(() =>
   watchlist.groups
-    .map((g) => ({ id: g.id, name: g.name, rows: g.symbols.map(rowOf) }))
-    .filter((g) => g.rows.length > 0),
+    .filter((g) => g.name !== NEIMENGGU_GROUP_NAME)
+    .map((g) => ({
+      id: g.id,
+      name: g.name,
+      count: g.symbols.length,
+    })),
 )
+
+const activeWatchGroup = computed(() => {
+  const groups = watchlist.groups.filter((g) => g.name !== NEIMENGGU_GROUP_NAME)
+  return groups.find((g) => g.id === watchlist.activeGroupId) || groups[0] || null
+})
+
+const showHoldSignals = computed(() => boardMode.value === 'watch')
+
+const displaySymbols = computed(() =>
+  boardMode.value === 'neimenggu'
+    ? NEIMENGGU_SYMBOLS
+    : activeWatchGroup.value?.symbols || [],
+)
+
+const displayRows = computed(() => displaySymbols.value.map(rowOf))
+
+const boardEmpty = computed(() => {
+  if (boardMode.value === 'neimenggu') return !NEIMENGGU_SYMBOLS.length
+  return !watchGroupTabs.value.some((g) => g.count > 0)
+})
+
+const boardGroupEmpty = computed(
+  () => boardMode.value === 'watch' && !boardEmpty.value && !displayRows.value.length,
+)
+
+function selectBoardMode(mode: 'watch' | 'neimenggu') {
+  if (boardMode.value === mode) return
+  boardMode.value = mode
+  holdBySymbol.value = {}
+  fundBySymbol.value = {}
+  holdError.value = ''
+  fundError.value = ''
+  if (mode === 'watch') {
+    const g = activeWatchGroup.value
+    if (g) watchlist.setActiveGroup(g.id)
+  } else {
+    for (const s of NEIMENGGU_STOCKS) rememberSymbol(s.symbol, s.name)
+  }
+  void refreshBoardData()
+}
+
+function selectWatchGroup(id: string) {
+  if (id === watchlist.activeGroupId) return
+  watchlist.setActiveGroup(id)
+  holdBySymbol.value = {}
+  fundBySymbol.value = {}
+  holdError.value = ''
+  fundError.value = ''
+  void refreshBoardData()
+}
+
+async function refreshBoardData() {
+  await loadValuations()
+  void scanHoldSignals()
+  void loadFundamentals()
+}
+
+/** 把误建的「内蒙古」关注分组并回个人关注；内蒙古 Tab 仍是独立列表 */
+async function reclaimNeimengguWatchGroup() {
+  try {
+    const dissolved = await watchlist.dissolveNamedGroup(NEIMENGGU_GROUP_NAME)
+    if (dissolved && activeWatchGroup.value) {
+      watchlist.setActiveGroup(activeWatchGroup.value.id)
+    }
+  } catch {
+    /* ignore */
+  }
+}
 
 onMounted(async () => {
   document.documentElement.setAttribute('data-theme', config.theme)
   await config.restoreSession()
   await config.loadConfig()
   await watchlist.load()
+  await reclaimNeimengguWatchGroup()
+  if (activeWatchGroup.value) watchlist.setActiveGroup(activeWatchGroup.value.id)
+  rememberSymbol('900948.SH', '伊泰B股')
   await loadWatchlistData()
+  void scanHoldSignals()
+  void loadFundamentals()
   try {
     const { data } = await fetchHealth()
     if (data.data) {
@@ -185,6 +320,8 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  holdScanToken += 1
+  fundScanToken += 1
   if (percentileTimer) clearTimeout(percentileTimer)
 })
 
@@ -217,6 +354,8 @@ async function onWatchFromSearch(hit: { symbol: string; name: string; watched: b
     }
   }
   await loadWatchlistData()
+  void scanHoldSignals()
+  void loadFundamentals()
 }
 
 async function openChart() {
@@ -242,7 +381,82 @@ async function scanWatched() {
 
 async function unfollow(sym: string) {
   await watchlist.remove(sym)
+  const nextHold = { ...holdBySymbol.value }
+  delete nextHold[sym.toUpperCase()]
+  holdBySymbol.value = nextHold
+  const nextFund = { ...fundBySymbol.value }
+  delete nextFund[sym.toUpperCase()]
+  fundBySymbol.value = nextFund
   await loadWatchlistData()
+  void scanHoldSignals()
+  void loadFundamentals()
+}
+
+async function loadFundamentals() {
+  const syms = displaySymbols.value
+  const token = ++fundScanToken
+  if (!syms.length) {
+    fundBySymbol.value = {}
+    fundLoading.value = false
+    fundError.value = ''
+    return
+  }
+  fundLoading.value = true
+  fundError.value = ''
+  try {
+    const { data } = await analyzeWatchFundamentals(syms)
+    if (token !== fundScanToken) return
+    const map: Record<string, WatchFundamental> = {}
+    for (const row of data.data?.items || []) {
+      map[row.symbol.toUpperCase()] = row
+      if (row.name) rememberSymbol(row.symbol, row.name)
+    }
+    fundBySymbol.value = map
+  } catch (e) {
+    if (token !== fundScanToken) return
+    fundError.value = apiErrorText(e, '基本面分析失败')
+    fundBySymbol.value = {}
+  } finally {
+    if (token === fundScanToken) fundLoading.value = false
+  }
+}
+
+async function scanHoldSignals() {
+  if (!showHoldSignals.value) {
+    holdBySymbol.value = {}
+    holdLoading.value = false
+    holdError.value = ''
+    return
+  }
+  const syms = displaySymbols.value
+  const token = ++holdScanToken
+  if (!syms.length) {
+    holdBySymbol.value = {}
+    holdLoading.value = false
+    holdError.value = ''
+    return
+  }
+  holdLoading.value = true
+  holdError.value = ''
+  try {
+    const body = config.isAuthenticated
+      ? { symbols: syms }
+      : { guest_symbols: syms, symbols: syms }
+    const { data } = await scanHoldings(body)
+    if (token !== holdScanToken) return
+    const map: Record<string, HoldingsRow> = {}
+    for (const row of data.data?.items || []) {
+      map[row.symbol.toUpperCase()] = row
+      if (row.name) rememberSymbol(row.symbol, row.name)
+    }
+    holdBySymbol.value = map
+  } catch (e) {
+    if (token !== holdScanToken) return
+    holdError.value = apiErrorText(e, '仓位信号扫描失败')
+    holdBySymbol.value = {}
+  } finally {
+    if (token === holdScanToken) holdLoading.value = false
+  }
 }
 </script>
 
@@ -295,21 +509,88 @@ async function unfollow(sym: string) {
     </div>
 
     <section class="card">
-      <h2>我的关注</h2>
-      <p class="watch-sync-hint">
+      <div class="board-tabs" role="tablist" aria-label="列表切换">
+        <button
+          type="button"
+          role="tab"
+          class="board-tab"
+          :class="{ active: boardMode === 'watch' }"
+          :aria-selected="boardMode === 'watch'"
+          @click="selectBoardMode('watch')"
+        >
+          我的关注
+          <span class="tab-count">{{ watchlist.symbols.length }}</span>
+        </button>
+        <button
+          type="button"
+          role="tab"
+          class="board-tab"
+          :class="{ active: boardMode === 'neimenggu' }"
+          :aria-selected="boardMode === 'neimenggu'"
+          @click="selectBoardMode('neimenggu')"
+        >
+          内蒙古上市股票
+          <span class="tab-count">{{ NEIMENGGU_STOCKS.length }}</span>
+        </button>
+      </div>
+
+      <div class="watch-head">
+        <h2>{{ boardMode === 'neimenggu' ? '内蒙古上市股票' : '我的关注' }}</h2>
+        <div class="watch-head-actions">
+          <span v-if="(showHoldSignals && holdLoading) || fundLoading" class="hold-scanning">
+            <template v-if="fundLoading && showHoldSignals && holdLoading">正在分析基本面与仓位信号…</template>
+            <template v-else-if="fundLoading">正在分析基本面…</template>
+            <template v-else>正在分析仓位信号…</template>
+          </span>
+        </div>
+      </div>
+      <p v-if="boardMode === 'watch'" class="watch-sync-hint">
         <template v-if="config.isAuthenticated">关注已同步到手机号 {{ maskPhone(config.username) }}，换设备登录后也能看到。</template>
-        <template v-else>                                                                 
+        <template v-else>
           未登录时关注只保存在这台浏览器。
           <RouterLink to="/settings">注册 / 登录</RouterLink>
           后同步到账号，换电脑也能看到。
         </template>
       </p>
-      <p v-if="watchlist.symbols.length" class="watch-sync-hint">
-        百分位是该股自己近十年市盈率/市净率的历史位置，不是行业或全市场对比。越低表示相对自己越便宜；≥85% 会标「历史偏高」。
+      <p v-else class="watch-sync-hint">
+        内蒙古辖区主要 A/B 股独立列表，不占用关注名额；与「我的关注」可同时包含同一只股票（如伊泰B股），互不冲突。只展示估值与基本面，不含仓位信号。
       </p>
-      <p v-if="valuationLoading && watchRows.length" class="watch-sync-hint">正在更新估值…</p>
-      <div v-if="!watchRows.length" class="empty">搜索结果里点「加自选」，最近形态会只显示这些标的。</div>
-      <div v-else class="watch-table-wrap">
+      <p v-if="displayRows.length" class="watch-sync-hint">
+        百分位是该股自己近十年市盈率/市净率的历史位置。基本面按行业分轨：成长轨（ROE≥15%+增速）、周期/价值轨（ROE均值≥10%、不连亏、现金流、负债）。
+        <template v-if="boardMode === 'watch'">打开本页会自动扫描当前分组的仓位信号。</template>
+      </p>
+      <p v-if="valuationLoading && displayRows.length" class="watch-sync-hint">正在更新估值…</p>
+      <p v-if="holdError" class="follow-error">{{ holdError }}</p>
+      <p v-if="fundError" class="follow-error">{{ fundError }}</p>
+
+      <div
+        v-if="boardMode === 'watch' && watchGroupTabs.length > 1"
+        class="watch-tabs"
+        role="tablist"
+        aria-label="关注分组"
+      >
+        <button
+          v-for="g in watchGroupTabs"
+          :key="g.id"
+          type="button"
+          role="tab"
+          class="watch-tab"
+          :class="{ active: g.id === (activeWatchGroup?.id || watchlist.activeGroupId) }"
+          :aria-selected="g.id === (activeWatchGroup?.id || watchlist.activeGroupId)"
+          @click="selectWatchGroup(g.id)"
+        >
+          {{ g.name }}
+          <span class="tab-count">{{ g.count }}</span>
+        </button>
+      </div>
+
+      <div v-if="boardEmpty" class="empty">
+        <template v-if="boardMode === 'watch'">搜索结果里点「加自选」，最近形态会只显示这些标的。</template>
+        <template v-else>暂无内蒙古上市股票数据。</template>
+      </div>
+      <div v-else-if="boardGroupEmpty" class="empty">当前分组暂无股票，可从搜索结果加入此分组。</div>
+      <template v-else>
+      <div class="watch-table-wrap">
       <table class="watch-table">
         <thead>
           <tr>
@@ -320,80 +601,108 @@ async function unfollow(sym: string) {
             <th>市盈率 TTM</th>
             <th>市净率</th>
             <th>总市值</th>
-            <th></th>
+            <th>基本面</th>
+            <th v-if="showHoldSignals">仓位信号</th>
+            <th v-if="boardMode === 'watch'"></th>
           </tr>
         </thead>
         <tbody>
-          <template v-for="g in watchGroups" :key="g.id">
-            <tr v-if="watchGroups.length > 1" class="group-sep">
-              <td colspan="8">{{ g.name }}</td>
-            </tr>
-            <tr
-              v-for="row in g.rows"
-              :key="row.symbol"
-              class="watch-row"
-              @click="router.push(`/chart/${row.symbol}`)"
-            >
-              <td class="symbol-code">{{ row.code }}</td>
-              <td class="symbol-name">{{ row.name }}</td>
-              <td>{{ row.price }}</td>
-              <td :class="row.changeClass">{{ row.change }}</td>
-              <td>
-                <div>{{ row.pe }}</div>
-                <div :class="row.pePctClass" title="相对该股近十年，不是行业分位">{{ row.pePct }}</div>
-              </td>
-              <td>
-                <div>{{ row.pb }}</div>
-                <div :class="row.pbPctClass" title="相对该股近十年，不是行业分位">{{ row.pbPct }}</div>
-              </td>
-              <td>{{ row.cap }}</td>
-              <td>
-                <span class="chip-x" title="取消关注" @click.stop="unfollow(row.symbol)">×</span>
-              </td>
-            </tr>
-          </template>
+          <tr
+            v-for="row in displayRows"
+            :key="row.symbol"
+            class="watch-row"
+            :class="{ 'has-hold': showHoldSignals && row.holdHighlight }"
+            @click="router.push(`/chart/${row.symbol}`)"
+          >
+            <td class="symbol-code">{{ row.code }}</td>
+            <td class="symbol-name">{{ row.name }}</td>
+            <td>{{ row.price }}</td>
+            <td :class="row.changeClass">{{ row.change }}</td>
+            <td>
+              <div>{{ row.pe }}</div>
+              <div :class="row.pePctClass" title="相对该股近十年，不是行业分位">{{ row.pePct }}</div>
+            </td>
+            <td>
+              <div>{{ row.pb }}</div>
+              <div :class="row.pbPctClass" title="相对该股近十年，不是行业分位">{{ row.pbPct }}</div>
+            </td>
+            <td>{{ row.cap }}</td>
+            <td class="fund-cell">
+              <template v-if="row.fundVerdict">
+                <span class="fund-badge" :class="row.fundTone">{{ row.fundVerdict }}</span>
+                <p v-if="row.fundMetrics && row.fundMetrics !== '—'" class="fund-detail">{{ row.fundMetrics }}</p>
+              </template>
+              <span v-else-if="fundLoading" class="hold-pending">…</span>
+              <span v-else class="hold-muted">—</span>
+            </td>
+            <td v-if="showHoldSignals" class="hold-cell">
+              <template v-if="row.holdAction">
+                <span class="badge" :class="row.holdAction">{{ row.holdLabel || row.holdAction }}</span>
+                <p v-if="row.holdDetail && row.holdHighlight" class="hold-detail">{{ row.holdDetail }}</p>
+              </template>
+              <span v-else-if="holdLoading" class="hold-pending">…</span>
+              <span v-else class="hold-muted">—</span>
+            </td>
+            <td v-if="boardMode === 'watch'">
+              <span class="chip-x" title="取消关注" @click.stop="unfollow(row.symbol)">×</span>
+            </td>
+          </tr>
         </tbody>
       </table>
       </div>
-      <div v-if="watchRows.length" class="watch-cards">
-        <template v-for="g in watchGroups" :key="'mg-' + g.id">
-          <div v-if="watchGroups.length > 1" class="watch-group-label">{{ g.name }}</div>
-          <article
-            v-for="row in g.rows"
-            :key="'m-' + row.symbol"
-            class="watch-card"
-            @click="router.push(`/chart/${row.symbol}`)"
-          >
-            <div class="watch-card-head">
-              <div>
-                <div class="watch-card-name">{{ row.name }}</div>
-                <div class="symbol-code">{{ row.code }}</div>
-              </div>
-              <span class="chip-x" title="取消关注" @click.stop="unfollow(row.symbol)">×</span>
+      <div class="watch-cards">
+        <article
+          v-for="row in displayRows"
+          :key="'m-' + row.symbol"
+          class="watch-card"
+          :class="{ 'has-hold': showHoldSignals && row.holdHighlight }"
+          @click="router.push(`/chart/${row.symbol}`)"
+        >
+          <div class="watch-card-head">
+            <div>
+              <div class="watch-card-name">{{ row.name }}</div>
+              <div class="symbol-code">{{ row.code }}</div>
             </div>
-            <div class="watch-card-quote">
-              <span>{{ row.price }}</span>
-              <span :class="row.changeClass">{{ row.change }}</span>
+            <span
+              v-if="boardMode === 'watch'"
+              class="chip-x"
+              title="取消关注"
+              @click.stop="unfollow(row.symbol)"
+            >×</span>
+          </div>
+          <div class="watch-card-quote">
+            <span>{{ row.price }}</span>
+            <span :class="row.changeClass">{{ row.change }}</span>
+          </div>
+          <div class="watch-card-metrics">
+            <div>
+              <span class="k">市盈率</span>
+              <span>{{ row.pe }}</span>
+              <span :class="row.pePctClass">{{ row.pePct }}</span>
             </div>
-            <div class="watch-card-metrics">
-              <div>
-                <span class="k">市盈率</span>
-                <span>{{ row.pe }}</span>
-                <span :class="row.pePctClass">{{ row.pePct }}</span>
-              </div>
-              <div>
-                <span class="k">市净率</span>
-                <span>{{ row.pb }}</span>
-                <span :class="row.pbPctClass">{{ row.pbPct }}</span>
-              </div>
-              <div>
-                <span class="k">市值</span>
-                <span>{{ row.cap }}</span>
-              </div>
+            <div>
+              <span class="k">市净率</span>
+              <span>{{ row.pb }}</span>
+              <span :class="row.pbPctClass">{{ row.pbPct }}</span>
             </div>
-          </article>
-        </template>
+            <div>
+              <span class="k">市值</span>
+              <span>{{ row.cap }}</span>
+            </div>
+          </div>
+          <div v-if="row.fundVerdict || (showHoldSignals && row.holdAction)" class="watch-card-signals">
+            <div v-if="row.fundVerdict" class="watch-card-fund">
+              <span class="fund-badge" :class="row.fundTone">{{ row.fundVerdict }}</span>
+              <p v-if="row.fundMetrics && row.fundMetrics !== '—'" class="fund-detail">{{ row.fundMetrics }}</p>
+            </div>
+            <div v-if="showHoldSignals && row.holdAction" class="watch-card-hold">
+              <span class="badge" :class="row.holdAction">{{ row.holdLabel || row.holdAction }}</span>
+              <p v-if="row.holdDetail && row.holdHighlight" class="hold-detail">{{ row.holdDetail }}</p>
+            </div>
+          </div>
+        </article>
       </div>
+      </template>
     </section>
 
 
@@ -444,19 +753,6 @@ async function unfollow(sym: string) {
 .status-ok { font-size: 18px; color: var(--color-primary); }
 .watch-table-wrap { margin-top: var(--space-sm); overflow-x: auto; }
 .watch-cards { display: none; }
-.group-sep td {
-  background: color-mix(in srgb, var(--color-primary) 8%, transparent);
-  color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 600;
-  padding: 6px 10px;
-}
-.watch-group-label {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  margin: 4px 0 2px;
-}
 .watch-row { cursor: pointer; }
 .watch-row:hover { background: rgba(24, 144, 255, 0.04); }
 .quote-up { color: var(--color-up); }
@@ -482,6 +778,127 @@ th { color: var(--text-secondary); font-weight: 500; }
 .pattern-row:hover { background: rgba(24, 144, 255, 0.04); }
 .watch-sync-hint { color: var(--text-secondary); font-size: 13px; margin: 0 0 var(--space-md); }
 .watch-sync-hint a { color: var(--color-primary); }
+.watch-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  margin-bottom: var(--space-sm);
+  flex-wrap: wrap;
+}
+.watch-head h2 { margin: 0; }
+.watch-head-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  flex-wrap: wrap;
+}
+.board-tabs {
+  display: flex;
+  gap: 0;
+  margin: 0 0 var(--space-md);
+  border-bottom: 1px solid var(--border-color);
+}
+.board-tab {
+  flex: 1;
+  padding: 12px 16px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  color: var(--text-secondary);
+  font-size: 15px;
+  font-weight: 600;
+  transition: color 0.15s, border-color 0.15s;
+}
+.board-tab:hover { color: var(--text-primary); }
+.board-tab.active {
+  color: var(--color-primary);
+  border-bottom-color: var(--color-primary);
+}
+.watch-tabs {
+  display: flex;
+  gap: 0;
+  margin: 0 0 var(--space-md);
+  border-bottom: 1px solid var(--border-color);
+  overflow-x: auto;
+}
+.watch-tab {
+  flex: 0 0 auto;
+  padding: 10px 14px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  color: var(--text-secondary);
+  font-size: 14px;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: color 0.15s, border-color 0.15s;
+}
+.watch-tab:hover { color: var(--text-primary); }
+.watch-tab.active {
+  color: var(--color-primary);
+  border-bottom-color: var(--color-primary);
+}
+.tab-count {
+  margin-left: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.watch-tab.active .tab-count { color: var(--color-primary); }
+.hold-scanning { font-size: 13px; color: var(--color-primary); }
+.fund-cell, .hold-cell { min-width: 150px; max-width: 280px; }
+.fund-detail, .hold-detail {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+.fund-badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid;
+}
+.fund-badge.strong {
+  color: var(--color-down);
+  border-color: rgba(82, 196, 26, 0.4);
+  background: rgba(82, 196, 26, 0.08);
+}
+.fund-badge.mid {
+  color: #d46b08;
+  border-color: rgba(250, 140, 22, 0.4);
+  background: rgba(250, 140, 22, 0.08);
+}
+.fund-badge.weak {
+  color: var(--color-up);
+  border-color: rgba(245, 34, 45, 0.35);
+  background: rgba(245, 34, 45, 0.06);
+}
+.fund-badge.na {
+  color: var(--text-secondary);
+  border-color: var(--border-color);
+  background: transparent;
+}
+.hold-pending, .hold-muted { color: var(--text-secondary); font-size: 13px; }
+.watch-row.has-hold { background: color-mix(in srgb, var(--color-primary) 4%, transparent); }
+.badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid;
+}
+.badge.add { color: var(--color-down); border-color: rgba(82, 196, 26, 0.4); background: rgba(82, 196, 26, 0.08); }
+.badge.reduce { color: #d46b08; border-color: rgba(250, 140, 22, 0.4); background: rgba(250, 140, 22, 0.08); }
+.badge.exit { color: var(--color-up); border-color: rgba(245, 34, 45, 0.35); background: rgba(245, 34, 45, 0.06); }
+.badge.hold { color: var(--text-secondary); border-color: var(--border-color); background: transparent; }
 .empty { color: var(--text-secondary); padding: var(--space-lg); text-align: center; }
 .symbol-code { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .symbol-name { color: var(--text-secondary); }
@@ -508,6 +925,8 @@ th { color: var(--text-secondary); font-weight: 500; }
   .watch-card-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; font-size: 13px; }
   .watch-card-metrics > div { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px; }
   .watch-card-metrics .k { color: var(--text-secondary); margin-right: 0; }
+  .watch-card-signals { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-color); display: flex; flex-direction: column; gap: 8px; }
+  .watch-card.has-hold { border-color: color-mix(in srgb, var(--color-primary) 35%, var(--border-color)); }
   th, td { padding: 8px; }
   .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 }
