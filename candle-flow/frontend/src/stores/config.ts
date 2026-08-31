@@ -3,21 +3,19 @@ import {
   AUTH_TOKEN_KEY,
   fetchConfig,
   fetchMe,
-  fetchMembershipOffer,
   loginPassword,
   registerAccount,
   type MembershipInfo,
-  type MembershipOffer,
 } from '@/api'
 
 let restoreTask: Promise<void> | null = null
 
 const emptyMembership = (): MembershipInfo => ({
-  plan: 'free',
-  plan_label: '免费',
-  is_member: false,
+  plan: 'lifetime',
+  plan_label: '全部开放',
+  is_member: true,
   expires_at: null,
-  watchlist_limit: 8,
+  watchlist_limit: 50,
 })
 
 export const useConfigStore = defineStore('config', {
@@ -32,11 +30,10 @@ export const useConfigStore = defineStore('config', {
     username: '',
     token: '',
     membership: emptyMembership(),
-    offer: null as MembershipOffer | null,
   }),
   getters: {
     isDarkMode: (s) => s.theme === 'dark',
-    isMember: (s) => s.membership.is_member,
+    isMember: () => true,
   },
   actions: {
     setMembership(info?: MembershipInfo | null) {
@@ -116,14 +113,6 @@ export const useConfigStore = defineStore('config', {
         }
       } catch {
         /* use defaults */
-      }
-    },
-    async loadMembershipOffer() {
-      try {
-        const { data } = await fetchMembershipOffer()
-        this.offer = data.data || null
-      } catch {
-        this.offer = null
       }
     },
     toggleTheme() {

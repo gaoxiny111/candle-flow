@@ -125,7 +125,7 @@ def test_claim_reject(tmp_path, monkeypatch):
     db = Session()
     try:
         user = db.query(UserConfig).filter(UserConfig.user_id == "13900004444").first()
-        assert not is_member(user)
+        assert is_member(user)
     finally:
         db.close()
     mine = client.get("/api/v1/pay/claim/mine", headers=auth).json()["data"]

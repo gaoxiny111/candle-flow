@@ -105,9 +105,10 @@ def test_get_valuations_uses_tencent(monkeypatch):
     assert rows[2]["price"] is None
 
 
-def test_valuations_api_requires_member():
+def test_valuations_api_open():
     res = _client().get("/api/v1/symbols/valuations", params={"symbols": "600519.SH"})
-    assert res.status_code == 401
+    assert res.status_code != 403
+    assert res.status_code != 401
 
 
 def test_valuations_cache(monkeypatch):

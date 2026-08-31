@@ -1,15 +1,12 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { RouterLink } from 'vue-router'
 import { apiErrorText, fetchBacktest, resolveSymbolQuery, type BacktestResult } from '@/api'
-import { useConfigStore } from '@/stores/config'
 import { patternNameZh, directionZh } from '@/utils/labels'
 import { rememberSymbol, tryNormalizeSymbol } from '@/utils/symbol'
 import { useKlineStore } from '@/stores/kline'
 import SymbolSearch from '@/components/SymbolSearch.vue'
 
 const kline = useKlineStore()
-const config = useConfigStore()
 const symbol = ref(kline.currentSymbol || '000001.SZ')
 const loading = ref(false)
 const error = ref('')
@@ -45,7 +42,6 @@ async function run() {
   <div class="backtest-view">
     <h1>形态回测</h1>
     <p class="lead">用已同步的日线，按当前尼森规则（形态 + 汇聚 + 形态止损 + 2R）顺序开平仓，不重叠持仓。止损看影线，止盈看收盘。</p>
-    <p v-if="!config.isMember" class="lead member-hint">形态回测需要会员。<RouterLink to="/settings">去设置开通</RouterLink></p>
     <div class="toolbar card">
       <SymbolSearch v-model="symbol" placeholder="股票名称或代码" @select="(h) => { symbol = h.symbol; run() }" />
       <button class="btn-primary" :disabled="loading" @click="run">{{ loading ? '回测中...' : '开始回测' }}</button>
@@ -93,7 +89,6 @@ async function run() {
 
 <style scoped>
 .lead { color: var(--text-secondary); font-size: 13px; margin-bottom: var(--space-md); line-height: 1.6; }
-.member-hint a { color: var(--color-primary); }
 .toolbar { display: flex; gap: var(--space-sm); margin-bottom: var(--space-md); align-items: center; }
 .toolbar :deep(.symbol-search) { min-width: 260px; }
 .error { color: #f5222d; }

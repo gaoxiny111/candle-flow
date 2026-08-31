@@ -15,7 +15,6 @@ from app.schemas.pattern import (
     WatchlistScanResponse,
 )
 from app.services.kline_service import KlineService
-from app.services.membership import require_member
 from app.services.pattern_service import PatternService
 from app.services.signal_service import SignalService
 from app.services.watchlist import parse_watchlist
@@ -70,7 +69,6 @@ def scan_watchlist(
     db: Session = Depends(get_db),
     user: UserConfig | None = Depends(get_optional_user),
 ):
-    require_member(user)
     watch = _watchlist_symbols(user, symbols)
     if not watch:
         return ApiResponse(

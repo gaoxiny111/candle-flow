@@ -35,6 +35,12 @@ const router = createRouter({
       meta: { title: '信号详情', requiresAuth: false },
     },
     {
+      path: '/bull-tactics',
+      name: 'bull-tactics',
+      component: () => import('@/views/BullTacticsView.vue'),
+      meta: { title: '主板战法', requiresAuth: false },
+    },
+    {
       path: '/backtest',
       name: 'backtest',
       component: () => import('@/views/BacktestView.vue'),
@@ -50,7 +56,7 @@ const router = createRouter({
       path: '/admin',
       name: 'admin',
       component: () => import('@/views/AdminView.vue'),
-      meta: { title: '会员管理', requiresAuth: false },
+      meta: { title: '用户管理', requiresAuth: false },
     },
   ],
 })

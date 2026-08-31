@@ -28,12 +28,10 @@ from app.services.akshare_client import akshare_client
 from app.services.backtest_service import run_backtest
 from app.services.kline_service import KlineService
 from app.services.membership import (
-    FREE_WATCHLIST,
-    MEMBER_WATCHLIST,
     VALID_PLANS,
+    WATCHLIST_LIMIT,
     activate_membership,
     membership_snapshot,
-    require_member,
     watchlist_limit,
 )
 from app.services.pay_claim import APPROVED, PENDING as CLAIM_PENDING, REJECTED, claim_out, claim_path
@@ -232,8 +230,8 @@ def membership_offer():
             wechat_qr=wechat_qr,
             alipay_qr=alipay_qr,
             note=settings.membership_note,
-            free_watchlist=FREE_WATCHLIST,
-            member_watchlist=MEMBER_WATCHLIST,
+            free_watchlist=WATCHLIST_LIMIT,
+            member_watchlist=WATCHLIST_LIMIT,
             online_wechat=online_channels()["wechat"],
             online_alipay=online_channels()["alipay"],
         )
@@ -279,6 +277,104 @@ def admin_set_membership(body: AdminMembershipBody, db: Session = Depends(get_db
     db.commit()
     db.refresh(cfg)
     return ApiResponse(data={"username": cfg.user_id, "membership": _membership_out(cfg)})
+
+
+class AdminCreateUserBody(BaseModel):
+    admin_key: str
+    username: str
+    password: str = Field(min_length=4, max_length=64)
+    plan: str = "free"
+    days: int | None = None
+
+    @field_validator("username")
+    @classmethod
+    def username_ok(cls, value: str) -> str:
+        try:
+            return normalize_account(value)
+        except ValueError as e:
+            raise ValueError(str(e)) from e
+
+    @field_validator("plan")
+    @classmethod
+    def plan_ok(cls, value: str) -> str:
+        plan = value.strip().lower()
+        if plan not in VALID_PLANS:
+            raise ValueError("无效套餐")
+        return plan
+
+
+class AdminDeleteUserBody(BaseModel):
+    admin_key: str
+    username: str
+
+    @field_validator("username")
+    @classmethod
+    def username_ok(cls, value: str) -> str:
+        try:
+            return normalize_account(value)
+        except ValueError as e:
+            raise ValueError(str(e)) from e
+
+
+@router.post("/admin/users")
+def admin_create_user(body: AdminCreateUserBody, db: Session = Depends(get_db)):
+    _require_admin_key(body.admin_key)
+    if body.username == "default":
+        raise HTTPException(status_code=400, detail="不能使用保留账号名")
+    exists = db.query(UserConfig).filter(UserConfig.user_id == body.username).first()
+    if exists:
+        raise HTTPException(status_code=400, detail="该账号已存在")
+    cfg = UserConfig(
+        user_id=body.username,
+        risk_per_trade=Decimal(str(settings.risk_per_trade)),
+        default_symbol=settings.default_symbol,
+        preferred_period="daily",
+        password_hash=_hash_password(body.username, body.password),
+        auth_token=_new_token(),
+        watchlist=dump_watchlist([]),
+        membership_plan="free",
+    )
+    try:
+        if body.plan != "free":
+            activate_membership(cfg, body.plan, body.days)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    db.add(cfg)
+    db.commit()
+    db.refresh(cfg)
+    return ApiResponse(
+        data=AdminUserOut(
+            username=cfg.user_id,
+            is_active=bool(cfg.is_active),
+            watchlist_count=len(parse_watchlist(cfg.watchlist)),
+            membership=_membership_out(cfg),
+            updated_at=_fmt_dt(cfg.updated_at),
+        )
+    )
+
+
+@router.post("/admin/users/delete")
+def admin_delete_user(body: AdminDeleteUserBody, db: Session = Depends(get_db)):
+    _require_admin_key(body.admin_key)
+    if body.username == "default":
+        raise HTTPException(status_code=400, detail="不能删除系统默认账号")
+    cfg = db.query(UserConfig).filter(UserConfig.user_id == body.username).first()
+    if not cfg:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    from app.models.payment import PaymentOrder
+    from app.models.payment_claim import PaymentClaim
+    from app.services.pay_claim import delete_claim_file
+
+    claims = db.query(PaymentClaim).filter(PaymentClaim.user_id == body.username).all()
+    for row in claims:
+        if row.image_file:
+            delete_claim_file(row.image_file)
+        db.delete(row)
+    db.query(PaymentOrder).filter(PaymentOrder.user_id == body.username).delete(synchronize_session=False)
+    db.delete(cfg)
+    db.commit()
+    return ApiResponse(data={"username": body.username, "deleted": True})
 
 
 @router.get("/admin/claims")
@@ -366,7 +462,7 @@ def update_config(body: ConfigUpdateBody, user: UserConfig = Depends(require_use
 @router.get("/config/watchlist")
 def get_watchlist(user: UserConfig | None = Depends(get_optional_user)):
     if not user:
-        return ApiResponse(data=WatchlistOut(symbols=[], limit=FREE_WATCHLIST))
+        return ApiResponse(data=WatchlistOut(symbols=[], limit=WATCHLIST_LIMIT))
     return ApiResponse(data=_watchlist_out(user))
 
 
@@ -453,9 +549,7 @@ def setup_password(body: PasswordBody, db: Session = Depends(get_db)):
 def backtest_symbol(
     symbol: str,
     db: Session = Depends(get_db),
-    user: UserConfig | None = Depends(get_optional_user),
 ):
-    require_member(user)
     try:
         symbol = resolve_symbol(symbol, db)
     except SymbolError as e:

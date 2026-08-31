@@ -1,11 +1,8 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_optional_user
 from app.database import get_db
-from app.models.user_config import UserConfig
 from app.schemas.common import ApiResponse
-from app.services.membership import require_member
 from app.services.stock_universe import lookup_name, refresh_universe, resolve_symbol, search_stocks
 from app.services.valuation import get_valuations
 from app.services.watchlist import MAX_WATCHLIST
@@ -57,9 +54,7 @@ def lookup_names(symbols: str = Query(""), db: Session = Depends(get_db)):
 def lookup_valuations(
     symbols: str = Query(""),
     db: Session = Depends(get_db),
-    user: UserConfig | None = Depends(get_optional_user),
 ):
-    require_member(user)
     items = get_valuations([s.strip() for s in symbols.split(",") if s.strip()], db=db)
     for item in items:
         if not item.get("name"):

@@ -24,6 +24,7 @@ const navItems = computed(() => [
   { path: '/', label: '仪表盘' },
   { path: chartPath.value, label: 'K线图表' },
   { path: '/flow', label: '宽基主力' },
+  { path: '/bull-tactics', label: '主板战法' },
   { path: '/backtest', label: '回测' },
   { path: '/settings', label: '设置' },
 ])
@@ -31,6 +32,7 @@ const navItems = computed(() => [
 const isActive = (path: string) => {
   if (path === '/') return route.path === '/'
   if (path === '/flow') return route.path.startsWith('/flow')
+  if (path === '/bull-tactics') return route.path.startsWith('/bull-tactics')
   return route.path.startsWith(path.split('/').slice(0, 2).join('/'))
 }
 </script>

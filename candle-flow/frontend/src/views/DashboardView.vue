@@ -298,10 +298,6 @@ async function unfollow(sym: string) {
           后同步到账号，换电脑也能看到。
         </template>
       </p>
-      <p v-if="watchlist.symbols.length && !config.isMember" class="watch-sync-hint">
-        估值分位、扫描关注为会员功能。
-        <RouterLink to="/settings">去设置开通</RouterLink>
-      </p>
       <p v-if="watchlist.symbols.length" class="watch-sync-hint">
         百分位是该股自己近十年市盈率/市净率的历史位置，不是行业或全市场对比。越低表示相对自己越便宜；≥85% 会标「历史偏高」。
       </p>

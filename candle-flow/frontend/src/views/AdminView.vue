@@ -1,14 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import {
   apiErrorText,
-  fetchAdminClaimImage,
-  fetchAdminClaims,
+  createAdminUser,
+  deleteAdminUser,
   fetchAdminUsers,
-  reviewAdminClaim,
-  setAdminMembership,
   type AdminUserRow,
-  type PayClaim,
 } from '@/api'
 
 const ADMIN_KEY_STORAGE = 'candle-flow-admin-key'
@@ -21,13 +18,10 @@ const message = ref('')
 const error = ref('')
 const filter = ref('')
 const users = ref<AdminUserRow[]>([])
-const claims = ref<PayClaim[]>([])
-const claimImages = ref<Record<number, string>>({})
-const busyClaim = ref<number | null>(null)
 
-const quickUser = ref('')
-const quickPlan = ref<'month' | 'year' | 'lifetime' | 'free'>('month')
-const quickDays = ref<number | null>(null)
+const newUser = ref('')
+const newPassword = ref('')
+const creating = ref(false)
 
 const filtered = computed(() => {
   const q = filter.value.trim().toLowerCase()
@@ -43,35 +37,6 @@ onMounted(() => {
   }
 })
 
-function clearClaimImages() {
-  for (const url of Object.values(claimImages.value)) {
-    URL.revokeObjectURL(url)
-  }
-  claimImages.value = {}
-}
-
-async function loadClaims() {
-  const key = adminKey.value.trim()
-  const { data } = await fetchAdminClaims(key, 'pending')
-  const rows = data.data || []
-  claims.value = rows
-  clearClaimImages()
-  const next: Record<number, string> = {}
-  await Promise.all(
-    rows.map(async (row) => {
-      if (!row.has_image) return
-      try {
-        next[row.id] = await fetchAdminClaimImage(key, row.id)
-      } catch {
-        /* image optional */
-      }
-    }),
-  )
-  claimImages.value = next
-}
-
-onUnmounted(() => clearClaimImages())
-
 async function unlock() {
   error.value = ''
   message.value = ''
@@ -86,15 +51,10 @@ async function unlock() {
     users.value = data.data || []
     sessionStorage.setItem(ADMIN_KEY_STORAGE, key)
     unlocked.value = true
-    await loadClaims()
-    message.value = claims.value.length
-      ? `待开通 ${claims.value.length} 笔，共 ${users.value.length} 个账号`
-      : `已加载 ${users.value.length} 个账号`
+    message.value = `已加载 ${users.value.length} 个账号`
   } catch (e) {
     unlocked.value = false
     users.value = []
-    claims.value = []
-    clearClaimImages()
     sessionStorage.removeItem(ADMIN_KEY_STORAGE)
     error.value = apiErrorText(e, '密钥无效或无法加载用户')
   } finally {
@@ -105,8 +65,6 @@ async function unlock() {
 function lock() {
   unlocked.value = false
   users.value = []
-  claims.value = []
-  clearClaimImages()
   adminKey.value = ''
   sessionStorage.removeItem(ADMIN_KEY_STORAGE)
   message.value = '已退出管理'
@@ -120,7 +78,6 @@ async function refresh() {
   try {
     const { data } = await fetchAdminUsers(adminKey.value.trim(), filter.value.trim())
     users.value = data.data || []
-    await loadClaims()
   } catch (e) {
     error.value = apiErrorText(e)
   } finally {
@@ -128,45 +85,46 @@ async function refresh() {
   }
 }
 
-async function reviewClaim(id: number, action: 'approve' | 'reject') {
-  busyClaim.value = id
+async function createUser() {
+  const name = newUser.value.trim()
+  const password = newPassword.value
+  if (!name) {
+    error.value = '请填写账号（手机号或用户名）'
+    return
+  }
+  if (password.length < 4) {
+    error.value = '口令至少 4 位'
+    return
+  }
+  creating.value = true
   error.value = ''
   message.value = ''
   try {
-    const { data } = await reviewAdminClaim(adminKey.value.trim(), id, action)
-    const claim = data.data?.claim
-    message.value = action === 'approve'
-      ? `${claim?.username} 已开通${claim?.plan_label || ''}`
-      : `${claim?.username} 已驳回`
+    const { data } = await createAdminUser({
+      admin_key: adminKey.value.trim(),
+      username: name,
+      password,
+    })
+    const u = data.data
+    message.value = u ? `已创建 ${u.username}` : '已创建用户'
+    newUser.value = ''
+    newPassword.value = ''
     await refresh()
   } catch (e) {
     error.value = apiErrorText(e)
   } finally {
-    busyClaim.value = null
+    creating.value = false
   }
 }
 
-async function setPlan(username: string, plan: 'free' | 'month' | 'year' | 'lifetime', days?: number | null) {
+async function removeUser(username: string) {
+  if (!window.confirm(`确定删除用户 ${username}？相关记录也会清除，且不可恢复。`)) return
   busyUser.value = username
   error.value = ''
   message.value = ''
   try {
-    const body: {
-      admin_key: string
-      username: string
-      plan: 'free' | 'month' | 'year' | 'lifetime'
-      days?: number
-    } = {
-      admin_key: adminKey.value.trim(),
-      username,
-      plan,
-    }
-    if (days && days > 0) body.days = days
-    const { data } = await setAdminMembership(body)
-    const m = data.data?.membership
-    message.value = m
-      ? `${username} → ${m.plan_label}${m.expires_at ? `（至 ${m.expires_at}）` : ''}`
-      : '已更新'
+    await deleteAdminUser(adminKey.value.trim(), username)
+    message.value = `已删除 ${username}`
     await refresh()
   } catch (e) {
     error.value = apiErrorText(e)
@@ -174,22 +132,11 @@ async function setPlan(username: string, plan: 'free' | 'month' | 'year' | 'life
     busyUser.value = ''
   }
 }
-
-async function quickActivate() {
-  const name = quickUser.value.trim()
-  if (!name) {
-    error.value = '请填写手机号'
-    return
-  }
-  await setPlan(name, quickPlan.value, quickDays.value)
-  quickUser.value = ''
-  quickDays.value = null
-}
 </script>
 
 <template>
   <div class="admin-view">
-    <h1>会员管理</h1>
+    <h1>用户管理</h1>
     <p class="lead">仅管理员使用。地址不挂在导航里，请收藏 <code>/admin</code>。密钥保存在本机会话，关闭标签页即清除。</p>
 
     <div v-if="!unlocked" class="card unlock-card">
@@ -215,58 +162,14 @@ async function quickActivate() {
         <button class="btn-secondary" type="button" @click="lock">退出管理</button>
       </div>
 
-      <div class="card claims-card">
-        <h2>待开通凭证（{{ claims.length }}）</h2>
-        <p v-if="!claims.length" class="empty">暂无用户上传的付款截图</p>
-        <ul v-else class="claim-list">
-          <li v-for="c in claims" :key="c.id" class="claim-item">
-            <a v-if="claimImages[c.id]" :href="claimImages[c.id]" target="_blank" rel="noopener" class="shot">
-              <img :src="claimImages[c.id]" :alt="`${c.username} 付款截图`" />
-            </a>
-            <div class="claim-meta">
-              <p><strong>{{ c.username }}</strong> · {{ c.plan_label }} ¥{{ c.amount }}</p>
-              <p class="muted">{{ c.created_at || '' }}{{ c.note ? ` · ${c.note}` : '' }}</p>
-              <div class="actions">
-                <button
-                  class="btn-primary"
-                  type="button"
-                  :disabled="busyClaim === c.id"
-                  @click="reviewClaim(c.id, 'approve')"
-                >
-                  开通
-                </button>
-                <button
-                  class="btn-secondary danger"
-                  type="button"
-                  :disabled="busyClaim === c.id"
-                  @click="reviewClaim(c.id, 'reject')"
-                >
-                  驳回
-                </button>
-              </div>
-            </div>
-          </li>
-        </ul>
-      </div>
-
       <div class="card quick-card">
-        <h2>快捷开通</h2>
-        <div class="quick-row">
-          <input v-model="quickUser" placeholder="手机号" @keyup.enter="quickActivate" />
-          <select v-model="quickPlan">
-            <option value="month">月卡</option>
-            <option value="year">年卡</option>
-            <option value="lifetime">终身</option>
-            <option value="free">取消会员</option>
-          </select>
-          <input
-            v-model.number="quickDays"
-            type="number"
-            min="1"
-            placeholder="天数(可选)"
-            title="留空则按月卡30天/年卡365天"
-          />
-          <button class="btn-primary" type="button" :disabled="!!busyUser" @click="quickActivate">开通</button>
+        <h2>创建用户</h2>
+        <div class="quick-row create-row">
+          <input v-model="newUser" placeholder="手机号或用户名" @keyup.enter="createUser" />
+          <input v-model="newPassword" type="password" placeholder="初始口令（至少4位）" @keyup.enter="createUser" />
+          <button class="btn-primary" type="button" :disabled="creating" @click="createUser">
+            {{ creating ? '创建中…' : '创建' }}
+          </button>
         </div>
       </div>
 
@@ -277,8 +180,6 @@ async function quickActivate() {
           <thead>
             <tr>
               <th>手机号</th>
-              <th>套餐</th>
-              <th>到期</th>
               <th>关注</th>
               <th>更新</th>
               <th>操作</th>
@@ -287,46 +188,16 @@ async function quickActivate() {
           <tbody>
             <tr v-for="u in filtered" :key="u.username">
               <td class="name">{{ u.username }}</td>
-              <td>
-                <span :class="['badge', u.membership.is_member ? 'on' : '']">
-                  {{ u.membership.plan_label }}
-                </span>
-              </td>
-              <td>{{ u.membership.expires_at || (u.membership.plan === 'lifetime' ? '永久' : '—') }}</td>
               <td>{{ u.watchlist_count }}</td>
               <td class="muted">{{ u.updated_at || '—' }}</td>
               <td class="actions">
                 <button
-                  class="btn-secondary"
-                  type="button"
-                  :disabled="busyUser === u.username"
-                  @click="setPlan(u.username, 'month')"
-                >
-                  月卡
-                </button>
-                <button
-                  class="btn-secondary"
-                  type="button"
-                  :disabled="busyUser === u.username"
-                  @click="setPlan(u.username, 'year')"
-                >
-                  年卡
-                </button>
-                <button
-                  class="btn-secondary"
-                  type="button"
-                  :disabled="busyUser === u.username"
-                  @click="setPlan(u.username, 'lifetime')"
-                >
-                  终身
-                </button>
-                <button
                   class="btn-secondary danger"
                   type="button"
                   :disabled="busyUser === u.username"
-                  @click="setPlan(u.username, 'free')"
+                  @click="removeUser(u.username)"
                 >
-                  取消
+                  删除
                 </button>
               </td>
             </tr>
@@ -364,91 +235,36 @@ async function quickActivate() {
 }
 .unlock-card input,
 .toolbar input,
-.quick-row input,
-.quick-row select {
-  width: 100%;
+.quick-row input {
+  padding: 8px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  font-size: 14px;
 }
 .toolbar {
   display: flex;
   gap: var(--space-sm);
   align-items: center;
-  margin-bottom: var(--space-md);
   flex-wrap: wrap;
 }
 .toolbar input { flex: 1; min-width: 160px; }
-.quick-card { margin-bottom: var(--space-md); }
 .quick-card h2,
-.table-wrap h2,
-.claims-card h2 {
-  font-size: 16px;
-  margin-bottom: var(--space-md);
-}
-.claims-card { margin-bottom: var(--space-md); }
-.claim-list { list-style: none; display: flex; flex-direction: column; gap: 12px; }
-.claim-item {
-  display: flex;
-  gap: 12px;
-  align-items: flex-start;
-  padding-bottom: 12px;
-  border-bottom: 1px solid var(--border-color);
-}
-.claim-item:last-child { border-bottom: 0; padding-bottom: 0; }
-.shot img {
-  width: 120px;
-  height: 120px;
-  object-fit: contain;
-  background: #fff;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-}
-.claim-meta { flex: 1; min-width: 0; }
-.claim-meta p { margin: 0 0 6px; font-size: 14px; }
+.table-wrap h2 { font-size: 16px; margin: 0 0 var(--space-md); }
 .quick-row {
-  display: grid;
-  grid-template-columns: 1.4fr 1fr 1fr auto;
+  display: flex;
   gap: var(--space-sm);
+  flex-wrap: wrap;
   align-items: center;
 }
-.table-wrap { overflow-x: auto; }
-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 13px;
-}
-th,
-td {
-  padding: 10px 8px;
-  text-align: left;
-  border-bottom: 1px solid var(--border-color);
-  vertical-align: middle;
-}
-.name { font-weight: 600; }
-.muted { color: var(--text-secondary); font-size: 12px; white-space: nowrap; }
-.badge {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 4px;
-  background: rgba(0, 0, 0, 0.06);
-  font-size: 12px;
-}
-.badge.on {
-  color: #d48806;
-  background: #fffbe6;
-}
-.actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.actions .btn-secondary {
-  font-size: 12px;
-  padding: 4px 8px;
-}
-.danger { color: #cf1322 !important; }
+.quick-row input { flex: 1; min-width: 140px; }
+.table-wrap table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.table-wrap th,
+.table-wrap td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border-color); }
+.table-wrap .name { font-family: var(--font-mono, monospace); }
+.table-wrap .muted { color: var(--text-secondary); font-size: 13px; }
+.table-wrap .actions { white-space: nowrap; }
 .empty { color: var(--text-secondary); font-size: 13px; }
 .message { color: var(--color-primary); font-size: 14px; margin-top: var(--space-md); }
-.error { color: #f5222d; font-size: 14px; margin-top: var(--space-md); }
-@media (max-width: 768px) {
-  .quick-row { grid-template-columns: 1fr; }
-}
+.error { color: var(--color-danger, #c0392b); font-size: 14px; margin-top: var(--space-md); }
+.btn-secondary.danger { color: var(--color-danger, #c0392b); }
 </style>

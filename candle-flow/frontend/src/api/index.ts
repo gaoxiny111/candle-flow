@@ -296,6 +296,20 @@ export const fetchAdminUsers = (adminKey: string, q = '') =>
     headers: { 'X-Admin-Key': adminKey },
   })
 
+export const createAdminUser = (body: {
+  admin_key: string
+  username: string
+  password: string
+  plan?: 'free' | 'month' | 'year' | 'lifetime'
+  days?: number
+}) => api.post<ApiResponse<AdminUserRow>>('/admin/users', body)
+
+export const deleteAdminUser = (adminKey: string, username: string) =>
+  api.post<ApiResponse<{ username: string; deleted: boolean }>>('/admin/users/delete', {
+    admin_key: adminKey,
+    username,
+  })
+
 export const setAdminMembership = (body: {
   admin_key: string
   username: string
@@ -345,6 +359,65 @@ export const fetchBacktest = async (symbol: string) => {
   const res = await api.get<ApiResponse<BacktestResult>>(`/backtest/${encodeURIComponent(symbol)}`, { timeout: 120000 })
   return { data: checkApi(res) }
 }
+
+export interface BullTacticHit {
+  tactic: string
+  buy_date: string
+  buy_price: number
+  setup_date: string
+  score: number
+  details: Record<string, unknown>
+}
+
+export interface BullTacticScanRow {
+  symbol: string
+  name: string
+  hits: BullTacticHit[]
+  eligible?: boolean
+}
+
+export interface BullTacticRule {
+  id: string
+  name: string
+  rule: string
+}
+
+export const fetchBullTacticRules = () =>
+  api.get<ApiResponse<{ tactics: BullTacticRule[]; universe: string }>>('/bull-tactics/rules')
+
+export const scanBullTacticsSymbol = (symbol: string, recentBars = 30) =>
+  api.get<ApiResponse<BullTacticScanRow>>(`/bull-tactics/scan/${encodeURIComponent(symbol)}`, {
+    params: { recent_bars: recentBars },
+    timeout: 120000,
+  })
+
+export const scanBullTacticsWatchlist = (symbols?: string[], recentBars = 30) =>
+  api.post<ApiResponse<{ items: BullTacticScanRow[]; skipped: string[]; count: number }>>(
+    '/bull-tactics/scan/watchlist',
+    null,
+    {
+      params: {
+        recent_bars: recentBars,
+        symbols: symbols?.length ? symbols.join(',') : undefined,
+      },
+      timeout: 180000,
+    },
+  )
+
+export interface BullTacticMarketScanResult {
+  items: BullTacticScanRow[]
+  scanned: number
+  universe_size: number
+  skipped: number
+  errors: number
+  count: number
+}
+
+export const scanBullTacticsMarket = (recentBars = 30) =>
+  api.post<ApiResponse<BullTacticMarketScanResult>>('/bull-tactics/scan/market', null, {
+    params: { recent_bars: recentBars },
+    timeout: 900000,
+  })
 
 export interface SymbolHit {
   symbol: string

@@ -25,6 +25,41 @@ const PAD = { top: 16, right: 12, bottom: 28, left: 52 }
 const VIEW_W = 960
 const VIEW_H = computed(() => props.height || 360)
 
+/** A-share session: 09:30–11:30 + 13:00–15:00 → 240 trading minutes */
+const SESSION_OPEN_AM = 9 * 60 + 30
+const SESSION_CLOSE_AM = 11 * 60 + 30
+const SESSION_OPEN_PM = 13 * 60
+const SESSION_CLOSE_PM = 15 * 60
+const TOTAL_TRADING_MINUTES = 240
+
+function timeToMinutes(hhmm: string): number | null {
+  const parts = hhmm.split(':')
+  if (parts.length < 2) return null
+  const h = Number(parts[0])
+  const m = Number(parts[1])
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return null
+  return h * 60 + m
+}
+
+function tradingMinuteIndex(hhmm: string): number | null {
+  const mins = timeToMinutes(hhmm)
+  if (mins == null) return null
+  if (mins >= SESSION_OPEN_AM && mins <= SESSION_CLOSE_AM) {
+    return mins - SESSION_OPEN_AM
+  }
+  if (mins >= SESSION_OPEN_PM && mins <= SESSION_CLOSE_PM) {
+    return 120 + (mins - SESSION_OPEN_PM)
+  }
+  return null
+}
+
+function crossesLunchBreak(t1: string, t2: string) {
+  const m1 = timeToMinutes(t1)
+  const m2 = timeToMinutes(t2)
+  if (m1 == null || m2 == null) return false
+  return m1 <= SESSION_CLOSE_AM && m2 >= SESSION_OPEN_PM
+}
+
 function yi(v: number) {
   return v / 1e8
 }
@@ -35,11 +70,6 @@ function fmtYi(v?: number | null) {
   const sign = n > 0 ? '+' : ''
   return `${sign}${n.toFixed(2)}亿`
 }
-
-const times = computed(() => {
-  const first = props.series.find((s) => s.points.length)?.points || []
-  return first.map((p) => p.time)
-})
 
 const innerW = VIEW_W - PAD.left - PAD.right
 const innerH = computed(() => VIEW_H.value - PAD.top - PAD.bottom)
@@ -85,9 +115,14 @@ const yTicks = computed(() => {
   return ticks
 })
 
-function xPos(index: number, total: number) {
-  if (total <= 1) return PAD.left
-  return PAD.left + (index / (total - 1)) * innerW
+function xPosByTradingTime(time: string) {
+  const idx = tradingMinuteIndex(time)
+  if (idx == null) return PAD.left
+  return PAD.left + (idx / TOTAL_TRADING_MINUTES) * innerW
+}
+
+function xPosByTime(time: string) {
+  return xPosByTradingTime(time)
 }
 
 function yPos(yiVal: number) {
@@ -96,26 +131,30 @@ function yPos(yiVal: number) {
   return PAD.top + ((max - yiVal) / (max - min || 1)) * h
 }
 
-function xPosByTime(time: string) {
-  const list = times.value
-  const i = list.indexOf(time)
-  if (i < 0) return PAD.left
-  return xPos(i, list.length)
-}
-
 function pathFor(s: FlowSeries) {
-  const axis = times.value
-  if (!axis.length || !s.points.length) return ''
-  const byTime = new Map(s.points.map((p) => [p.time, p.value]))
-  const cmds: string[] = []
-  axis.forEach((t, i) => {
-    const v = byTime.get(t)
-    if (v == null) return
-    const x = xPos(i, axis.length)
-    const y = yPos(yi(v))
-    cmds.push(`${cmds.length ? 'L' : 'M'}${x.toFixed(1)},${y.toFixed(1)}`)
+  if (!s.points.length) return ''
+  const sorted = [...s.points].sort((a, b) => {
+    const ia = tradingMinuteIndex(a.time) ?? -1
+    const ib = tradingMinuteIndex(b.time) ?? -1
+    return ia - ib
   })
-  return cmds.join(' ')
+  const segments: string[] = []
+  let current: string[] = []
+  let prevTime: string | null = null
+
+  for (const p of sorted) {
+    if (tradingMinuteIndex(p.time) == null) continue
+    if (prevTime && crossesLunchBreak(prevTime, p.time)) {
+      if (current.length) segments.push(current.join(' '))
+      current = []
+    }
+    const x = xPosByTradingTime(p.time)
+    const y = yPos(yi(p.value))
+    current.push(`${current.length ? 'L' : 'M'}${x.toFixed(1)},${y.toFixed(1)}`)
+    prevTime = p.time
+  }
+  if (current.length) segments.push(current.join(' '))
+  return segments.join(' ')
 }
 
 function fmtY(v: number) {
@@ -139,7 +178,7 @@ function fmtY(v: number) {
         </span>
       </div>
     </div>
-    <div v-if="!times.length" class="empty">暂无分时资金数据</div>
+    <div v-if="!series.some((s) => s.points.length)" class="empty">暂无分时资金数据</div>
     <svg
       v-else
       class="chart"
