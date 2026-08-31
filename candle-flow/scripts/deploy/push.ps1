@@ -1,6 +1,6 @@
 param(
   [Parameter(Mandatory = $true)][string]$Server,
-  [string]$User = "admin",
+  [string]$User = "root",
   [int]$Port = 22
 )
 

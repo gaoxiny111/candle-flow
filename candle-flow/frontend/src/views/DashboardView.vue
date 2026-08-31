@@ -233,7 +233,7 @@ const activeWatchGroup = computed(() => {
   return groups.find((g) => g.id === watchlist.activeGroupId) || groups[0] || null
 })
 
-const showHoldSignals = computed(() => boardMode.value === 'watch')
+const showHoldSignals = true
 
 const displaySymbols = computed(() =>
   boardMode.value === 'neimenggu'
@@ -422,12 +422,6 @@ async function loadFundamentals() {
 }
 
 async function scanHoldSignals() {
-  if (!showHoldSignals.value) {
-    holdBySymbol.value = {}
-    holdLoading.value = false
-    holdError.value = ''
-    return
-  }
   const syms = displaySymbols.value
   const token = ++holdScanToken
   if (!syms.length) {
@@ -553,11 +547,11 @@ async function scanHoldSignals() {
         </template>
       </p>
       <p v-else class="watch-sync-hint">
-        内蒙古辖区主要 A/B 股独立列表，不占用关注名额；与「我的关注」可同时包含同一只股票（如伊泰B股），互不冲突。只展示估值与基本面，不含仓位信号。
+        内蒙古辖区主要 A/B 股独立列表，不占用关注名额；与「我的关注」可同时包含同一只股票（如伊泰B股），互不冲突。展示估值、基本面与仓位信号。
       </p>
       <p v-if="displayRows.length" class="watch-sync-hint">
         百分位是该股自己近十年市盈率/市净率的历史位置。基本面按行业分轨：成长轨（ROE≥15%+增速）、周期/价值轨（ROE均值≥10%、不连亏、现金流、负债）。
-        <template v-if="boardMode === 'watch'">打开本页会自动扫描当前分组的仓位信号。</template>
+        打开本页会自动扫描当前列表的仓位信号。
       </p>
       <p v-if="valuationLoading && displayRows.length" class="watch-sync-hint">正在更新估值…</p>
       <p v-if="holdError" class="follow-error">{{ holdError }}</p>
