@@ -97,8 +97,29 @@ def test_growth_v_shape_boost():
     cold = GrowthAnalyzer().analyze(fd, revenue_yoy=-5.0, profit_yoy=-10.0)
     hot = GrowthAnalyzer().analyze(fd, revenue_yoy=13.5, profit_yoy=82.5)
     assert hot.metadata.get("v_shape") is True
+    assert cold.metadata.get("v_shape") is False
+    assert type(cold.metadata["v_shape"]) is bool
     assert hot.score > cold.score
     assert hot.score >= 50
+
+
+def test_json_safe_strips_numpy_bool():
+    import numpy as np
+    from pydantic import BaseModel
+    from typing import Any, Optional
+
+    from app.analysis.engine import _json_safe
+
+    class Wrap(BaseModel):
+        data: Optional[Any] = None
+
+    raw = {"v_shape": np.bool_(False), "score": np.float64(12.5), "nested": {"ok": np.True_}}
+    safe = _json_safe(raw)
+    assert safe["v_shape"] is False
+    assert type(safe["v_shape"]) is bool
+    assert type(safe["score"]) is float
+    assert safe["nested"]["ok"] is True
+    Wrap(data=safe).model_dump()
 
 
 def test_rating_label_b_plus():

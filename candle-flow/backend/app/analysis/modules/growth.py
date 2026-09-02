@@ -16,14 +16,14 @@ class GrowthAnalyzer(BaseAnalyzer):
                 return 0.0
             span = len(clean) - 1
             start, end = clean.iloc[0], clean.iloc[-1]
-            if start <= 0 or end <= 0:
+            if float(start) <= 0 or float(end) <= 0:
                 return 0.0
-            return ((end / start) ** (1 / span) - 1) * 100
+            return float(((end / start) ** (1 / span) - 1) * 100)
         start = clean.iloc[-(years + 1)]
         end = clean.iloc[-1]
-        if start <= 0 or end <= 0:
+        if float(start) <= 0 or float(end) <= 0:
             return 0.0
-        return ((end / start) ** (1 / years) - 1) * 100
+        return float(((end / start) ** (1 / years) - 1) * 100)
 
     def analyze(self, financial_data: pd.DataFrame, **kwargs) -> ModuleResult:
         indicators: list[IndicatorResult] = []
@@ -130,5 +130,5 @@ class GrowthAnalyzer(BaseAnalyzer):
             level=score_to_level(module_score),
             indicators=indicators,
             warnings=warnings,
-            metadata={"v_shape": v_shape},
+            metadata={"v_shape": bool(v_shape)},
         )

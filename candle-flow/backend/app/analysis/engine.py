@@ -25,6 +25,32 @@ from app.utils.symbol import normalize_symbol
 logger = logging.getLogger(__name__)
 
 
+def _json_safe(obj: Any) -> Any:
+    """把 numpy/pandas 标量转成原生类型，避免 Pydantic 序列化 500。"""
+    if obj is None:
+        return None
+    # np.float64 是 float 子类，必须先于 isinstance(..., float) 处理
+    mod = getattr(type(obj), "__module__", "") or ""
+    item = getattr(obj, "item", None)
+    if callable(item) and (mod.startswith("numpy") or mod.startswith("pandas")):
+        try:
+            return _json_safe(item())
+        except (ValueError, TypeError):
+            pass
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    try:
+        if pd.isna(obj):
+            return None
+    except (ValueError, TypeError):
+        pass
+    return obj
+
+
 def _module_to_dict(m: ModuleResult) -> dict:
     return {
         "module_name": m.module_name,
@@ -32,7 +58,7 @@ def _module_to_dict(m: ModuleResult) -> dict:
         "level": m.level.value,
         "indicators": [asdict(i) | {"level": i.level.value} for i in m.indicators],
         "warnings": m.warnings,
-        "metadata": m.metadata,
+        "metadata": _json_safe(m.metadata),
     }
 
 
@@ -365,12 +391,12 @@ class FundamentalEngine:
                 dcf["is_reliable"] = False
                 dcf["note"] = (dcf.get("note") or "") + "估值偏离现价过大，已标记不可信"
             else:
-                dcf["is_reliable"] = shares_src != "default_1e9"
+                dcf["is_reliable"] = bool(shares_src != "default_1e9")
         else:
             # 无现价对照时：默认股本一律不可信
             dcf["is_reliable"] = bool(iv) and shares_src != "default_1e9"
 
-        return dcf
+        return _json_safe(dcf)
 
     def _generate_summary(
         self,
@@ -394,4 +420,4 @@ class FundamentalEngine:
 
 
 def analyze_symbol_full(db: Session, symbol: str, **kwargs) -> dict[str, Any]:
-    return FundamentalEngine().run_full_analysis(symbol, db=db, **kwargs)
+    return _json_safe(FundamentalEngine().run_full_analysis(symbol, db=db, **kwargs))
