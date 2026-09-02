@@ -149,12 +149,18 @@ function fmtChange(n: number | null | undefined) {
   return `${sign}${n.toFixed(2)}%`
 }
 
+function fmtDividend(n: number | null | undefined) {
+  if (n == null || Number.isNaN(n)) return '—'
+  return `${n.toFixed(2)}%`
+}
+
 function rowOf(sym: string) {
   const key = sym.toUpperCase()
   const v = valuations.value[key]
   const analysis = analysisBySymbol.value[key]
   const tech = techSignalOf(sym)
   const composite = analysis?.composite_score ?? null
+  const dy = v?.dividend_yield ?? analysis?.market?.dividend_yield ?? null
   return {
     symbol: sym,
     code: sym.split('.')[0] || tickerOf(sym),
@@ -162,6 +168,7 @@ function rowOf(sym: string) {
     price: fmtPrice(sym, v?.price),
     change: fmtChange(v?.change_pct),
     changeClass: changeClass(v?.change_pct),
+    dividend: fmtDividend(typeof dy === 'number' ? dy : null),
     composite: composite != null ? composite.toFixed(1) : analysisLoading.value ? '…' : '—',
     rating: ratingLabel(composite, analysis?.final_rating),
     techLabel: tech.label,
@@ -304,6 +311,7 @@ function openDetail(sym: string) {
             <th>代码</th>
             <th>价格</th>
             <th>涨跌</th>
+            <th>股息率</th>
             <th>综合分</th>
             <th>评级</th>
             <th>技术信号</th>
@@ -316,6 +324,7 @@ function openDetail(sym: string) {
             <td class="symbol-code">{{ row.code }}</td>
             <td>{{ row.price }}</td>
             <td :class="row.changeClass">{{ row.change }}</td>
+            <td class="div-cell">{{ row.dividend }}</td>
             <td class="score-cell">{{ row.composite }}</td>
             <td class="rating-cell">{{ row.rating }}</td>
             <td>
@@ -345,6 +354,7 @@ function openDetail(sym: string) {
             <span :class="row.changeClass">{{ row.change }}</span>
           </div>
           <div class="watch-card-metrics">
+            <div><span class="k">股息率</span><span>{{ row.dividend }}</span></div>
             <div><span class="k">综合分</span><span>{{ row.composite }}</span></div>
             <div><span class="k">评级</span><span>{{ row.rating }}</span></div>
             <div class="watch-card-tech">
@@ -403,7 +413,7 @@ function openDetail(sym: string) {
 .watch-table-wrap { margin-top: var(--space-sm); overflow-x: auto; }
 .watch-cards { display: none; }
 .watch-row { cursor: default; }
-.score-cell, .rating-cell { font-variant-numeric: tabular-nums; font-weight: 600; }
+.score-cell, .rating-cell, .div-cell { font-variant-numeric: tabular-nums; font-weight: 600; }
 .tech-signal {
   display: inline-flex;
   align-items: center;

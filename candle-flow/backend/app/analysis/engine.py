@@ -173,6 +173,23 @@ class FundamentalEngine:
         }
         rv = RelativeValuation()
         rel = rv.analyze(current, history=None, industry=None)
+        # 无历史分位时，用绝对估值给信号（避免 PE 有值却 signal=「—」不参与打分）
+        if pe is not None and "PE_TTM" in rel and rel["PE_TTM"].get("signal") in (None, "—"):
+            p = float(pe)
+            if 0 < p <= 12:
+                rel["PE_TTM"]["signal"] = "低估"
+            elif p <= 20:
+                rel["PE_TTM"]["signal"] = "合理"
+            elif p > 35:
+                rel["PE_TTM"]["signal"] = "高估"
+        if pb is not None and "PB" in rel and rel["PB"].get("signal") in (None, "—"):
+            b = float(pb)
+            if 0 < b <= 2.0:
+                rel["PB"]["signal"] = "低估"
+            elif b <= 3.5:
+                rel["PB"]["signal"] = "合理"
+            elif b > 6:
+                rel["PB"]["signal"] = "高估"
         if pe_pct is not None and "PE_TTM" in rel:
             rel["PE_TTM"]["percentile_5y"] = pe_pct
             # 绝对低估优先于历史分位：煤炭 PE<12 仍偏便宜
@@ -229,6 +246,19 @@ class FundamentalEngine:
             iv = result["dcf"].get("intrinsic_value_per_share")
             if price and iv:
                 result["dcf"]["margin_of_safety_pct"] = round((iv - float(price)) / float(price) * 100, 1)
+
+        # 无行情时：用 DCF 安全边际粗估，避免默认 55 系统性压低现金奶牛
+        if not scores and result.get("dcf"):
+            iv = result["dcf"].get("intrinsic_value_per_share")
+            price = market.get("price")
+            if iv and price and float(price) > 0:
+                mos = (float(iv) - float(price)) / float(price)
+                if mos > 0.3:
+                    result["composite_valuation_score"] = 82.0
+                elif mos > 0:
+                    result["composite_valuation_score"] = 70.0
+                else:
+                    result["composite_valuation_score"] = 50.0
 
         return result
 

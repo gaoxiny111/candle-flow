@@ -35,8 +35,8 @@ class GrowthAnalyzer(BaseAnalyzer):
         profit = financial_data["net_profit"]
 
         rev_cagr_3y = self._calc_cagr(revenue, 3)
-        # 周期股负增长不直接打到地板：中性区扩到 -15~0
-        score, level = self._score_by_range(rev_cagr_3y, (15, 200), (5, 15), (-15, 5))
+        # 成熟蓝筹：小幅负 CAGR 仍属稳健，不按成长股标准打地板
+        score, level = self._score_by_range(rev_cagr_3y, (10, 200), (-10, 10), (-25, -10))
         indicators.append(
             IndicatorResult(
                 name="营收3年CAGR(%)",
@@ -49,7 +49,7 @@ class GrowthAnalyzer(BaseAnalyzer):
         )
 
         profit_cagr_3y = self._calc_cagr(profit, 3)
-        score2, level2 = self._score_by_range(profit_cagr_3y, (20, 300), (5, 20), (-20, 5))
+        score2, level2 = self._score_by_range(profit_cagr_3y, (12, 300), (-12, 12), (-30, -12))
         indicators.append(
             IndicatorResult(
                 name="净利润3年CAGR(%)",
@@ -63,16 +63,16 @@ class GrowthAnalyzer(BaseAnalyzer):
 
         yoy_rev = kwargs.get("revenue_yoy")
         yoy_profit = kwargs.get("profit_yoy")
-        # 最新同比权重更高：捕捉边际拐点
+        # 蓝筹温和复苏（0%~+10%）给良好档，不要求高增长
         if yoy_rev is not None:
             yoy_val = float(yoy_rev)
-            ls = self._linear_score(yoy_val, -20, 40)
+            ls, yoy_lv = self._score_by_range(yoy_val, (12, 200), (0, 12), (-10, 0))
             indicators.append(
                 IndicatorResult(
                     name="最新报告期营收同比(%)",
                     value=round(yoy_val, 2),
                     score=ls,
-                    level=score_to_level(ls),
+                    level=yoy_lv,
                     trend="up" if yoy_val > 5 else ("down" if yoy_val < -5 else "flat"),
                     weight=3.0,
                 )
@@ -80,36 +80,41 @@ class GrowthAnalyzer(BaseAnalyzer):
 
         if yoy_profit is not None:
             yp = float(yoy_profit)
-            ls2 = self._linear_score(min(yp, 150), -30, 80)
+            ls2, yp_lv = self._score_by_range(min(yp, 150), (15, 300), (0, 15), (-12, 0))
             indicators.append(
                 IndicatorResult(
                     name="最新报告期净利同比(%)",
                     value=round(yp, 2),
                     score=ls2,
-                    level=score_to_level(ls2),
+                    level=yp_lv,
                     trend="up" if yp > 5 else ("down" if yp < -5 else "flat"),
                     weight=3.0,
                 )
             )
 
-        # V 型反转：历史 CAGR 为负，但最新同比显著转正
+        # V 型反转：历史 CAGR 为负，但最新同比显著转正（含温和复苏）
         v_shape = (
             profit_cagr_3y < 0
             and yoy_profit is not None
-            and float(yoy_profit) >= 20
+            and float(yoy_profit) >= 8
             and yoy_rev is not None
             and float(yoy_rev) >= 0
         )
         if v_shape:
+            strong = float(yoy_profit) >= 20
             indicators.append(
                 IndicatorResult(
                     name="成长拐点",
                     value=round(float(yoy_profit), 2),
-                    score=78.0,
+                    score=78.0 if strong else 70.0,
                     level=AnalysisLevel.GOOD,
                     trend="up",
                     weight=2.5,
-                    comment="历史复合增速为负但最新同比强劲反弹（V型拐点）",
+                    comment=(
+                        "历史复合增速为负但最新同比强劲反弹（V型拐点）"
+                        if strong
+                        else "历史复合增速为负但最新同比已转正（复苏拐点）"
+                    ),
                 )
             )
             warnings.append("近3年净利润复合增速为负，但最新报告期已现拐点，需观察持续性")

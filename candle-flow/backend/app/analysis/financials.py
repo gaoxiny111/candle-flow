@@ -78,24 +78,20 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
         shares = net_profit / eps if net_profit and eps and abs(eps) > 1e-9 else None
         ocf_total = ocf_ps * shares if ocf_ps and shares else None
 
-        # 权益乘数默认约 1.8~2.5；煤炭等重资产取 2.2
-        equity_mult = 2.2
-        total_assets = equity * equity_mult if equity else (revenue / 0.3 if revenue else None)
-
         rows.append(
             {
                 "report_date": d,
                 "revenue": revenue,
                 "net_profit": net_profit,
                 "equity": equity,
-                "roe": roe,
+                "roe": roe,  # 年报口径，直接用业绩快报字段
                 "eps": eps,
                 "operating_cashflow": ocf_total,
                 "capital_expenditure": (ocf_total or 0) * 0.25 if ocf_total else None,
                 "operating_profit": net_profit * 1.15 if net_profit else None,
-                "cogs": revenue * 0.68 if revenue else None,  # 煤炭毛利约 30%
-                "total_assets": total_assets,
-                "current_liabilities": (total_assets or 0) * 0.30 if total_assets else None,
+                # 不伪造毛利率：无真实成本时不填 cogs
+                "total_assets": None,
+                "current_liabilities": None,
                 "accounts_receivable": revenue * 0.08 if revenue else None,
             }
         )
@@ -124,10 +120,13 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
         meta["ocf_per_share"] = _pick(latest_raw, "每股经营现金流量")
         meta["eps"] = _pick(latest_raw, "每股收益")
         meta["latest_report"] = latest_d
-        # 若最新是中报且有 ROE，覆盖展示用最新 ROE（年化粗估：中报 ROE×2 仅作参考，这里直接用报告值）
-        latest_roe = _pick(latest_raw, "净资产收益率")
-        if latest_roe is not None:
-            meta["latest_roe"] = latest_roe
+        interim_roe = _pick(latest_raw, "净资产收益率")
+        if interim_roe is not None and latest_d and not _is_annual(str(latest_d)):
+            meta["interim_roe"] = interim_roe
+            # 中报 ROE 未年化；0630 粗估 ×2，0331×4，0930×4/3
+            mmdd = str(latest_d)[4:8] if len(str(latest_d)) >= 8 else ""
+            factor = {"0331": 4.0, "0630": 2.0, "0930": 4.0 / 3.0}.get(mmdd, 2.0)
+            meta["annualized_interim_roe"] = round(float(interim_roe) * factor, 2)
 
     if not rows:
         return pd.DataFrame(), meta
@@ -136,33 +135,40 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
     fd = fd.set_index("report_date").sort_index()
     meta["report_dates"] = list(fd.index)
     meta["annual_dates"] = list(fd.index)
+    # 评分优先用最近年报 ROE，避免中报 5.8% 被当成全年
+    if "roe" in fd.columns and len(fd):
+        annual_roe = fd["roe"].dropna()
+        if len(annual_roe):
+            meta["annual_roe"] = float(annual_roe.iloc[-1])
+            meta["latest_roe"] = meta["annual_roe"]
 
-    # 资产负债率：优先最新年报 zcfz；B 股常缺失则回退估算
+    # 资产负债率：必须优先年报；中报负债率季节性偏高（神华中报 40% vs 年报 ~25–33%）
     debt_ratio = None
-    for cand in [meta.get("latest_report"), *(reversed(list(fd.index)))]:
-        if not cand:
-            continue
-        # 中报日期 zcfz 可能没有，尝试同年年报
-        try_dates = [str(cand)]
-        if not _is_annual(str(cand)) and len(str(cand)) >= 4:
-            try_dates.append(f"{str(cand)[:4]}1231")
-        for td in try_dates:
-            debt_map = _fetch_debt_map(td)
-            if symbol in debt_map:
-                debt_ratio = debt_map[symbol]
-                break
-        if debt_ratio is not None:
+    for cand in list(reversed(list(fd.index))):
+        debt_map = _fetch_debt_map(str(cand))
+        if symbol in debt_map:
+            debt_ratio = debt_map[symbol]
             break
     if debt_ratio is None and not fd.empty:
         last = fd.iloc[-1]
-        debt_ratio = _debt_ratio_fallback(
-            symbol,
-            float(last["equity"]) if pd.notna(last.get("equity")) else None,
-            float(last["total_assets"]) if pd.notna(last.get("total_assets")) else None,
-        )
-        if debt_ratio is not None:
-            meta["debt_ratio_estimated"] = True
+        # 无总资产时用权益粗估（负债率未知则跳过）
+        eq = float(last["equity"]) if pd.notna(last.get("equity")) else None
+        if eq:
+            # 保守占位，标注估算
+            debt_ratio = _debt_ratio_fallback(symbol, eq, eq * 1.35)
+            if debt_ratio is not None:
+                meta["debt_ratio_estimated"] = True
     meta["debt_ratio"] = debt_ratio
+
+    # 有负债率后回填总资产，供周转/杜邦展示（非伪造毛利）
+    if debt_ratio is not None and debt_ratio < 100 and "equity" in fd.columns:
+        for idx in fd.index:
+            eq = fd.at[idx, "equity"]
+            if pd.isna(eq) or eq <= 0:
+                continue
+            ta = float(eq) / max(1e-6, 1 - float(debt_ratio) / 100.0)
+            fd.at[idx, "total_assets"] = ta
+            fd.at[idx, "current_liabilities"] = ta * (float(debt_ratio) / 100.0) * 0.5
 
     return fd, meta
 

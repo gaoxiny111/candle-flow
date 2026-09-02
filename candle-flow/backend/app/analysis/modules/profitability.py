@@ -17,8 +17,11 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
         fd = financial_data.copy()
         equity = fd["equity"].replace(0, pd.NA)
         revenue = fd["revenue"].replace(0, pd.NA)
-        roe_series = (fd["net_profit"] / equity * 100).dropna()
-        # 优先用最新报告期 ROE（可中报）；否则用年报序列末值
+        # 评分用年报 ROE（kwargs.latest_roe 已由 financials 设为年报末值）
+        if "roe" in fd.columns and fd["roe"].notna().any():
+            roe_series = fd["roe"].dropna()
+        else:
+            roe_series = (fd["net_profit"] / equity * 100).dropna()
         latest_roe = kwargs.get("latest_roe")
         roe = float(latest_roe) if latest_roe is not None else (
             float(roe_series.iloc[-1]) if len(roe_series) else 0.0
@@ -28,8 +31,8 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
         asset_turnover = float((fd["revenue"] / fd["total_assets"].replace(0, pd.NA)).iloc[-1]) if "total_assets" in fd else 0.0
         equity_multiplier = float((fd["total_assets"] / equity).iloc[-1]) if len(equity.dropna()) else 0.0
 
-        # 周期股 ROE 10% 附近视为良好（对照煤炭行业中上水平）
-        roe_score, roe_level = self._score_by_range(roe, (14, 100), (9, 14), (5, 9))
+        # 周期/蓝筹 ROE：12%+ 已属优秀（对照神华等龙头报告）
+        roe_score, roe_level = self._score_by_range(roe, (12, 100), (8, 12), (5, 8))
         indicators.append(
             IndicatorResult(
                 name="ROE(%)",
@@ -63,23 +66,26 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
                 )
             )
 
-        if "cogs" in fd.columns:
+        # 仅在有真实成本数据时计入毛利率，避免伪造 COGS 拉低/抬高分数
+        if "cogs" in fd.columns and fd["cogs"].notna().any():
             gm_series = ((fd["revenue"] - fd["cogs"]) / revenue * 100).dropna()
-            gross_margin = float(gm_series.iloc[-1]) if len(gm_series) else 0.0
-            gm_score, gm_level = self._score_by_range(gross_margin, (50, 100), (30, 50), (15, 30))
-            indicators.append(
-                IndicatorResult(
-                    name="毛利率(%)",
-                    value=round(gross_margin, 2),
-                    score=gm_score,
-                    level=gm_level,
-                    trend=self._calc_trend(gm_series),
-                    weight=2.0,
+            if len(gm_series):
+                gross_margin = float(gm_series.iloc[-1])
+                gm_score, gm_level = self._score_by_range(gross_margin, (50, 100), (30, 50), (15, 30))
+                indicators.append(
+                    IndicatorResult(
+                        name="毛利率(%)",
+                        value=round(gross_margin, 2),
+                        score=gm_score,
+                        level=gm_level,
+                        trend=self._calc_trend(gm_series),
+                        weight=2.0,
+                    )
                 )
-            )
 
         nm_pct = net_margin * 100
-        nm_score, nm_level = self._score_by_range(nm_pct, (20, 100), (10, 20), (3, 10))
+        # 煤炭等净利率 15%+ 已属优秀
+        nm_score, nm_level = self._score_by_range(nm_pct, (15, 100), (8, 15), (3, 8))
         indicators.append(
             IndicatorResult(
                 name="净利率(%)",

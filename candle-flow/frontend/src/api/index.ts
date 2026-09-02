@@ -475,6 +475,7 @@ export interface SymbolValuation {
   pb: number | null
   pb_percentile: number | null
   market_cap: number | null
+  dividend_yield?: number | null
   percentiles_pending?: boolean
 }
 
@@ -643,6 +644,8 @@ export interface FundamentalAnalysisReport {
     pb?: number | null
     pe_percentile?: number | null
     pb_percentile?: number | null
+    market_cap?: number | null
+    dividend_yield?: number | null
   }
   warnings: string[]
   summary: string

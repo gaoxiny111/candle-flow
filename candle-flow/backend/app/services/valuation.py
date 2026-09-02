@@ -19,8 +19,8 @@ EASTMONEY_ULIST = "https://push2.eastmoney.com/api/qt/ulist.np/get"
 EASTMONEY_HISTORY = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 BAIDU_VALUATION = "https://gushitong.baidu.com/opendata"
 # f2 最新价 f3 涨跌幅 f9 市盈率(动) f12 代码 f13 市场 f14 名称
-# f23 市净率 f115 市盈率(TTM) f116 总市值(元)
-QUOTE_FIELDS = "f2,f3,f9,f12,f13,f14,f23,f115,f116"
+# f20/f116 总市值 f23 市净率 f115 市盈率(TTM) f133 股息率(TTM %)
+QUOTE_FIELDS = "f2,f3,f9,f12,f13,f14,f20,f23,f115,f116,f133"
 CACHE_TTL_SEC = 180
 HIST_TTL_SEC = 12 * 3600
 HIST_YEARS = 10
@@ -55,6 +55,7 @@ def _empty(symbol: str, name: str = "") -> dict[str, Any]:
         "pe_dynamic": None,
         "pb": None,
         "market_cap": None,
+        "dividend_yield": None,
         "pe_percentile": None,
         "pb_percentile": None,
         "percentiles_pending": False,
@@ -97,7 +98,8 @@ def _row_to_item(symbol: str, row: dict[str, Any]) -> dict[str, Any]:
         "pe_ttm": _num(row.get("f115")),
         "pe_dynamic": _num(row.get("f9")),
         "pb": _num(row.get("f23")),
-        "market_cap": _num(row.get("f116")),
+        "market_cap": _num(row.get("f116")) or _num(row.get("f20")),
+        "dividend_yield": _num(row.get("f133")),
     }
 
 
@@ -146,6 +148,7 @@ def _parse_tencent(text: str, wanted: set[str]) -> dict[str, dict[str, Any]]:
             "pe_dynamic": _num(fields[39]),
             "pb": _num(fields[46]),
             "market_cap": cap_yi * 1e8 if cap_yi is not None else None,
+            "dividend_yield": None,
         }
     return out
 
@@ -189,42 +192,57 @@ def _fetch_eastmoney(symbols: list[str]) -> dict[str, dict[str, Any]]:
         wanted.add(symbol)
     if not secids:
         return {}
-    try:
-        r = requests.get(
-            EASTMONEY_ULIST,
-            params={
-                "fltt": "2",
-                "invt": "2",
-                "fields": QUOTE_FIELDS,
-                "secids": ",".join(secids),
-            },
-            headers=_HEADERS,
-            timeout=8,
-        )
-        payload = r.json() or {}
-        rows = ((payload.get("data") or {}).get("diff")) or []
-    except Exception as e:
-        logger.warning("eastmoney valuation failed for %s: %s", symbols, e)
-        return {}
 
-    out: dict[str, dict[str, Any]] = {}
-    if isinstance(rows, dict):
-        rows = list(rows.values())
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        symbol = _symbol_from_row(row)
-        if not symbol or symbol not in wanted:
-            continue
-        out[symbol] = _row_to_item(symbol, row)
-    return out
+    last_err: Exception | None = None
+    for attempt in range(2):
+        try:
+            r = requests.get(
+                EASTMONEY_ULIST,
+                params={
+                    "fltt": "2",
+                    "invt": "2",
+                    "fields": QUOTE_FIELDS,
+                    "secids": ",".join(secids),
+                },
+                headers=_HEADERS,
+                timeout=8,
+            )
+            payload = r.json() or {}
+            rows = ((payload.get("data") or {}).get("diff")) or []
+            out: dict[str, dict[str, Any]] = {}
+            if isinstance(rows, dict):
+                rows = list(rows.values())
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                symbol = _symbol_from_row(row)
+                if not symbol or symbol not in wanted:
+                    continue
+                out[symbol] = _row_to_item(symbol, row)
+            return out
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                time.sleep(0.4)
+    logger.warning("eastmoney valuation failed for %s: %s", symbols, last_err)
+    return {}
 
 
 def _fetch_quotes(symbols: list[str]) -> dict[str, dict[str, Any]]:
-    data = _fetch_tencent(symbols)
+    # 东财优先：含股息率；腾讯补缺价/涨跌
+    data = _fetch_eastmoney(symbols)
     missing = [s for s in symbols if s not in data]
     if missing:
-        data.update(_fetch_eastmoney(missing))
+        data.update(_fetch_tencent(missing))
+    # 东财部分失败时，腾讯命中的票再试一次补股息
+    need_dy = [s for s in symbols if data.get(s) and data[s].get("dividend_yield") is None]
+    if need_dy:
+        for s, item in _fetch_eastmoney(need_dy).items():
+            dy = item.get("dividend_yield")
+            if s in data and dy is not None:
+                data[s]["dividend_yield"] = dy
+            elif s not in data:
+                data[s] = item
     return data
 
 
