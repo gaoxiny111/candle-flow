@@ -1,6 +1,6 @@
 import re
 
-SYMBOL_WITH_MARKET = re.compile(r"^(\d{6})\.(SH|SZ)$", re.I)
+SYMBOL_WITH_MARKET = re.compile(r"^(\d{6})\.(SH|SZ|BJ)$", re.I)
 CODE_ONLY = re.compile(r"^\d{6}$")
 FUTURE_WITH_MARKET = re.compile(r"^([A-Z]{1,2}(?:0|\d{3,4}))\.FUT$", re.I)
 FUTURE_CODE = re.compile(r"^([A-Za-z]{1,2})(0|\d{3,4})$")
@@ -220,10 +220,13 @@ def is_etf_symbol(symbol: str) -> bool:
 
 
 def market_for_code(code: str) -> str:
-    """Infer SH/SZ from a bare 6-digit code (stocks, B-shares, ETFs)."""
+    """Infer SH/SZ/BJ from a bare 6-digit code (stocks, B-shares, ETFs)."""
     c = (code or "").strip()
     if not CODE_ONLY.match(c):
         raise SymbolError(f"无法识别市场: {code}")
+    # 北交所：920xxx 新代码段，以及 4xxxxx/8xxxxx 老代码段
+    if c.startswith("920") or c.startswith(("4", "8")):
+        return "BJ"
     # 5xxxxx ETF / 6xxxxx A / 9xxxxx B → 沪市
     if c.startswith(("5", "6", "9")):
         return "SH"

@@ -1,3 +1,4 @@
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -10,6 +11,8 @@ from app.schemas.kline import KlineOut, KlineSyncRequest, KlineSyncResponse
 from app.services.kline_service import KlineService
 from app.services.stock_universe import resolve_symbol
 from app.utils.symbol import SymbolError
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -54,6 +57,14 @@ def list_kline(
         except DataSourceError as e:
             if not items:
                 return ApiResponse(code=e.code, message=e.message, data=None)
+    elif svc.latest_is_stale(symbol):
+        # 本地系列落后于最近交易日：增量补齐中间缺失的历史蜡烛，而非只补今天
+        try:
+            svc.sync(symbol)
+            items, total = svc.get_klines(symbol, start_date, end_date, page, page_size)
+            items = svc.sanitize_rows(items)
+        except Exception:
+            logger.warning("incremental kline sync failed for %s", symbol, exc_info=True)
     # Opening the chart should always try to attach/refresh today's bar (no Sync click).
     merged = svc.merge_today_spot(symbol)
     if not merged and svc.latest_is_stale(symbol):
@@ -87,7 +98,13 @@ def latest_kline(symbol: str = Query(...), db: Session = Depends(get_db)):
             return ApiResponse(code=e.code, message=e.message, data=None)
         item = svc.get_latest(symbol)
     elif svc.latest_is_stale(symbol):
-        svc.ensure_today_bar(symbol)
+        # 先增量补齐缺失的历史交易日，再尝试补今天
+        try:
+            svc.sync(symbol)
+        except Exception:
+            logger.warning("incremental kline sync failed for %s", symbol, exc_info=True)
+        if svc.latest_is_stale(symbol):
+            svc.ensure_today_bar(symbol)
         item = svc.get_latest(symbol)
     if not item:
         return ApiResponse(code=404101, message="symbol not found", data=None)

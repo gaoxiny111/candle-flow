@@ -91,7 +91,12 @@ class AKShareClient:
             logger.warning("eastmoney hist failed for %s: %s; fallback to sina", code, e)
 
         # 东财常被掐连接，回退新浪日线
-        prefix = "sh" if code.startswith(("5", "6", "9")) else "sz"
+        if code.startswith("920") or code.startswith(("4", "8")):
+            prefix = "bj"
+        elif code.startswith(("5", "6", "9")):
+            prefix = "sh"
+        else:
+            prefix = "sz"
         return ak.stock_zh_a_daily(
             symbol=f"{prefix}{code}",
             start_date=start,

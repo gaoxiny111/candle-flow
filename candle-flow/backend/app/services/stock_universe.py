@@ -29,10 +29,23 @@ REFRESH_TTL = timedelta(hours=24)
 _refresh_lock = threading.Lock()
 _last_refresh: datetime | None = None
 
-_MARKET_CODE = re.compile(r"^(sh|sz)(\d{6})$", re.I)
+_MARKET_CODE = re.compile(r"^(sh|sz|bj)(\d{6})$", re.I)
 _OF_CODE = re.compile(r"^of(\d{6})$", re.I)
 # 11/12/13 股票，22 场内基金/ETF
 _SINA_KINDS = {"11", "12", "13", "22"}
+
+
+def pinyin_abbr(name: str) -> str:
+    """中文名 -> 拼音首字母缩写（小写），非汉字字符原样保留。如 贵州茅台->gzmt，伊泰B股->ytbg。"""
+    text = (name or "").strip()
+    if not text:
+        return ""
+    try:
+        from pypinyin import Style, lazy_pinyin
+
+        return "".join(lazy_pinyin(text, style=Style.FIRST_LETTER, errors=lambda x: list(x))).lower()
+    except Exception:
+        return ""
 
 
 def code_to_symbol(code: str, market: str | None = None) -> str | None:
@@ -42,11 +55,8 @@ def code_to_symbol(code: str, market: str | None = None) -> str | None:
         return None
     if market:
         m = market.strip().lower()
-        if m in ("sh", "sz") or m.startswith(("sh", "sz")):
-            suffix = "SH" if m.startswith("sh") else "SZ"
-            return f"{code}.{suffix}"
-        if m.startswith("bj"):
-            return None
+        if m in ("sh", "sz", "bj") or m.startswith(("sh", "sz", "bj")):
+            return f"{code}.{m[:2].upper()}"
     try:
         return normalize_symbol(code)
     except SymbolError:
@@ -89,7 +99,17 @@ def parse_sina_suggest(text: str) -> list[dict]:
         name = parts[4] if len(parts) > 4 else parts[0]
         if not name or name.isdigit():
             name = parts[0]
-        items.append({"symbol": symbol, "name": name, "code": symbol.split(".")[0], "market": symbol.split(".")[1]})
+        # 新浪第 6 个字段是拼音首字母（如 gzmt），直接利用
+        py = parts[5].strip().lower() if len(parts) > 5 and parts[5].strip().isascii() else ""
+        items.append(
+            {
+                "symbol": symbol,
+                "name": name,
+                "code": symbol.split(".")[0],
+                "market": symbol.split(".")[1],
+                "pinyin": py,
+            }
+        )
         seen.add(symbol)
     return items
 
@@ -110,11 +130,14 @@ def _upsert(db: Session, rows: Iterable[dict]) -> int:
     count = 0
     for row in rows:
         symbol = row["symbol"]
+        py = (row.get("pinyin") or "").strip().lower() or pinyin_abbr(row["name"])
         existing = db.get(StockInfo, symbol)
         if existing:
             existing.name = row["name"]
             existing.code = row["code"]
             existing.market = row["market"]
+            if py:
+                existing.pinyin = py
         else:
             db.add(
                 StockInfo(
@@ -122,6 +145,7 @@ def _upsert(db: Session, rows: Iterable[dict]) -> int:
                     code=row["code"],
                     name=row["name"],
                     market=row["market"],
+                    pinyin=py,
                 )
             )
         count += 1
@@ -132,6 +156,49 @@ def _upsert(db: Session, rows: Iterable[dict]) -> int:
 def ensure_seeded(db: Session) -> None:
     if db.query(StockInfo).count() == 0:
         _upsert(db, _seed_rows())
+    ensure_pinyin(db)
+    ensure_market_consistent(db)
+
+
+def ensure_market_consistent(db: Session) -> None:
+    """纠正历史脏数据：北交所代码段（920/4/8 开头）却被标成 SH/SZ 的行。"""
+    bad_rows = [
+        row
+        for row in db.query(StockInfo).filter(StockInfo.market.in_(("SH", "SZ"))).all()
+        if (row.code or "").startswith("920") or (row.code or "").startswith(("4", "8"))
+    ]
+    if not bad_rows:
+        return
+    for row in bad_rows:
+        correct_symbol = f"{row.code}.BJ"
+        existing = db.get(StockInfo, correct_symbol)
+        if existing:
+            existing.name = row.name
+            if row.pinyin:
+                existing.pinyin = row.pinyin
+        else:
+            db.add(
+                StockInfo(
+                    symbol=correct_symbol,
+                    code=row.code,
+                    name=row.name,
+                    market="BJ",
+                    pinyin=row.pinyin or pinyin_abbr(row.name),
+                )
+            )
+        db.delete(row)
+    db.commit()
+    logger.info("fixed %d stock_info rows with wrong market (BJ code segment)", len(bad_rows))
+
+
+def ensure_pinyin(db: Session) -> None:
+    """为存量数据回填拼音首字母（一次性，迁移后旧行 pinyin 为空）。"""
+    missing = db.query(StockInfo).filter((StockInfo.pinyin == None) | (StockInfo.pinyin == "")).all()  # noqa: E711
+    if not missing:
+        return
+    for row in missing:
+        row.pinyin = pinyin_abbr(row.name)
+    db.commit()
 
 
 def fetch_sina_suggest(query: str) -> list[dict]:
@@ -181,6 +248,30 @@ def refresh_universe(db: Session, force: bool = False) -> int:
                 )
         except Exception as e:
             logger.warning("stock universe refresh failed: %s", e)
+        if not rows:
+            # 后备：东财全市场快照（含北交所）
+            try:
+                import akshare as ak
+
+                df = ak.stock_zh_a_spot_em()
+                for _, rec in df.iterrows():
+                    code = str(rec.get("代码", "")).zfill(6)
+                    name = str(rec.get("名称", "")).strip()
+                    symbol = code_to_symbol(code)
+                    if not symbol or not name or name in ("nan", "None"):
+                        continue
+                    rows.append(
+                        {
+                            "symbol": symbol,
+                            "code": symbol.split(".")[0],
+                            "name": name,
+                            "market": symbol.split(".")[1],
+                        }
+                    )
+                if rows:
+                    logger.info("stock universe refreshed via eastmoney spot fallback: %d rows", len(rows))
+            except Exception as e:
+                logger.warning("eastmoney spot fallback failed: %s", e)
         rows.extend(_seed_rows())
         n = _upsert(db, rows) if rows else 0
         if n:
@@ -205,19 +296,27 @@ def _rank(item: StockInfo, q: str) -> tuple[int, int, str]:
     name = item.name or ""
     code = item.code or ""
     symbol = item.symbol or ""
+    py = (item.pinyin or "").lower()
     qu = q.upper()
+    ql = q.lower()
     if name == q:
         return (0, 0, symbol)
+    if py and py == ql:
+        return (1, 0, symbol)
     if name.startswith(q):
-        return (1, len(name), symbol)
+        return (2, len(name), symbol)
+    if py and py.startswith(ql):
+        return (3, len(py), symbol)
     if q in name:
-        return (2, name.find(q), symbol)
+        return (4, name.find(q), symbol)
     if code == q or symbol.upper() == qu or symbol.split(".")[0] == q:
-        return (3, 0, symbol)
-    if code.startswith(q) or symbol.upper().startswith(qu):
-        return (4, 0, symbol)
-    if q in code or qu in symbol.upper():
         return (5, 0, symbol)
+    if code.startswith(q) or symbol.upper().startswith(qu):
+        return (6, 0, symbol)
+    if py and ql in py:
+        return (7, py.find(ql), symbol)
+    if q in code or qu in symbol.upper():
+        return (8, 0, symbol)
     return (9, 0, symbol)
 
 
@@ -232,6 +331,7 @@ def search_local(db: Session, query: str, limit: int = 10) -> list[StockInfo]:
             (StockInfo.name.contains(q))
             | (StockInfo.code.contains(q))
             | (StockInfo.symbol.contains(q.upper()))
+            | (StockInfo.pinyin.contains(q.lower()))
         )
         .all()
     )

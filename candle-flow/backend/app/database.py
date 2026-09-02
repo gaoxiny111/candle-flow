@@ -31,6 +31,13 @@ def _migrate_sqlite():
     if not settings.database_url.startswith("sqlite"):
         return
     insp = inspect(engine)
+    if "stock_info" in insp.get_table_names():
+        scols = {c["name"] for c in insp.get_columns("stock_info")}
+        if "pinyin" not in scols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE stock_info ADD COLUMN pinyin VARCHAR(64) NOT NULL DEFAULT ''"))
+            with engine.begin() as conn:
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_stock_info_pinyin ON stock_info (pinyin)"))
     if "trading_signals" not in insp.get_table_names():
         return
     cols = {c["name"] for c in insp.get_columns("trading_signals")}

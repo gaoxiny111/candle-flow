@@ -85,7 +85,7 @@ function isFutureSymbol(symbol: string): boolean {
 }
 
 export function isIndexSymbol(symbol: string): boolean {
-  const m = /^(\d{6})\.(SH|SZ)$/.exec(symbol.trim().toUpperCase())
+  const m = /^(\d{6})\.(SH|SZ|BJ)$/.exec(symbol.trim().toUpperCase())
   if (!m) return false
   const [, code, market] = m
   if (market === 'SH' && code.startsWith('000')) return true
@@ -94,7 +94,7 @@ export function isIndexSymbol(symbol: string): boolean {
 }
 
 export function isEtfSymbol(symbol: string): boolean {
-  const m = /^(\d{6})\.(SH|SZ)$/.exec(symbol.trim().toUpperCase())
+  const m = /^(\d{6})\.(SH|SZ|BJ)$/.exec(symbol.trim().toUpperCase())
   if (!m) return false
   const [, code, market] = m
   if (market === 'SH' && /^(51|56|58)/.test(code)) return true
@@ -102,7 +102,9 @@ export function isEtfSymbol(symbol: string): boolean {
   return false
 }
 
-function marketForCode(code: string): 'SH' | 'SZ' {
+function marketForCode(code: string): 'SH' | 'SZ' | 'BJ' {
+  // 北交所：920xxx 新代码段，以及 4xxxxx/8xxxxx 老代码段
+  if (code.startsWith('920') || code.startsWith('4') || code.startsWith('8')) return 'BJ'
   if (code.startsWith('5') || code.startsWith('6') || code.startsWith('9')) return 'SH'
   if (code.startsWith('0') || code.startsWith('1') || code.startsWith('2') || code.startsWith('3')) {
     return 'SZ'
@@ -119,7 +121,7 @@ export function normalizeSymbol(input: string): string {
   if (ALIASES[raw]) return ALIASES[raw]
 
   const upper = raw.toUpperCase()
-  const withMarket = /^(\d{6})\.(SH|SZ)$/.exec(upper)
+  const withMarket = /^(\d{6})\.(SH|SZ|BJ)$/.exec(upper)
   if (withMarket) return `${withMarket[1]}.${withMarket[2]}`
 
   if (/^\d{6}$/.test(upper)) {
@@ -238,7 +240,7 @@ export function searchLocalSymbols(query: string): { symbol: string; name: strin
   const upper = text.toUpperCase()
   for (const [symbol, name] of Object.entries({ ...SYMBOL_NAMES, ...extraNames })) {
     if (isFutureSymbol(symbol)) continue
-    if (name.includes(text) || symbol.includes(upper) || symbol.split('.')[0].startsWith(upper.replace(/\.(SH|SZ)$/, ''))) {
+    if (name.includes(text) || symbol.includes(upper) || symbol.split('.')[0].startsWith(upper.replace(/\.(SH|SZ|BJ)$/, ''))) {
       add(symbol, name)
     }
   }

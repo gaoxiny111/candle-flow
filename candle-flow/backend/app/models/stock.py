@@ -13,6 +13,7 @@ class StockInfo(Base):
     code: Mapped[str] = mapped_column(String(10), nullable=False)
     name: Mapped[str] = mapped_column(String(40), nullable=False)
     market: Mapped[str] = mapped_column(String(8), nullable=False)
+    pinyin: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default="")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
@@ -20,4 +21,5 @@ class StockInfo(Base):
     __table_args__ = (
         Index("ix_stock_info_code", "code"),
         Index("ix_stock_info_name", "name"),
+        Index("ix_stock_info_pinyin", "pinyin"),
     )

@@ -2,14 +2,20 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
+from app.models.stock import StockInfo
 from app.services.stock_universe import (
+    code_to_symbol,
+    ensure_market_consistent,
+    ensure_seeded,
     lookup_name,
     parse_sina_suggest,
+    pinyin_abbr,
     resolve_symbol,
     search_local,
+    search_stocks,
     _upsert,
 )
-from app.utils.symbol import SymbolError, normalize_symbol
+from app.utils.symbol import SymbolError, market_for_code, normalize_symbol
 
 
 def test_parse_sina_suggest_ignores_futures():
@@ -112,3 +118,83 @@ def test_lookup_name_from_stock_info():
     )
     assert lookup_name(db, "002812.SZ") == "恩捷股份"
     assert lookup_name(db, "002812") == "恩捷股份"
+
+
+def test_pinyin_abbr():
+    assert pinyin_abbr("贵州茅台") == "gzmt"
+    assert pinyin_abbr("宁德时代") == "ndsd"
+    assert pinyin_abbr("") == ""
+
+
+def test_search_local_by_pinyin():
+    db = _memory_db()
+    _upsert(
+        db,
+        [
+            {"symbol": "600519.SH", "code": "600519", "name": "贵州茅台", "market": "SH"},
+            {"symbol": "300750.SZ", "code": "300750", "name": "宁德时代", "market": "SZ"},
+        ],
+    )
+    hits = search_local(db, "gzmt")
+    assert hits and hits[0].symbol == "600519.SH"
+    hits = search_local(db, "GZMT")
+    assert hits and hits[0].symbol == "600519.SH"
+    hits = search_local(db, "nd")
+    assert hits and hits[0].symbol == "300750.SZ"
+
+
+def test_search_stocks_pinyin_without_network(monkeypatch):
+    """本地库有拼音时，不依赖新浪联想也能搜到。"""
+    db = _memory_db()
+    monkeypatch.setattr("app.services.stock_universe.fetch_sina_suggest", lambda q: [])
+    monkeypatch.setattr("app.services.stock_universe.refresh_universe", lambda db, force=False: 0)
+    _upsert(
+        db,
+        [{"symbol": "600519.SH", "code": "600519", "name": "贵州茅台", "market": "SH"}],
+    )
+    hits = search_stocks(db, "gzmt")
+    assert hits and hits[0]["symbol"] == "600519.SH"
+
+
+def test_ensure_seeded_backfills_pinyin():
+    db = _memory_db()
+    db.add(StockInfo(symbol="600519.SH", code="600519", name="贵州茅台", market="SH", pinyin=""))
+    db.commit()
+    ensure_seeded(db)
+    hits = search_local(db, "gzmt")
+    assert hits and hits[0].symbol == "600519.SH"
+
+
+def test_bj_code_to_symbol():
+    assert code_to_symbol("920047", "bj") == "920047.BJ"
+    assert code_to_symbol("920047") == "920047.BJ"
+    assert code_to_symbol("830799") == "830799.BJ"
+    assert code_to_symbol("430047") == "430047.BJ"
+    assert market_for_code("920047") == "BJ"
+    assert normalize_symbol("920047") == "920047.BJ"
+    assert normalize_symbol("920047.bj") == "920047.BJ"
+    # 900 开头仍是上海 B 股
+    assert market_for_code("900948") == "SH"
+
+
+def test_parse_sina_suggest_bj():
+    text = "var suggestvalue='诺思兰德,11,920047,bj920047,诺思兰德,nsld,诺思兰德,99,1,,,';"
+    items = parse_sina_suggest(text)
+    assert items and items[0]["symbol"] == "920047.BJ"
+    assert items[0]["market"] == "BJ"
+    assert items[0]["pinyin"] == "nsld"
+
+
+def test_ensure_market_consistent_fixes_dirty_rows():
+    db = _memory_db()
+    db.add(StockInfo(symbol="920047.SH", code="920047", name="诺思兰德", market="SH", pinyin="nsld"))
+    db.add(StockInfo(symbol="600519.SH", code="600519", name="贵州茅台", market="SH", pinyin="gzmt"))
+    db.commit()
+    ensure_market_consistent(db)
+    assert db.get(StockInfo, "920047.SH") is None
+    fixed = db.get(StockInfo, "920047.BJ")
+    assert fixed and fixed.name == "诺思兰德" and fixed.pinyin == "nsld"
+    # 正常行不受影响
+    assert db.get(StockInfo, "600519.SH") is not None
+    hits = search_local(db, "920047")
+    assert hits and hits[0].symbol == "920047.BJ"

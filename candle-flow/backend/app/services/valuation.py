@@ -67,7 +67,8 @@ def _secid(symbol: str) -> Optional[str]:
     code, market = parse_symbol(symbol)
     if market == "sh":
         return f"1.{code}"
-    if market == "sz":
+    if market in ("sz", "bj"):
+        # 东财北交所 secid 市场位与深市同为 0
         return f"0.{code}"
     return None
 
@@ -80,6 +81,9 @@ def _symbol_from_row(row: dict[str, Any]) -> Optional[str]:
     if market in (1, "1"):
         return f"{code}.SH"
     if market in (0, "0"):
+        # 东财 f13=0 涵盖深市与北交所，按代码段区分
+        if code.startswith("920") or code.startswith(("4", "8")):
+            return f"{code}.BJ"
         return f"{code}.SZ"
     return None
 
@@ -101,7 +105,7 @@ def _tencent_code(symbol: str) -> Optional[str]:
     if is_future(symbol):
         return None
     code, market = parse_symbol(symbol)
-    if market not in ("sh", "sz"):
+    if market not in ("sh", "sz", "bj"):
         return None
     return f"{market}{code}"
 
@@ -118,7 +122,15 @@ def _parse_tencent(text: str, wanted: set[str]) -> dict[str, dict[str, Any]]:
             continue
         code = (fields[2] or "").zfill(6)
         key = chunk.split("=")[0].replace("v_", "").strip()
-        market = "SH" if key.startswith("sh") else "SZ" if key.startswith("sz") else ""
+        market = (
+            "SH"
+            if key.startswith("sh")
+            else "SZ"
+            if key.startswith("sz")
+            else "BJ"
+            if key.startswith("bj")
+            else ""
+        )
         if not market or len(code) != 6:
             continue
         symbol = f"{code}.{market}"
