@@ -107,3 +107,44 @@ def test_rating_label_b_plus():
     assert rating_label(74.3) == "B+"
     assert rating_label(53.2) == "D"
     assert rating_label(82) == "A-"
+
+
+def test_dcf_shares_from_market_cap_and_reliability():
+    from app.analysis.engine import FundamentalEngine
+    from app.analysis.models.dcf import DCFModel
+
+    # 股本错误（1e9）会把神华级别 FCF 打到数百元/股
+    blown = DCFModel(wacc=0.08, terminal_growth=0.02).value(
+        base_fcf=5e10, high_growth_rate=0.04, transition_growth_rate=0.03, shares_outstanding=1e9
+    )
+    assert blown["intrinsic_value_per_share"] and blown["intrinsic_value_per_share"] > 200
+
+    # 用市值/股价还原股本后应回到合理量级
+    eng = FundamentalEngine()
+    fd = _sample_financials()
+    # 放大到接近龙头量级
+    fd = fd.copy()
+    fd["operating_cashflow"] = [5e10, 6e10, 7e10]
+    fd["capital_expenditure"] = [1e10, 1.2e10, 1.5e10]
+    fd["net_profit"] = [4e10, 5e10, 5.5e10]
+    fd["eps"] = [2.0, 2.5, 2.8]
+    market = {"price": 48.0, "market_cap": 48.0 * 2e10}  # ~200 亿股
+    meta = {"symbol": "601088.SH", "profit_yoy": 4.0, "debt_ratio": 25.0, "eps": 2.8}
+    dcf = eng._build_dcf(fd, market, meta)
+    assert dcf["shares_source"] == "market_cap/price"
+    assert dcf["fcf_source"] == "ocf-capex"
+    assert dcf.get("is_reliable") is True
+    iv = dcf["intrinsic_value_per_share"]
+    assert iv is not None
+    assert 10 < iv < 150  # 相对 48 元现价不爆表
+    assert abs(dcf["assumptions"]["wacc"] - 0.08) < 1e-9  # 低负债动态 WACC
+
+
+def test_dcf_default_shares_marked_unreliable():
+    from app.analysis.engine import FundamentalEngine
+
+    eng = FundamentalEngine()
+    fd = _sample_financials()
+    dcf = eng._build_dcf(fd, {"price": 10.0}, {"symbol": "TEST.SH", "profit_yoy": 5.0})
+    assert dcf["shares_source"] == "default_1e9"
+    assert dcf.get("is_reliable") is False
