@@ -6,6 +6,7 @@ import SignalPanel from '@/components/SignalPanel.vue'
 import RiskCalculator from '@/components/RiskCalculator.vue'
 import IndicatorOverlay from '@/components/IndicatorOverlay.vue'
 import SymbolSearch from '@/components/SymbolSearch.vue'
+import FundamentalPanel from '@/components/FundamentalPanel.vue'
 import { useKlineStore } from '@/stores/kline'
 import { usePatternStore } from '@/stores/pattern'
 import { useSignalStore } from '@/stores/signal'
@@ -31,6 +32,7 @@ const visibleIndicators = ref(['MA', 'MACD', 'RSI'])
 const showPatternMarkers = ref(false)
 const selectedSignal = ref<SignalItem | null>(null)
 const highlightPatternId = ref<number | null>(null)
+const activeTab = ref<'pattern' | 'fundamental'>('pattern')
 
 const symbol = computed(() => {
   const raw = route.params.symbol as string | undefined
@@ -219,73 +221,124 @@ watch(symbol, (s) => loadAll(s))
       <span v-if="kline.error" class="input-error">{{ kline.error }}</span>
     </div>
 
-    <div v-if="kline.error && !kline.klineList.length" class="card empty-chart">
-      无法加载 K 线：{{ kline.error }}。请检查网络后重新加载。
+    <div class="chart-tabs card" role="tablist">
+      <button
+        type="button"
+        role="tab"
+        class="chart-tab"
+        :class="{ active: activeTab === 'fundamental' }"
+        :aria-selected="activeTab === 'fundamental'"
+        @click="activeTab = 'fundamental'"
+      >
+        基本面分析
+      </button>
+      <button
+        type="button"
+        role="tab"
+        class="chart-tab"
+        :class="{ active: activeTab === 'pattern' }"
+        :aria-selected="activeTab === 'pattern'"
+        @click="activeTab = 'pattern'"
+      >
+        K 线形态
+      </button>
     </div>
 
-    <div v-else class="main-layout">
-      <div class="chart-area card">
-        <ChartContainer
-          :symbol="symbol"
-          :period="chartPeriod"
-          :kline-data="displayKlines"
-          :patterns="displayPatterns"
-          :highlight-pattern-id="highlightPatternId"
-          :show-all-markers="showPatternMarkers"
-          :show-ma="visibleIndicators.includes('MA')"
-          :show-boll="visibleIndicators.includes('BOLL')"
-          :show-macd="visibleIndicators.includes('MACD')"
-          :show-rsi="visibleIndicators.includes('RSI')"
-          :show-stoch="visibleIndicators.includes('STOCH')"
-          :show-atr="visibleIndicators.includes('ATR')"
-          :show-retrace="visibleIndicators.includes('RETRACE')"
-          :loading="kline.loading"
-        />
+    <div v-if="activeTab === 'fundamental'" class="fundamental-layout">
+      <FundamentalPanel :symbol="symbol" />
+    </div>
+
+    <template v-else>
+      <div v-if="kline.error && !kline.klineList.length" class="card empty-chart">
+        无法加载 K 线：{{ kline.error }}。请检查网络后重新加载。
       </div>
-      <aside class="sidebar">
-        <IndicatorOverlay v-model:visible-types="visibleIndicators" />
-        <SignalPanel
-          :signals="signal.signals"
-          :selected-id="selectedSignal?.id ?? null"
-          :kline-data="kline.klineList"
-          :patterns="pattern.patterns"
-          :is-index="isIndexSymbol(symbol)"
-          @select-signal="onSignalSelect"
-          @select-pattern="onPatternSelect"
-          @confirm-signal="onConfirm"
-          @dismiss-signal="onDismiss"
-        />
-        <RiskCalculator
-          :entry-price="finiteNum(selectedSignal?.entry_price ?? kline.latestKline?.close)"
-          :stop-loss="finiteNum(selectedSignal?.stop_loss)"
-          :capital="config.defaultCapital"
-        />
-      </aside>
-    </div>
 
-    <div class="pattern-filter card">
-      <span>形态筛选:</span>
-      <select v-model="pattern.filterDirection" @change="pattern.updateFilter(pattern.filterDirection, pattern.filterStatus)">
-        <option value="">全部方向</option>
-        <option value="bullish">看涨</option>
-        <option value="bearish">看跌</option>
-      </select>
-      <select v-model="pattern.filterStatus" @change="pattern.updateFilter(pattern.filterDirection, pattern.filterStatus)">
-        <option value="">全部状态</option>
-        <option value="pending">待确认</option>
-        <option value="confirmed">已确认</option>
-      </select>
-      <label class="marker-toggle">
-        <input v-model="showPatternMarkers" type="checkbox" />
-        显示全部标注
-      </label>
-      <span class="pattern-count">共 {{ pattern.patterns.length }} 个形态</span>
-    </div>
+      <div v-else class="main-layout">
+        <div class="chart-area card">
+          <ChartContainer
+            :symbol="symbol"
+            :period="chartPeriod"
+            :kline-data="displayKlines"
+            :patterns="displayPatterns"
+            :highlight-pattern-id="highlightPatternId"
+            :show-all-markers="showPatternMarkers"
+            :show-ma="visibleIndicators.includes('MA')"
+            :show-boll="visibleIndicators.includes('BOLL')"
+            :show-macd="visibleIndicators.includes('MACD')"
+            :show-rsi="visibleIndicators.includes('RSI')"
+            :show-stoch="visibleIndicators.includes('STOCH')"
+            :show-atr="visibleIndicators.includes('ATR')"
+            :show-retrace="visibleIndicators.includes('RETRACE')"
+            :loading="kline.loading"
+          />
+        </div>
+        <aside class="sidebar">
+          <IndicatorOverlay v-model:visible-types="visibleIndicators" />
+          <SignalPanel
+            :signals="signal.signals"
+            :selected-id="selectedSignal?.id ?? null"
+            :kline-data="kline.klineList"
+            :patterns="pattern.patterns"
+            :is-index="isIndexSymbol(symbol)"
+            @select-signal="onSignalSelect"
+            @select-pattern="onPatternSelect"
+            @confirm-signal="onConfirm"
+            @dismiss-signal="onDismiss"
+          />
+          <RiskCalculator
+            :entry-price="finiteNum(selectedSignal?.entry_price ?? kline.latestKline?.close)"
+            :stop-loss="finiteNum(selectedSignal?.stop_loss)"
+            :capital="config.defaultCapital"
+          />
+        </aside>
+      </div>
+
+      <div class="pattern-filter card">
+        <span>形态筛选:</span>
+        <select v-model="pattern.filterDirection" @change="pattern.updateFilter(pattern.filterDirection, pattern.filterStatus)">
+          <option value="">全部方向</option>
+          <option value="bullish">看涨</option>
+          <option value="bearish">看跌</option>
+        </select>
+        <select v-model="pattern.filterStatus" @change="pattern.updateFilter(pattern.filterDirection, pattern.filterStatus)">
+          <option value="">全部状态</option>
+          <option value="pending">待确认</option>
+          <option value="confirmed">已确认</option>
+        </select>
+        <label class="marker-toggle">
+          <input v-model="showPatternMarkers" type="checkbox" />
+          显示全部标注
+        </label>
+        <span class="pattern-count">共 {{ pattern.patterns.length }} 个形态</span>
+      </div>
+    </template>
   </div>
 </template>
 
 <style scoped>
 .chart-view { display: flex; flex-direction: column; gap: var(--space-md); }
+.chart-tabs {
+  display: flex;
+  gap: 0;
+  padding: 0;
+  overflow: hidden;
+}
+.chart-tab {
+  flex: 1;
+  padding: 12px 16px;
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--text-secondary);
+}
+.chart-tab.active {
+  color: var(--color-primary);
+  border-bottom-color: var(--color-primary);
+  font-weight: 600;
+}
+.fundamental-layout { min-height: 400px; }
 .toolbar { display: flex; align-items: center; gap: var(--space-sm); flex-wrap: wrap; }
 .toolbar-search { display: flex; gap: var(--space-sm); flex: 1 1 280px; min-width: 0; }
 .toolbar-search :deep(.symbol-search) { flex: 1; min-width: 0; }

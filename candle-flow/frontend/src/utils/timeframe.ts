@@ -18,10 +18,11 @@ function weekKey(isoDate: string): string {
 /** ISO-week fold; bar date is the last session in that week. */
 export function toWeekly(daily: KlineItem[]): KlineItem[] {
   if (!daily.length) return []
+  const ordered = [...daily].sort((a, b) => ymd(a.date).localeCompare(ymd(b.date)))
   const out: KlineItem[] = []
   let key = ''
   let bucket: KlineItem[] = []
-  for (const bar of daily) {
+  for (const bar of ordered) {
     const k = weekKey(bar.date)
     if (!key) {
       key = k

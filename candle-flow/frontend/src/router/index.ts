@@ -42,9 +42,7 @@ const router = createRouter({
     },
     {
       path: '/fundamentals',
-      name: 'fundamentals',
-      component: () => import('@/views/FundamentalPoolView.vue'),
-      meta: { title: '基本面候选池', requiresAuth: false },
+      redirect: '/',
     },
     {
       path: '/backtest',

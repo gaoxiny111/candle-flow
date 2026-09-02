@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from app.api.v1 import (
+    analysis,
     bull_tactics,
     flow,
     fundamentals,
@@ -16,6 +17,7 @@ from app.api.v1 import (
 )
 
 api_router = APIRouter(prefix="/api/v1")
+api_router.include_router(analysis.router, tags=["analysis"])
 api_router.include_router(symbols.router, tags=["symbols"])
 api_router.include_router(kline.router, tags=["kline"])
 api_router.include_router(flow.router, tags=["flow"])

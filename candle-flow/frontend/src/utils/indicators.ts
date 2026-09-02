@@ -15,10 +15,12 @@ export function barTime(k: KlineItem): string {
 
 export function sanitizeKlines(data: KlineItem[]): KlineItem[] {
   if (!data.length) return data
-  // Drop duplicate dates (keep last) — LWC requires strictly ascending times.
+  // Drop duplicate / invalid dates (keep last) — LWC requires strictly ascending times.
   const byDay = new Map<string, KlineItem>()
   for (const k of data) {
-    byDay.set(barTime(k), k)
+    const day = barTime(k)
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue
+    byDay.set(day, k)
   }
   const deduped = [...byDay.values()].sort((a, b) => barTime(a).localeCompare(barTime(b)))
   if (deduped.length < 8) return deduped

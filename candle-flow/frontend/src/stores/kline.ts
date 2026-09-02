@@ -25,7 +25,10 @@ export const useKlineStore = defineStore('kline', {
       this.error = null
       try {
         const { data } = await fetchKline(sym, 500, refresh)
-        this.klineList = data.data || []
+        const rows = data.data || []
+        this.klineList = [...rows].sort((a, b) =>
+          String(a.date).slice(0, 10).localeCompare(String(b.date).slice(0, 10)),
+        )
         this.currentSymbol = sym
         this.dataSource = this.klineList[0]?.source || 'akshare'
         if (!this.klineList.length) {

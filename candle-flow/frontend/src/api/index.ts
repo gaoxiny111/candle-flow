@@ -599,6 +599,63 @@ export const analyzeWatchFundamentals = async (symbols: string[]) => {
   return { data: checkApi(res) }
 }
 
+export interface AnalysisIndicator {
+  name: string
+  value: number
+  score: number
+  level: string
+  trend?: string
+  industry_avg?: number | null
+  weight?: number
+  comment?: string
+}
+
+export interface AnalysisModule {
+  module_name: string
+  score: number
+  level: string
+  indicators: AnalysisIndicator[]
+  warnings: string[]
+  metadata?: Record<string, unknown>
+}
+
+export interface FundamentalAnalysisReport {
+  symbol: string
+  name: string
+  industry: string
+  report_dates: string[]
+  composite_score: number
+  final_rating: string
+  modules: Record<string, AnalysisModule>
+  valuation: {
+    relative?: Record<string, { current?: number; percentile_5y?: number | null; signal?: string; value?: number }>
+    dcf?: {
+      intrinsic_value_per_share?: number | null
+      margin_of_safety_pct?: number
+      note?: string
+      assumptions?: Record<string, number>
+    }
+    composite_valuation_score?: number
+  }
+  market: {
+    price?: number | null
+    pe_ttm?: number | null
+    pb?: number | null
+    pe_percentile?: number | null
+    pb_percentile?: number | null
+  }
+  warnings: string[]
+  summary: string
+}
+
+export const fetchFundamentalAnalysis = async (symbol: string) => {
+  const sym = encodeURIComponent(symbol)
+  const res = await api.get<ApiResponse<FundamentalAnalysisReport>>(`/analysis/${sym}`, {
+    timeout: 180000,
+  })
+  return { data: checkApi(res) }
+}
+
 export const runFundamentalScreen = async (body: {
   themes?: string[]
   auto_themes?: boolean

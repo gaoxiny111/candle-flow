@@ -210,18 +210,20 @@ function buildMarkers(): SeriesMarker<string>[] {
     toShow = valid.filter((p) => recentDates.has(String(p.candle_date).slice(0, 10)))
   }
 
-  return toShow.map((p) => {
-    const highlighted = props.highlightPatternId != null && p.id === props.highlightPatternId
-    const bullish = p.direction === 'bullish'
-    return {
-      time: String(p.candle_date).slice(0, 10),
-      position: bullish ? ('belowBar' as const) : ('aboveBar' as const),
-      color: highlighted ? '#1890ff' : bullish ? '#f5222d' : '#52c41a',
-      shape: highlighted ? ('circle' as const) : bullish ? ('arrowUp' as const) : ('arrowDown' as const),
-      text: highlighted ? patternNameZh(p.pattern_name) : '',
-      size: highlighted ? 2 : 1,
-    }
-  })
+  return toShow
+    .map((p) => {
+      const highlighted = props.highlightPatternId != null && p.id === props.highlightPatternId
+      const bullish = p.direction === 'bullish'
+      return {
+        time: String(p.candle_date).slice(0, 10),
+        position: bullish ? ('belowBar' as const) : ('aboveBar' as const),
+        color: highlighted ? '#1890ff' : bullish ? '#f5222d' : '#52c41a',
+        shape: highlighted ? ('circle' as const) : bullish ? ('arrowUp' as const) : ('arrowDown' as const),
+        text: highlighted ? patternNameZh(p.pattern_name) : '',
+        size: highlighted ? 2 : 1,
+      }
+    })
+    .sort((a, b) => String(a.time).localeCompare(String(b.time)))
 }
 
 function scrollToDate(dateStr: string) {
@@ -270,13 +272,18 @@ function scheduleDefaultWindow(bars: KlineItem[]) {
 }
 
 function updateData(focusDate?: string) {
-  if (!candleSeries || !props.klineData.length) return
+  if (!chart || !candleSeries || !props.klineData.length) return
   const bars = sanitizeKlines(props.klineData)
   if (!bars.length) return
   const nextKey = dataKeyOf(bars)
   const dataChanged = nextKey !== lastDataKey
 
-  candleSeries.setData(toChartData(bars))
+  try {
+    candleSeries.setData(toChartData(bars))
+  } catch (e) {
+    console.warn('candlestick setData failed', e)
+    return
+  }
   if (volumeSeries) {
     volumeSeries.setData(
       bars.map((k) => ({
@@ -323,7 +330,13 @@ function updateData(focusDate?: string) {
   }
   const lastB = boll[boll.length - 1]
   bollLegend.value = lastB ? { mid: lastB.mid, upper: lastB.upper, lower: lastB.lower } : { mid: 0, upper: 0, lower: 0 }
-  candleSeries.setMarkers(buildMarkers())
+  try {
+    candleSeries.setMarkers(buildMarkers())
+  } catch (e) {
+    console.warn('candlestick setMarkers failed', e)
+    candleSeries.setMarkers([])
+  }
+  if (!chart || !candleSeries) return
   drawWindows(bars)
   drawRetracements(bars)
   candleSeries.priceScale().applyOptions({ autoScale: true, scaleMargins: { top: 0.08, bottom: 0.18 } })
@@ -459,6 +472,15 @@ onUnmounted(() => {
   clearWindowSeries()
   clearRetraceSeries()
   chart?.remove()
+  chart = null
+  candleSeries = null
+  volumeSeries = null
+  ma5Series = null
+  ma10Series = null
+  ma20Series = null
+  bollMidSeries = null
+  bollUpSeries = null
+  bollDnSeries = null
 })
 
 watch(
