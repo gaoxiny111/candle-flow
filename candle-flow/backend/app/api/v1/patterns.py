@@ -58,8 +58,8 @@ def list_patterns(
 def scan_patterns(body: PatternScanRequest, db: Session = Depends(get_db)):
     svc = PatternService(db)
     count = svc.scan(body.symbol, body.lookback_days)
-    SignalService(db).regenerate(body.symbol)
-    return ApiResponse(data=PatternScanResponse(found_count=count))
+    created = SignalService(db).regenerate(body.symbol)
+    return ApiResponse(data=PatternScanResponse(found_count=count, signals_created=created))
 
 
 @router.post("/patterns/scan/watchlist")

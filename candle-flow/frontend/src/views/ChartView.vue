@@ -164,6 +164,11 @@ function onSignalSelect(s: SignalItem) {
   highlightPatternId.value = matched?.id ?? null
 }
 
+function onPatternSelect(p: { id: number }) {
+  selectedSignal.value = null
+  highlightPatternId.value = p.id
+}
+
 onMounted(async () => {
   await config.restoreSession()
   await config.loadConfig()
@@ -246,6 +251,7 @@ watch(symbol, (s) => loadAll(s))
           :patterns="pattern.patterns"
           :is-index="isIndexSymbol(symbol)"
           @select-signal="onSignalSelect"
+          @select-pattern="onPatternSelect"
           @confirm-signal="onConfirm"
           @dismiss-signal="onDismiss"
         />

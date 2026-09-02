@@ -195,7 +195,8 @@ function calcMA(data: KlineItem[], period: number) {
 function buildMarkers(): SeriesMarker<string>[] {
   if (!props.markers?.length || !props.klineData.length) return []
 
-  const dates = new Set(sanitizeKlines(props.klineData).map((k) => barTime(k)))
+  const bars = sanitizeKlines(props.klineData)
+  const dates = new Set(bars.map((k) => barTime(k)))
   const valid = props.markers.filter((p) => dates.has(String(p.candle_date).slice(0, 10)))
 
   let toShow = valid
@@ -204,7 +205,9 @@ function buildMarkers(): SeriesMarker<string>[] {
   } else if (props.highlightPatternId != null) {
     toShow = valid.filter((p) => p.id === props.highlightPatternId)
   } else {
-    return []
+    // 默认展示近 7 个交易日的形态标注（与信号面板 lookback 一致）
+    const recentDates = new Set(bars.slice(-7).map((k) => barTime(k)))
+    toShow = valid.filter((p) => recentDates.has(String(p.candle_date).slice(0, 10)))
   }
 
   return toShow.map((p) => {

@@ -12,7 +12,7 @@ from app.core.nison_rules import (
     is_extended_high,
     pattern_stop,
 )
-from app.core.confluence import evaluate_confluence
+from app.core.confluence import SoftConflict, evaluate_confluence
 from app.core.price_targets import resolve_take_profits
 from app.core.windows import window_still_open
 from app.models.pattern import PatternRecord
@@ -287,6 +287,27 @@ class SignalService:
             )
         return base.model_copy(update=updates) if updates else base
 
+    def _level_from_confluence(
+        self,
+        pattern_score: float,
+        effective_count: float,
+        soft_items: list[SoftConflict],
+    ) -> str:
+        """形态分 + 加权汇聚；按软冲突类型分级惩罚。"""
+        combined = float(pattern_score) + effective_count * 6
+        cap_medium = False
+        for sc in soft_items:
+            if sc.kind == "emotion_extreme":
+                cap_medium = True
+            elif sc.kind == "structure_flaw":
+                cap_medium = True
+            elif sc.kind == "low_momentum":
+                combined -= 8
+        level = self._level_from_score(combined)
+        if cap_medium and level == "strong":
+            return "medium"
+        return level
+
     def _level_from_score(self, score: float) -> str:
         if score >= 80:
             return "strong"
@@ -346,11 +367,13 @@ class SignalService:
         capital: float,
         risk_pct: float,
         confluence_count: int = 0,
+        confluence_effective: float = 0.0,
         confluence_hits: str = "",
         confluence_detail: str = "",
         klines: Optional[list] = None,
         kline_index: Optional[int] = None,
         soft_warning: str = "",
+        soft_items: Optional[list[SoftConflict]] = None,
     ) -> bool:
         signal_type = "buy" if pattern.direction == "bullish" else "sell"
         if signal_type == "buy" and stop >= entry:
@@ -387,12 +410,12 @@ class SignalService:
             take_profit=Decimal(str(round(tp1, 4))),
         )
 
-        combined = float(pattern.score) + confluence_count * 6
-        # Soft conflicts (e.g. overbought chase) warn but do not veto; cap level.
-        if soft_warning and combined < 90:
-            level = "medium"
-        else:
-            level = self._level_from_score(combined)
+        eff = confluence_effective if confluence_effective > 0 else float(confluence_count)
+        level = self._level_from_confluence(
+            float(pattern.score),
+            eff,
+            soft_items or [],
+        )
         signal = TradingSignal(
             symbol=pattern.symbol,
             signal_type=signal_type,
@@ -493,11 +516,13 @@ class SignalService:
                 capital,
                 risk_pct,
                 confluence.count,
+                confluence.effective_count,
                 confluence.label,
                 confluence.details_json,
                 ordered,
                 idx,
                 soft_warning,
+                confluence.soft_conflict_items,
             ):
                 created += 1
         if created:
@@ -544,6 +569,7 @@ class SignalService:
         if not latest:
             return 0
         close = float(latest.close)
+        today = latest.date
         rows = (
             self.db.query(TradingSignal)
             .filter(
@@ -554,6 +580,9 @@ class SignalService:
         )
         closed = 0
         for s in rows:
+            # 形态日当天的 pending 保留展示，次日再按现价判断是否已达目标
+            if s.pattern_date and s.pattern_date >= today:
+                continue
             try:
                 entry = float(s.entry_price)
                 tp1 = float(s.take_profit_1) if s.take_profit_1 is not None else None

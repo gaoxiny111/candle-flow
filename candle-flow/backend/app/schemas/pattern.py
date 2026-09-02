@@ -24,6 +24,7 @@ class PatternScanRequest(BaseSchema):
 
 class PatternScanResponse(BaseSchema):
     found_count: int
+    signals_created: int = 0
 
 
 class WatchlistScanFailed(BaseSchema):

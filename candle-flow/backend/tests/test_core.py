@@ -168,9 +168,11 @@ def test_confluence_soft_conflict_chase_high():
         price *= 1.02
         bars.append(_K(price, price * 1.01, price * 0.995, 1500))
     result = evaluate_confluence(bars, len(bars) - 1, "bullish")
-    # Overbought chase is a soft warning, not a hard weekly veto.
-    assert any("高位" in c or "追涨" in c for c in result.soft_conflicts) or result.count < 2
-    assert not result.hard_conflicts
+    # 极端 RSI 触发硬否决；否则为情绪软冲突
+    chased = any("高位" in c or "追涨" in c for c in result.soft_conflicts)
+    extreme = any("极端" in c for c in result.conflicts)
+    assert chased or extreme or result.count < 2
+    assert not any(c.startswith("周线") for c in result.hard_conflicts) or extreme
 
 
 def test_window_fill_by_close_not_wick():
@@ -333,7 +335,7 @@ def test_false_break_is_conflict():
     bars[-1].close = last * 0.995
     bars[-1].open = last
     result = evaluate_confluence(bars, len(bars) - 1, "bullish")
-    assert result.blocked
+    assert any(sc.kind == "structure_flaw" for sc in result.soft_conflict_items)
 
 
 def test_to_weekly_and_trend():
