@@ -166,11 +166,24 @@ export interface MarketConfluenceItem {
   signal_level: string
   candle_date: string
   close: number
+  tier?: 'S' | 'A' | 'B' | string
+  net_profit?: number | null
+  debt_ratio?: number | null
 }
 
 export interface MarketConfluenceScanResult {
   items: MarketConfluenceItem[]
+  tiers?: {
+    S: MarketConfluenceItem[]
+    A: MarketConfluenceItem[]
+    B: MarketConfluenceItem[]
+  }
+  tier_counts?: { S: number; A: number; B: number }
   count: number
+  raw_hit_count?: number
+  bullish_count?: number
+  tiered_before_fund?: number
+  fund_removed?: number
   scanned: number
   universe_size: number
   skipped: number
