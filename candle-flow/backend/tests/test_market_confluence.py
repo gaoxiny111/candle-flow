@@ -4,6 +4,7 @@ from app.core.confluence import SoftConflict
 from app.services.market_confluence_service import (
     _apply_tiers,
     _combined_score,
+    _fund_reject_reasons,
     _is_candidate,
     _tier_of,
 )
@@ -46,3 +47,31 @@ def test_apply_tiers_only_keeps_b_and_above():
     assert [r["symbol"] for r in kept] == ["A", "B", "C"]
     assert counts == {"S": 1, "A": 1, "B": 1}
     assert tiers["S"][0]["tier"] == "S"
+
+
+def test_fund_reject_honghe_like_weak_quality():
+    """鸿合科技类：微利 + 净利暴跌 + 天价 PE → 应剔除。"""
+    reasons = _fund_reject_reasons(
+        profit=1e7,
+        debt=30.0,
+        roe=1.56,
+        profit_yoy=-74.65,
+        pe=514.5,
+    )
+    assert any("ROE" in r for r in reasons)
+    assert any("净利同比" in r for r in reasons)
+    assert any("PE" in r for r in reasons)
+
+
+def test_fund_pass_healthy():
+    assert _fund_reject_reasons(
+        profit=1e9,
+        debt=40.0,
+        roe=12.0,
+        profit_yoy=8.0,
+        pe=15.0,
+    ) == []
+
+
+def test_fund_missing_fields_not_rejected():
+    assert _fund_reject_reasons(profit=1e8) == []

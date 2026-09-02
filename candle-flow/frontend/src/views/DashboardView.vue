@@ -480,7 +480,7 @@ async function switchBoardTab(tab: 'watch' | 'market') {
         </div>
         <p class="market-desc">
           自动扫描主板非 ST，仅保留<strong>看涨</strong>强共振，再按综合强度分层：
-          S≥120 核心池 / A 115–119 观察池 / B 110–114 备选池；并剔除亏损、负债率&gt;70%。
+          S≥120 核心池 / A 115–119 观察池 / B 110–114 备选池；并剔除亏损、负债率&gt;70%、ROE&lt;5%、净利同比&lt;-30%、PE&gt;80。
         </p>
         <p v-if="marketScanHint" class="scan-hint">{{ marketScanHint }}</p>
         <p v-if="marketScanError" class="follow-error">{{ marketScanError }}</p>
@@ -537,6 +537,8 @@ async function switchBoardTab(tab: 'watch' | 'market') {
                 <th>形态</th>
                 <th>共振</th>
                 <th>综合强度</th>
+                <th>ROE</th>
+                <th>PE</th>
                 <th>负债率</th>
                 <th>日期</th>
                 <th>操作</th>
@@ -569,6 +571,12 @@ async function switchBoardTab(tab: 'watch' | 'market') {
                   </div>
                 </td>
                 <td class="score-cell strong">{{ item.combined_score }}</td>
+                <td class="div-cell">
+                  {{ item.roe != null ? item.roe.toFixed(1) + '%' : '—' }}
+                </td>
+                <td class="div-cell">
+                  {{ item.pe_ttm != null ? item.pe_ttm.toFixed(1) : '—' }}
+                </td>
                 <td class="div-cell">
                   {{ item.debt_ratio != null ? item.debt_ratio.toFixed(1) + '%' : '—' }}
                 </td>

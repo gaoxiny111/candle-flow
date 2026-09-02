@@ -26,6 +26,8 @@ from app.services.fundamental_screen import (
 )
 from app.services.kline_service import KlineService
 from app.services.stock_universe import ensure_seeded, lookup_name
+from app.services.valuation import get_valuations
+from app.services.watchlist import MAX_WATCHLIST
 from app.utils.symbol import SymbolError, normalize_symbol
 
 logger = logging.getLogger(__name__)
@@ -40,8 +42,11 @@ TIER_B_MIN = 110.0
 TIER_A_MIN = 115.0
 TIER_S_MIN = 120.0
 DEBT_MAX = 70.0
+ROE_MIN = 5.0  # 过低盈利能力（如 ROE 1.5%）剔除
+PROFIT_YOY_MIN = -30.0  # 最新净利同比暴跌剔除
+PE_MAX = 80.0  # 估值极端（PE>80 且为正）剔除
 CACHE_TTL_SEC = 600
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 
 Outcome = Literal["hit", "ok", "skipped", "error"]
 Tier = Literal["S", "A", "B"]
@@ -79,6 +84,32 @@ def _tier_of(score: float) -> Tier | None:
     if score >= TIER_B_MIN:
         return "B"
     return None
+
+
+def _fund_reject_reasons(
+    *,
+    name: str = "",
+    profit: float | None = None,
+    debt: float | None = None,
+    roe: float | None = None,
+    profit_yoy: float | None = None,
+    pe: float | None = None,
+) -> list[str]:
+    """基本面排雷原因；有数据才判定，缺字段不拦截。"""
+    if is_st_name(name) or "退" in name:
+        return ["ST/退市"]
+    reasons: list[str] = []
+    if profit is not None and profit < 0:
+        reasons.append("亏损")
+    if debt is not None and debt > DEBT_MAX:
+        reasons.append(f"负债率{debt:.0f}%")
+    if roe is not None and roe < ROE_MIN:
+        reasons.append(f"ROE{roe:.1f}%")
+    if profit_yoy is not None and profit_yoy < PROFIT_YOY_MIN:
+        reasons.append(f"净利同比{profit_yoy:.0f}%")
+    if pe is not None and pe > 0 and pe > PE_MAX:
+        reasons.append(f"PE{pe:.0f}")
+    return reasons
 
 
 def _apply_tiers(items: list[dict]) -> tuple[list[dict], dict[str, list[dict]], dict[str, int]]:
@@ -185,12 +216,33 @@ class MarketConfluenceService:
         finally:
             db.close()
 
+    def _pe_map(self, symbols: list[str]) -> dict[str, float]:
+        """批量取 PE_TTM（按关注列表上限分批）。"""
+        out: dict[str, float] = {}
+        if not symbols:
+            return out
+        batch_size = max(1, int(MAX_WATCHLIST) or 50)
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i : i + batch_size]
+            try:
+                for v in get_valuations(batch, db=self.db):
+                    pe = v.get("pe_ttm")
+                    sym = v.get("symbol")
+                    if sym and pe is not None:
+                        try:
+                            out[str(sym)] = float(pe)
+                        except (TypeError, ValueError):
+                            continue
+            except Exception as exc:
+                logger.warning("market scan PE enrich failed: %s", exc)
+        return out
+
     def _fundamental_screen(self, items: list[dict]) -> tuple[list[dict], int]:
-        """第三层：亏损 / 高负债排雷（ST 已在宇宙阶段剔除；商誉暂无可靠字段）。"""
+        """第三层排雷：亏损/高负债/低ROE/净利暴跌/极高PE（ST 已在宇宙阶段剔除）。"""
         if not items:
             return [], 0
         removed = 0
-        profit_map: dict[str, float] = {}
+        fund_map: dict[str, dict[str, float]] = {}
         debt_map: dict[str, float] = {}
         try:
             snap_date, snap_df = resolve_latest_report_frame()
@@ -199,9 +251,18 @@ class MarketConfluenceService:
                     sym = _to_symbol(row.get("股票代码"))
                     if not sym:
                         continue
+                    entry: dict[str, float] = {}
                     np_ = _num(row.get("净利润")) or _num(row.get("归母净利润")) or _num(row.get("净利润-净利润"))
                     if np_ is not None:
-                        profit_map[sym] = float(np_)
+                        entry["net_profit"] = float(np_)
+                    roe = _num(row.get("净资产收益率"))
+                    if roe is not None:
+                        entry["roe"] = float(roe)
+                    py = _num(row.get("净利润-同比增长")) or _num(row.get("净利润同比增长"))
+                    if py is not None:
+                        entry["profit_yoy"] = float(py)
+                    if entry:
+                        fund_map[sym] = entry
             # 负债率优先用最近年报
             debt_date = str(snap_date or "")
             if debt_date and not debt_date.endswith("1231") and len(debt_date) >= 4:
@@ -211,20 +272,26 @@ class MarketConfluenceService:
         except Exception as exc:
             logger.warning("market scan fundamental enrich failed: %s", exc)
 
+        pe_map = self._pe_map([r["symbol"] for r in items])
+
         kept: list[dict] = []
         for row in items:
             sym = row["symbol"]
             name = row.get("name") or ""
-            if is_st_name(name) or "退" in name:
-                removed += 1
-                continue
-            profit = profit_map.get(sym)
+            fund = fund_map.get(sym) or {}
+            profit = fund.get("net_profit")
+            roe = fund.get("roe")
+            profit_yoy = fund.get("profit_yoy")
             debt = debt_map.get(sym)
-            reasons: list[str] = []
-            if profit is not None and profit < 0:
-                reasons.append("亏损")
-            if debt is not None and debt > DEBT_MAX:
-                reasons.append(f"负债率{debt:.0f}%")
+            pe = pe_map.get(sym)
+            reasons = _fund_reject_reasons(
+                name=name,
+                profit=profit,
+                debt=debt,
+                roe=roe,
+                profit_yoy=profit_yoy,
+                pe=pe,
+            )
             if reasons:
                 removed += 1
                 continue
@@ -233,6 +300,12 @@ class MarketConfluenceService:
                 enriched["net_profit"] = profit
             if debt is not None:
                 enriched["debt_ratio"] = round(float(debt), 2)
+            if roe is not None:
+                enriched["roe"] = round(float(roe), 2)
+            if profit_yoy is not None:
+                enriched["profit_yoy"] = round(float(profit_yoy), 2)
+            if pe is not None:
+                enriched["pe_ttm"] = round(float(pe), 1)
             kept.append(enriched)
         return kept, removed
 
@@ -293,7 +366,7 @@ class MarketConfluenceService:
             "cache_age_sec": 0,
             "description": (
                 "仅看涨；按综合强度分 S(≥120)/A(115-119)/B(110-114)；"
-                "并剔除亏损、负债率>70%、ST/退市风险股"
+                "并剔除亏损、负债率>70%、ROE<5%、净利同比<-30%、PE>80、ST/退市风险股"
             ),
         }
         _cache["ts"] = now

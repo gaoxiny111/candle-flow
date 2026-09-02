@@ -169,6 +169,9 @@ export interface MarketConfluenceItem {
   tier?: 'S' | 'A' | 'B' | string
   net_profit?: number | null
   debt_ratio?: number | null
+  roe?: number | null
+  profit_yoy?: number | null
+  pe_ttm?: number | null
 }
 
 export interface MarketConfluenceScanResult {
