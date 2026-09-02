@@ -9,6 +9,7 @@ from app.models.user_config import UserConfig
 from app.schemas.common import ApiResponse, ResponseMeta
 from app.schemas.signal import SignalConfirmRequest, SignalOut
 from app.services.kline_service import KlineService
+from app.services.market_confluence_service import MarketConfluenceService
 from app.services.signal_service import SignalService
 from app.services.watchlist import parse_watchlist
 
@@ -53,6 +54,28 @@ def list_signals(
         data=[svc.to_signal_out(i, quotes.get(i.symbol)) for i in items],
         meta=ResponseMeta(page=page, page_size=page_size, total=total),
     )
+
+
+@router.get("/signals/market-scan")
+def get_market_confluence_scan(db: Session = Depends(get_db)):
+    """返回最近一次全市场强共振扫描缓存（若无则触发一次扫描）。"""
+    svc = MarketConfluenceService(db)
+    cached = svc.latest()
+    if cached is not None:
+        return ApiResponse(data=cached)
+    data = svc.scan_market(force=False)
+    return ApiResponse(data=data)
+
+
+@router.post("/signals/scan/market")
+def scan_market_confluence(
+    recent_bars: int = Query(2, ge=1, le=5),
+    force: bool = Query(False),
+    db: Session = Depends(get_db),
+):
+    """扫描本地已有 K 线的主板股票，筛选今日强技术共振信号。"""
+    data = MarketConfluenceService(db).scan_market(recent_bars=recent_bars, force=force)
+    return ApiResponse(data=data)
 
 
 @router.post("/signals/confirm")

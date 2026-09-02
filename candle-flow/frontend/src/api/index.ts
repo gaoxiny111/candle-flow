@@ -147,6 +147,52 @@ export const fetchSignals = (symbol?: string, status?: string, watchlistOnly = f
 export const confirmSignal = (signal_id: number, action: 'confirm' | 'dismiss') =>
   api.post<ApiResponse<SignalItem>>('/signals/confirm', { signal_id, action })
 
+export interface MarketConfluenceHit {
+  name: string
+  detail: string
+}
+
+export interface MarketConfluenceItem {
+  symbol: string
+  name: string
+  direction: 'bullish' | 'bearish' | string
+  pattern_name: string
+  pattern_score: number
+  confluence_count: number
+  confluence_effective: number
+  confluence_hits: string
+  confluence_detail: MarketConfluenceHit[]
+  combined_score: number
+  signal_level: string
+  candle_date: string
+  close: number
+}
+
+export interface MarketConfluenceScanResult {
+  items: MarketConfluenceItem[]
+  count: number
+  scanned: number
+  universe_size: number
+  skipped: number
+  errors: number
+  recent_bars: number
+  cached: boolean
+  cache_age_sec: number
+  description?: string
+}
+
+export const fetchMarketConfluenceScan = () =>
+  api.get<ApiResponse<MarketConfluenceScanResult>>('/signals/market-scan', { timeout: 300000 })
+
+export const scanMarketConfluence = (opts?: { force?: boolean; recent_bars?: number }) =>
+  api.post<ApiResponse<MarketConfluenceScanResult>>('/signals/scan/market', null, {
+    timeout: 300000,
+    params: {
+      force: opts?.force ?? false,
+      recent_bars: opts?.recent_bars ?? 2,
+    },
+  })
+
 export const calculateRisk = (params: {
   entry_price: number
   stop_loss: number

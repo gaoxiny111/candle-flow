@@ -6,8 +6,8 @@ import { usePatternStore } from '@/stores/pattern'
 import { useSignalStore } from '@/stores/signal'
 import { useConfigStore } from '@/stores/config'
 import { useWatchlistStore } from '@/stores/watchlist'
-import { apiErrorText, fetchFundamentalAnalysis, fetchValuations, resolveSymbolQuery } from '@/api'
-import type { FundamentalAnalysisReport, SymbolValuation } from '@/api'
+import { apiErrorText, fetchFundamentalAnalysis, fetchValuations, resolveSymbolQuery, scanMarketConfluence } from '@/api'
+import type { FundamentalAnalysisReport, MarketConfluenceItem, SymbolValuation } from '@/api'
 import { directionZh, patternNameZh } from '@/utils/labels'
 import { rememberSymbol, symbolName, tryNormalizeSymbol } from '@/utils/symbol'
 import SymbolSearch from '@/components/SymbolSearch.vue'
@@ -26,8 +26,15 @@ const valuationLoading = ref(false)
 const analysisLoading = ref(false)
 const analysisError = ref('')
 const analysisBySymbol = ref<Record<string, FundamentalAnalysisReport>>({})
+const boardTab = ref<'watch' | 'market'>('watch')
+const marketScanning = ref(false)
+const marketScanError = ref('')
+const marketScanHint = ref('')
+const marketItems = ref<MarketConfluenceItem[]>([])
+const marketStats = ref<{ scanned: number; universe_size: number; count: number; cached: boolean } | null>(null)
 let percentileTimer: ReturnType<typeof setTimeout> | null = null
 let analysisToken = 0
+let marketLoaded = false
 
 const watchedPatterns = computed(() => {
   const set = new Set(watchlist.symbols.map((s) => s.toUpperCase()))
@@ -276,6 +283,42 @@ async function loadAnalysisReports() {
 function openDetail(sym: string) {
   router.push(`/chart/${sym}`)
 }
+
+async function loadMarketScan(force = false) {
+  marketScanning.value = true
+  marketScanError.value = ''
+  marketScanHint.value = force ? '正在重新扫描全市场…' : '正在扫描全市场强技术共振信号…'
+  try {
+    const { data } = await scanMarketConfluence({ force, recent_bars: 2 })
+    const payload = data.data
+    marketItems.value = payload?.items || []
+    marketStats.value = payload
+      ? {
+          scanned: payload.scanned,
+          universe_size: payload.universe_size,
+          count: payload.count,
+          cached: payload.cached,
+        }
+      : null
+    marketLoaded = true
+    const age = payload?.cache_age_sec
+    marketScanHint.value = payload?.cached
+      ? `已展示缓存结果（${age ?? 0}s 前），共 ${payload.count} 只强共振`
+      : `已扫描 ${payload?.scanned ?? 0} 只，发现 ${payload?.count ?? 0} 只强共振`
+  } catch (e) {
+    marketScanError.value = apiErrorText(e, '市场扫描失败')
+    marketScanHint.value = ''
+  } finally {
+    marketScanning.value = false
+  }
+}
+
+async function switchBoardTab(tab: 'watch' | 'market') {
+  boardTab.value = tab
+  if (tab === 'market' && !marketLoaded && !marketScanning.value) {
+    await loadMarketScan(false)
+  }
+}
 </script>
 
 <template>
@@ -295,6 +338,28 @@ function openDetail(sym: string) {
     </section>
 
     <section class="card">
+      <div class="board-tabs" role="tablist">
+        <button
+          type="button"
+          class="board-tab"
+          :class="{ active: boardTab === 'watch' }"
+          role="tab"
+          @click="switchBoardTab('watch')"
+        >
+          我的关注
+        </button>
+        <button
+          type="button"
+          class="board-tab"
+          :class="{ active: boardTab === 'market' }"
+          role="tab"
+          @click="switchBoardTab('market')"
+        >
+          市场扫描
+        </button>
+      </div>
+
+      <template v-if="boardTab === 'watch'">
       <div class="watch-head">
         <h2>我的关注</h2>
         <span v-if="analysisLoading || valuationLoading" class="hold-scanning">正在更新…</span>
@@ -367,10 +432,91 @@ function openDetail(sym: string) {
         </article>
       </div>
       </template>
+      </template>
+
+      <template v-else>
+        <div class="watch-head">
+          <h2>市场扫描</h2>
+          <div class="watch-head-actions">
+            <span v-if="marketScanning" class="hold-scanning">扫描中…</span>
+            <button
+              type="button"
+              class="btn-secondary"
+              :disabled="marketScanning"
+              @click="loadMarketScan(true)"
+            >
+              重新扫描
+            </button>
+          </div>
+        </div>
+        <p class="market-desc">
+          自动扫描全市场（本地已有 K 线的主板非 ST），筛选今日出现
+          <strong>强技术共振信号</strong>
+          的股票。例如同时出现「看涨吞没 + RSI 超卖 + 站上 20 日均线」时会在这里高亮，便于快速发现潜在交易机会。
+        </p>
+        <p v-if="marketScanHint" class="scan-hint">{{ marketScanHint }}</p>
+        <p v-if="marketScanError" class="follow-error">{{ marketScanError }}</p>
+        <p v-if="marketStats" class="scan-meta">
+          宇宙 {{ marketStats.universe_size }} · 已扫 {{ marketStats.scanned }} · 命中 {{ marketStats.count }}
+          <span v-if="marketStats.cached"> · 缓存</span>
+        </p>
+
+        <div v-if="!marketScanning && !marketItems.length && !marketScanError" class="empty">
+          暂无强共振信号。可点「重新扫描」，或先在图表页同步更多股票的 K 线。
+        </div>
+        <div v-else-if="marketItems.length" class="watch-table-wrap">
+          <table class="watch-table market-table">
+            <thead>
+              <tr>
+                <th>股票</th>
+                <th>代码</th>
+                <th>方向</th>
+                <th>形态</th>
+                <th>共振</th>
+                <th>综合强度</th>
+                <th>日期</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="item in marketItems"
+                :key="item.symbol + item.pattern_name + item.candle_date"
+                class="watch-row market-hit"
+              >
+                <td class="symbol-name">{{ item.name || '—' }}</td>
+                <td class="symbol-code">{{ item.symbol.split('.')[0] }}</td>
+                <td>
+                  <span :class="['badge', item.direction === 'bullish' ? 'badge-bullish' : 'badge-bearish']">
+                    {{ item.direction === 'bullish' ? '看涨' : '看跌' }}
+                  </span>
+                </td>
+                <td>
+                  <div class="pattern-cell">{{ patternNameZh(item.pattern_name) }}</div>
+                  <div class="muted">形态分 {{ item.pattern_score }}</div>
+                </td>
+                <td>
+                  <div class="confluence-highlight">汇聚 {{ item.confluence_count }} 项</div>
+                  <div class="hit-tags">
+                    <span v-for="h in item.confluence_detail.slice(0, 4)" :key="h.name" class="hit-tag">
+                      {{ h.name }}
+                    </span>
+                  </div>
+                </td>
+                <td class="score-cell strong">{{ item.combined_score }}</td>
+                <td>{{ item.candle_date }}</td>
+                <td>
+                  <button type="button" class="link-btn" @click="openDetail(item.symbol)">详情</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </template>
     </section>
 
 
-    <section class="card recent-patterns">
+    <section v-if="boardTab === 'watch'" class="card recent-patterns">
       <h2>最近形态</h2>
       <div v-if="!watchlist.symbols.length" class="empty">在搜索结果里点「加自选」，这里只展示自选股的蜡烛形态。</div>
       <div v-else-if="!recentPatterns.length" class="empty">
@@ -500,6 +646,49 @@ th { color: var(--text-secondary); font-weight: 500; }
   color: var(--color-primary);
   border-bottom-color: var(--color-primary);
 }
+.market-desc {
+  color: var(--text-secondary);
+  font-size: 14px;
+  line-height: 1.65;
+  margin: 0 0 var(--space-md);
+}
+.market-desc strong { color: var(--text-primary); font-weight: 650; }
+.scan-hint { font-size: 13px; color: var(--text-secondary); margin: 0 0 8px; }
+.scan-meta { font-size: 12px; color: var(--text-secondary); margin: 0 0 var(--space-md); }
+.market-hit { background: rgba(82, 196, 26, 0.04); }
+.market-hit:hover { background: rgba(24, 144, 255, 0.06); }
+.confluence-highlight { font-weight: 650; color: #389e0d; }
+.hit-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.hit-tag {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(82, 196, 26, 0.12);
+  color: #389e0d;
+}
+.pattern-cell { font-weight: 600; }
+.muted { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+.score-cell.strong { color: #389e0d; }
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.badge-bullish { background: rgba(82, 196, 26, 0.15); color: #389e0d; }
+.badge-bearish { background: rgba(245, 34, 45, 0.12); color: #cf1322; }
+.btn-secondary {
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-primary);
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.btn-secondary:disabled { opacity: 0.55; cursor: not-allowed; }
+.hold-scanning { font-size: 13px; color: var(--text-secondary); }
 .watch-tabs {
   display: flex;
   gap: 0;
