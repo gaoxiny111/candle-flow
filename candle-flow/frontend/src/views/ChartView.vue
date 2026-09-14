@@ -14,7 +14,7 @@ import { useConfigStore } from '@/stores/config'
 import { useWatchlistStore } from '@/stores/watchlist'
 import { resolveSymbolQuery } from '@/api'
 import { patternNameZh } from '@/utils/labels'
-import { rememberSymbol, formatSymbol, tryNormalizeSymbol, isIndexSymbol } from '@/utils/symbol'
+import { rememberSymbol, formatSymbol, tryNormalizeSymbol, isEtfSymbol, isIndexSymbol } from '@/utils/symbol'
 import { mapPatternsToWeekly, toWeekly, weeklyBias } from '@/utils/timeframe'
 import type { SignalItem } from '@/api'
 
@@ -74,6 +74,7 @@ const displayPatterns = computed(() =>
 )
 const weekBias = computed(() => weeklyBias(kline.klineList))
 const watched = computed(() => watchlist.has(symbol.value))
+const isEtf = computed(() => isEtfSymbol(symbol.value))
 
 function setPeriod(period: 'daily' | 'weekly') {
   kline.currentPeriod = period
@@ -178,9 +179,13 @@ onMounted(async () => {
   if (config.preferredPeriod === 'weekly' || config.preferredPeriod === 'daily') {
     kline.currentPeriod = config.preferredPeriod
   }
+  if (isEtf.value) activeTab.value = 'pattern'
   loadAll(symbol.value)
 })
-watch(symbol, (s) => loadAll(s))
+watch(symbol, (s) => {
+  if (isEtfSymbol(s)) activeTab.value = 'pattern'
+  loadAll(s)
+})
 </script>
 
 <template>
@@ -223,6 +228,7 @@ watch(symbol, (s) => loadAll(s))
 
     <div class="chart-tabs card" role="tablist">
       <button
+        v-if="!isEtf"
         type="button"
         role="tab"
         class="chart-tab"

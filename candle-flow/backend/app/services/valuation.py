@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 from app.services.watchlist import MAX_WATCHLIST
-from app.utils.symbol import SymbolError, is_b_share, is_future, normalize_symbol, parse_symbol
+from app.utils.symbol import SymbolError, is_b_share, is_etf_symbol, is_future, normalize_symbol, parse_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +235,11 @@ def _fetch_quotes(symbols: list[str]) -> dict[str, dict[str, Any]]:
     if missing:
         data.update(_fetch_tencent(missing))
     # 东财部分失败时，腾讯命中的票再试一次补股息
-    need_dy = [s for s in symbols if data.get(s) and data[s].get("dividend_yield") is None]
+    need_dy = [
+        s
+        for s in symbols
+        if data.get(s) and data[s].get("dividend_yield") is None and not is_etf_symbol(s)
+    ]
     if need_dy:
         for s, item in _fetch_eastmoney(need_dy).items():
             dy = item.get("dividend_yield")
@@ -561,5 +565,7 @@ def get_valuations(symbols: list[str], *, now: Optional[float] = None, db: Any =
         item["pe_percentile"] = percentile_rank(item.get("pe_ttm"), pe_s)
         item["pb_percentile"] = percentile_rank(item.get("pb"), pb_s)
         item["percentiles_pending"] = symbol in pending_set
+        if is_etf_symbol(symbol):
+            item["dividend_yield"] = None
         rows.append(item)
     return rows

@@ -12,6 +12,7 @@ from app.analysis.config import MODULE_WEIGHTS, RISK_THRESHOLD
 from app.analysis.financials import build_financial_dataframe, industry_averages
 from app.analysis.models.dcf import DCFModel
 from app.analysis.models.relative import RelativeValuation
+from app.analysis.models.comps import calculate_comparable_valuation
 from app.analysis.modules.cashflow import CashflowAnalyzer
 from app.analysis.modules.efficiency import EfficiencyAnalyzer
 from app.analysis.modules.growth import GrowthAnalyzer
@@ -20,7 +21,7 @@ from app.analysis.modules.profitability import ProfitabilityAnalyzer
 from app.analysis.modules.risk import RiskAnalyzer
 from app.analysis.modules.solvency import SolvencyAnalyzer
 from app.services.valuation import get_valuations
-from app.utils.symbol import normalize_symbol
+from app.utils.symbol import is_etf_symbol, normalize_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -103,15 +104,17 @@ class FundamentalEngine:
         **kwargs,
     ) -> dict[str, Any]:
         sym = normalize_symbol(symbol)
+        if is_etf_symbol(sym):
+            return skipped_etf_report(sym)
         fin_df, meta = build_financial_dataframe(sym)
+        meta["symbol"] = sym
         market: dict[str, Any] = {}
-        if db is not None:
-            try:
-                vals = get_valuations([sym], db=db)
-                if vals:
-                    market = vals[0]
-            except Exception:
-                pass
+        try:
+            vals = get_valuations([sym], db=db)
+            if vals:
+                market = vals[0]
+        except Exception:
+            pass
 
         symbol_roe = meta.get("latest_roe")
         if symbol_roe is None and not fin_df.empty and "roe" in fin_df.columns:
@@ -134,7 +137,7 @@ class FundamentalEngine:
         for name, analyzer in self.analyzers.items():
             module_results[name] = analyzer.analyze(fin_df, **ctx)
 
-        valuation = self._run_valuation(fin_df, market, meta)
+        valuation = self._run_valuation(fin_df, market, meta, db=db)
         val_score = float(valuation.get("composite_valuation_score", 50.0))
 
         # 对照报告：盈利/成长/偿债/现金流/估值 加权；效率与行业仅展示
@@ -186,7 +189,7 @@ class FundamentalEngine:
             "summary": self._generate_summary(composite, letter, module_results, all_warnings, val_score),
         }
 
-    def _run_valuation(self, fin_df: pd.DataFrame, market: dict, meta: dict) -> dict:
+    def _run_valuation(self, fin_df: pd.DataFrame, market: dict, meta: dict, db: Session | None = None) -> dict:
         result: dict[str, Any] = {}
         pe = market.get("pe_ttm")
         pb = market.get("pb")
@@ -200,8 +203,40 @@ class FundamentalEngine:
             "PS": None,
             "profit_growth_rate": meta.get("profit_yoy"),
         }
+
+        comps: dict[str, Any] = {}
+        industry_frame = None
+        try:
+            comps = calculate_comparable_valuation(
+                meta.get("symbol") or market.get("symbol") or "",
+                market=market,
+                meta=meta,
+                fin_df=fin_df,
+                db=db,
+            )
+            result["comps"] = comps
+            # 喂给相对估值：行业 PE/PB 中位数（用可比公司均值近似）
+            if comps.get("avg_pe") is not None or comps.get("avg_pb") is not None:
+                row: dict[str, float] = {}
+                if comps.get("avg_pe") is not None:
+                    row["PE_TTM"] = float(comps["avg_pe"])
+                if comps.get("avg_pb") is not None:
+                    row["PB"] = float(comps["avg_pb"])
+                industry_frame = pd.DataFrame([row])
+        except Exception as e:
+            logger.warning("comparable valuation failed: %s", e)
+            result["comps"] = {
+                "stock_code": meta.get("symbol") or "",
+                "comparables": [],
+                "avg_pe": None,
+                "avg_pb": None,
+                "valuation_range": {},
+                "warning": f"可比估值计算失败: {e}",
+                "peer_count": 0,
+            }
+
         rv = RelativeValuation()
-        rel = rv.analyze(current, history=None, industry=None)
+        rel = rv.analyze(current, history=None, industry=industry_frame)
         # 无历史分位时，用绝对估值给信号（避免 PE 有值却 signal=「—」不参与打分）
         if pe is not None and "PE_TTM" in rel and rel["PE_TTM"].get("signal") in (None, "—"):
             p = float(pe)
@@ -237,6 +272,11 @@ class FundamentalEngine:
                 "signal": "低估" if dy >= 5 else ("合理" if dy >= 2 else "高估"),
                 "percentile_5y": None,
             }
+        # 可比公司信号优先补强相对估值
+        comps_signal = (comps or {}).get("signal")
+        if comps_signal and pe is not None and "PE_TTM" in rel:
+            if rel["PE_TTM"].get("signal") in (None, "—"):
+                rel["PE_TTM"]["signal"] = comps_signal
         result["relative"] = rel
 
         scores: list[float] = []
@@ -255,6 +295,10 @@ class FundamentalEngine:
             scores.append(75)
         if div is not None and float(div) >= 6:
             scores.append(90)
+        if comps_signal == "低估":
+            scores.append(82)
+        elif comps_signal == "高估":
+            scores.append(40)
         result["composite_valuation_score"] = sum(scores) / len(scores) if scores else 55.0
 
         if not fin_df.empty:
@@ -417,6 +461,34 @@ class FundamentalEngine:
             for w in warnings[:5]:
                 lines.append(f"  · {w}")
         return "\n".join(lines)
+
+
+def skipped_etf_report(symbol: str) -> dict[str, Any]:
+    """ETF 不跑个股财报模型：股息率 / 综合分 / 评级留空。"""
+    return {
+        "symbol": symbol,
+        "name": "",
+        "industry": "",
+        "report_dates": [],
+        "composite_score": None,
+        "final_rating": None,
+        "final_rating_letter": None,
+        "modules": {},
+        "valuation": {},
+        "market": {
+            "price": None,
+            "pe_ttm": None,
+            "pb": None,
+            "pe_percentile": None,
+            "pb_percentile": None,
+            "market_cap": None,
+            "dividend_yield": None,
+        },
+        "warnings": [],
+        "summary": "ETF 不适用个股基本面评分，已跳过股息率、综合分与评级。",
+        "skipped": True,
+        "skip_reason": "etf",
+    }
 
 
 def analyze_symbol_full(db: Session, symbol: str, **kwargs) -> dict[str, Any]:

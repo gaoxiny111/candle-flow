@@ -464,7 +464,62 @@ export interface BullTacticRule {
 }
 
 export const fetchBullTacticRules = () =>
-  api.get<ApiResponse<{ tactics: BullTacticRule[]; universe: string }>>('/bull-tactics/rules')
+  api.get<ApiResponse<{ tactics: BullTacticRule[]; universe: string; schedule?: string }>>('/bull-tactics/rules')
+
+export interface BullTacticDailyItem {
+  symbol: string
+  name: string
+  tactic: string
+  score: number
+  buy_date: string
+  buy_price: number
+  setup_date?: string
+  details?: Record<string, unknown>
+}
+
+export interface BullTacticDailyReport {
+  status?: string
+  ready?: boolean
+  trade_date?: string
+  generated_at?: string
+  scanned?: number
+  universe_size?: number
+  scan_skipped?: number
+  recent_hit_count?: number
+  count: number
+  counts?: Record<string, number>
+  items: BullTacticDailyItem[]
+  by_tactic?: Record<string, { symbol: string; name: string; score: number; buy_price: number }[]>
+  message?: string
+  error?: string
+  sync?: {
+    status?: string
+    needed?: number
+    synced?: number
+    skipped_fresh?: number
+    errors?: number
+    incremental?: boolean
+    elapsed_sec?: number
+  }
+  kline?: {
+    universe_size?: number
+    with_bars?: number
+    fresh_to_trade_date?: number
+    db_latest_date?: string | null
+    trade_date?: string
+    ratio?: number
+    stale?: boolean
+    ready?: boolean
+  }
+}
+
+export const fetchBullTacticsDaily = (tradeDate?: string) =>
+  api.get<ApiResponse<BullTacticDailyReport>>('/bull-tactics/daily', {
+    params: { trade_date: tradeDate || undefined },
+  })
+
+export const runBullTacticsDaily = () =>
+  api.post<ApiResponse<BullTacticDailyReport>>('/bull-tactics/daily/run', null, { timeout: 900000 })
 
 export const scanBullTacticsSymbol = (symbol: string, recentBars = 30, tactic?: string) =>
   api.get<ApiResponse<BullTacticScanRow>>(`/bull-tactics/scan/${encodeURIComponent(symbol)}`, {
@@ -682,22 +737,59 @@ export interface AnalysisModule {
   metadata?: Record<string, unknown>
 }
 
+export interface CompPeer {
+  symbol: string
+  name: string
+  pe?: number | null
+  pb?: number | null
+  market_cap?: number | null
+  price?: number | null
+}
+
+export interface CompValRange {
+  mid?: number
+  low: number
+  high: number
+}
+
+export interface ComparableValuation {
+  stock_code: string
+  industry?: string
+  comparables: CompPeer[]
+  avg_pe?: number | null
+  avg_pb?: number | null
+  valuation_range: {
+    pe_based?: CompValRange
+    pb_based?: CompValRange
+  }
+  target?: {
+    net_profit?: number
+    net_assets?: number | null
+    total_shares?: number
+    price?: number | null
+  }
+  signal?: string | null
+  warning?: string | null
+  peer_count?: number
+}
+
 export interface FundamentalAnalysisReport {
   symbol: string
   name: string
   industry: string
   report_dates: string[]
-  composite_score: number
-  final_rating: string
+  composite_score: number | null
+  final_rating: string | null
   modules: Record<string, AnalysisModule>
   valuation: {
-    relative?: Record<string, { current?: number; percentile_5y?: number | null; signal?: string; value?: number }>
+    relative?: Record<string, { current?: number; percentile_5y?: number | null; signal?: string; value?: number; industry_median?: number | null }>
     dcf?: {
       intrinsic_value_per_share?: number | null
       margin_of_safety_pct?: number
       note?: string
       assumptions?: Record<string, number>
     }
+    comps?: ComparableValuation
     composite_valuation_score?: number
   }
   market: {
@@ -711,6 +803,8 @@ export interface FundamentalAnalysisReport {
   }
   warnings: string[]
   summary: string
+  skipped?: boolean
+  skip_reason?: string
 }
 
 export const fetchFundamentalAnalysis = async (symbol: string) => {

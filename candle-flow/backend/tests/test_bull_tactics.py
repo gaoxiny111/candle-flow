@@ -82,10 +82,12 @@ def test_n_fanbao_detects_pullback():
 
 
 def test_niu_sanjue_gap_hold():
-    candles = [_c(i, 10.0, 10.4, 9.9, 10.0 + i * 0.02, 1_000_000) for i in range(45)]
+    candles = [_c(i, 10.0, 10.3, 9.9, 10.0, 1_000_000) for i in range(45)]
     prev = candles[-1]
-    gap_open = prev.high + 0.2
-    signal = Candle(gap_open, gap_open + 0.8, gap_open + 0.02, gap_open + 0.6, 2_500_000, datetime(2026, 3, 1))
+    # 跳空高开 + 涨幅≥7% 大阳
+    gap_open = prev.high + 0.15  # 10.45
+    close = round(prev.close * 1.08, 2)  # 10.80
+    signal = Candle(gap_open, close + 0.05, gap_open - 0.02, close, 2_500_000, datetime(2026, 3, 1))
     candles.append(signal)
     # 缩量回踩：守开盘价、守 MA39
     candles.append(

@@ -9,7 +9,7 @@ import { useWatchlistStore } from '@/stores/watchlist'
 import { apiErrorText, fetchFundamentalAnalysis, fetchValuations, resolveSymbolQuery, scanMarketConfluence } from '@/api'
 import type { FundamentalAnalysisReport, MarketConfluenceItem, SymbolValuation } from '@/api'
 import { directionZh, patternNameZh } from '@/utils/labels'
-import { rememberSymbol, symbolName, tryNormalizeSymbol } from '@/utils/symbol'
+import { isEtfSymbol, rememberSymbol, symbolName, tryNormalizeSymbol } from '@/utils/symbol'
 import SymbolSearch from '@/components/SymbolSearch.vue'
 
 const router = useRouter()
@@ -27,6 +27,7 @@ const analysisLoading = ref(false)
 const analysisError = ref('')
 const analysisBySymbol = ref<Record<string, FundamentalAnalysisReport>>({})
 const boardTab = ref<'watch' | 'market'>('watch')
+const watchKind = ref<'stock' | 'etf'>('stock')
 const marketScanning = ref(false)
 const marketScanError = ref('')
 const marketScanHint = ref('')
@@ -176,8 +177,10 @@ function rowOf(sym: string) {
   const v = valuations.value[key]
   const analysis = analysisBySymbol.value[key]
   const tech = techSignalOf(sym)
-  const composite = analysis?.composite_score ?? null
-  const dy = v?.dividend_yield ?? analysis?.market?.dividend_yield ?? null
+  const skipFund = isEtfSymbol(sym)
+  const analyzed = !skipFund && !!analysis && !analysis.skipped
+  const composite = analyzed ? (analysis.composite_score ?? null) : null
+  const dy = analyzed ? (v?.dividend_yield ?? analysis.market?.dividend_yield ?? null) : null
   return {
     symbol: sym,
     code: sym.split('.')[0] || tickerOf(sym),
@@ -186,16 +189,22 @@ function rowOf(sym: string) {
     change: fmtChange(v?.change_pct),
     changeClass: changeClass(v?.change_pct),
     dividend: fmtDividend(typeof dy === 'number' ? dy : null),
-    composite: composite != null ? composite.toFixed(1) : analysisLoading.value ? '…' : '—',
-    rating: ratingLabel(composite, analysis?.final_rating),
+    composite: skipFund ? '—' : composite != null ? composite.toFixed(1) : analysisLoading.value ? '…' : '—',
+    rating: skipFund ? '—' : ratingLabel(composite, analysis?.final_rating ?? undefined),
     techLabel: tech.label,
     techTone: tech.tone,
   }
 }
 
-const displaySymbols = computed(() => watchlist.symbols)
+const stockSymbols = computed(() => watchlist.symbols.filter((s) => !isEtfSymbol(s)))
+const etfSymbols = computed(() => watchlist.symbols.filter((s) => isEtfSymbol(s)))
+const displaySymbols = computed(() =>
+  watchKind.value === 'etf' ? etfSymbols.value : stockSymbols.value,
+)
 const displayRows = computed(() => displaySymbols.value.map(rowOf))
 const boardEmpty = computed(() => !watchlist.symbols.length)
+const kindEmpty = computed(() => !boardEmpty.value && !displaySymbols.value.length)
+const showFundColumns = computed(() => watchKind.value === 'stock')
 
 const filteredMarketItems = computed(() => {
   if (marketTierFilter.value === 'all') return marketItems.value
@@ -214,8 +223,8 @@ onMounted(async () => {
   await config.restoreSession()
   await config.loadConfig()
   await watchlist.load()
+  if (!stockSymbols.value.length && etfSymbols.value.length) watchKind.value = 'etf'
   await loadWatchlistData()
-  void loadAnalysisReports()
 })
 
 onUnmounted(() => {
@@ -245,6 +254,7 @@ async function onWatchFromSearch(hit: { symbol: string; name: string; watched: b
   followError.value = ''
   if (hit.name) rememberSymbol(hit.symbol, hit.name)
   if (hit.watched) {
+    watchKind.value = isEtfSymbol(hit.symbol) ? 'etf' : 'stock'
     try {
       await pattern.scanPatterns(hit.symbol)
     } catch {
@@ -252,7 +262,6 @@ async function onWatchFromSearch(hit: { symbol: string; name: string; watched: b
     }
   }
   await loadWatchlistData()
-  void loadAnalysisReports()
 }
 
 async function openChart() {
@@ -266,7 +275,7 @@ async function openChart() {
 }
 
 async function loadAnalysisReports() {
-  const syms = watchlist.symbols
+  const syms = stockSymbols.value
   const token = ++analysisToken
   if (!syms.length) {
     analysisBySymbol.value = {}
@@ -276,7 +285,7 @@ async function loadAnalysisReports() {
   }
   analysisLoading.value = true
   analysisError.value = ''
-  const map: Record<string, FundamentalAnalysisReport> = { ...analysisBySymbol.value }
+  const map: Record<string, FundamentalAnalysisReport> = {}
   try {
     await Promise.all(
       syms.map(async (sym) => {
@@ -284,7 +293,7 @@ async function loadAnalysisReports() {
           const { data } = await fetchFundamentalAnalysis(sym)
           if (token !== analysisToken) return
           const report = data.data
-          if (!report) return
+          if (!report || report.skipped) return
           map[sym.toUpperCase()] = report
           if (report.name) rememberSymbol(sym, report.name)
         } catch {
@@ -391,23 +400,58 @@ async function switchBoardTab(tab: 'watch' | 'market') {
       <template v-if="boardTab === 'watch'">
       <div class="watch-head">
         <h2>我的关注</h2>
-        <span v-if="analysisLoading || valuationLoading" class="hold-scanning">正在更新…</span>
+        <div class="watch-head-actions">
+          <span v-if="valuationLoading" class="hold-scanning">行情更新中…</span>
+          <span v-else-if="analysisLoading" class="hold-scanning">基本面计算中…</span>
+          <button
+            v-if="watchKind === 'stock' && stockSymbols.length"
+            type="button"
+            class="btn-secondary"
+            :disabled="analysisLoading"
+            @click="loadAnalysisReports"
+          >
+            {{ analysisLoading ? '计算中…' : '计算基本面' }}
+          </button>
+        </div>
+      </div>
+      <div v-if="!boardEmpty" class="watch-tabs" role="tablist">
+        <button
+          type="button"
+          class="watch-tab"
+          :class="{ active: watchKind === 'stock' }"
+          role="tab"
+          @click="watchKind = 'stock'"
+        >
+          个股<span class="tab-count">{{ stockSymbols.length }}</span>
+        </button>
+        <button
+          type="button"
+          class="watch-tab"
+          :class="{ active: watchKind === 'etf' }"
+          role="tab"
+          @click="watchKind = 'etf'"
+        >
+          ETF<span class="tab-count">{{ etfSymbols.length }}</span>
+        </button>
       </div>
       <p v-if="analysisError" class="follow-error">{{ analysisError }}</p>
 
       <div v-if="boardEmpty" class="empty">搜索结果里点「加自选」，这里会展示股票与分析摘要。</div>
+      <div v-else-if="kindEmpty" class="empty">
+        {{ watchKind === 'etf' ? '暂无 ETF，可在搜索结果里加自选。' : '暂无个股，可在搜索结果里加自选。' }}
+      </div>
       <template v-else>
       <div class="watch-table-wrap">
       <table class="watch-table">
         <thead>
           <tr>
-            <th>股票</th>
+            <th>{{ watchKind === 'etf' ? '名称' : '股票' }}</th>
             <th>代码</th>
             <th>价格</th>
             <th>涨跌</th>
-            <th>股息率</th>
-            <th>综合分</th>
-            <th>评级</th>
+            <th v-if="showFundColumns">股息率</th>
+            <th v-if="showFundColumns">综合分</th>
+            <th v-if="showFundColumns">评级</th>
             <th>技术信号</th>
             <th>操作</th>
           </tr>
@@ -418,9 +462,9 @@ async function switchBoardTab(tab: 'watch' | 'market') {
             <td class="symbol-code">{{ row.code }}</td>
             <td>{{ row.price }}</td>
             <td :class="row.changeClass">{{ row.change }}</td>
-            <td class="div-cell">{{ row.dividend }}</td>
-            <td class="score-cell">{{ row.composite }}</td>
-            <td class="rating-cell">{{ row.rating }}</td>
+            <td v-if="showFundColumns" class="div-cell">{{ row.dividend }}</td>
+            <td v-if="showFundColumns" class="score-cell">{{ row.composite }}</td>
+            <td v-if="showFundColumns" class="rating-cell">{{ row.rating }}</td>
             <td>
               <span class="tech-signal" :class="row.techTone">
                 <span class="tech-dot" />
@@ -448,9 +492,11 @@ async function switchBoardTab(tab: 'watch' | 'market') {
             <span :class="row.changeClass">{{ row.change }}</span>
           </div>
           <div class="watch-card-metrics">
-            <div><span class="k">股息率</span><span>{{ row.dividend }}</span></div>
-            <div><span class="k">综合分</span><span>{{ row.composite }}</span></div>
-            <div><span class="k">评级</span><span>{{ row.rating }}</span></div>
+            <template v-if="showFundColumns">
+              <div><span class="k">股息率</span><span>{{ row.dividend }}</span></div>
+              <div><span class="k">综合分</span><span>{{ row.composite }}</span></div>
+              <div><span class="k">评级</span><span>{{ row.rating }}</span></div>
+            </template>
             <div class="watch-card-tech">
               <span class="tech-signal" :class="row.techTone">
                 <span class="tech-dot" />
@@ -649,10 +695,10 @@ async function switchBoardTab(tab: 'watch' | 'market') {
   border-radius: 50%;
   flex-shrink: 0;
 }
-.tech-signal.bull .tech-dot { background: #52c41a; }
-.tech-signal.neutral .tech-dot { background: #52c41a; }
+.tech-signal.bull .tech-dot { background: #f5222d; }
+.tech-signal.neutral .tech-dot { background: #f5222d; }
 .tech-signal.wait .tech-dot { background: #faad14; }
-.tech-signal.bear .tech-dot { background: #f5222d; }
+.tech-signal.bear .tech-dot { background: #52c41a; }
 .link-btn {
   border: 0;
   background: transparent;
@@ -779,8 +825,8 @@ th { color: var(--text-secondary); font-weight: 500; }
   font-size: 12px;
   font-weight: 600;
 }
-.badge-bullish { background: rgba(82, 196, 26, 0.15); color: #389e0d; }
-.badge-bearish { background: rgba(245, 34, 45, 0.12); color: #cf1322; }
+.badge-bullish { background: rgba(245, 34, 45, 0.12); color: #cf1322; }
+.badge-bearish { background: rgba(82, 196, 26, 0.15); color: #389e0d; }
 .btn-secondary {
   border: 1px solid var(--border-color);
   background: transparent;

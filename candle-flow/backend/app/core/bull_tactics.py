@@ -1,4 +1,10 @@
-"""主板战法：黑马跨栏、N字反包、牛股三绝。"""
+"""主板战法：黑马跨栏、N字反包、牛股三绝。
+
+规则对齐：
+- 黑马跨栏：主板非 ST；近 7 日内连续三天涨停（第三天可炸板未回封）；之后缩量回调不破十日线
+- N字反包：主板非 ST；近 7 日内放量涨停；涨停后缩量回调不破涨停阳线开盘价
+- 牛股三绝：非 ST；跳空高开大阳线或涨停；之后缩量回调不破该阳线开盘价，且不跌破 39 日均线
+"""
 
 from __future__ import annotations
 
@@ -18,6 +24,11 @@ TACTIC_NAMES = (HEIMA, N_FAN, NIU_SAN)
 
 _MAIN_SH = ("600", "601", "603", "605")
 _MAIN_SZ = ("000", "001", "002", "003")
+
+# 信号日距买入日的最大间隔（含回调段）
+HEIMA_LOOKBACK = 7
+N_FAN_LOOKBACK = 7
+NIU_SAN_LOOKBACK = 15
 
 
 @dataclass
@@ -54,20 +65,31 @@ def limit_price(prev_close: float) -> float:
     return round(prev_close * 1.10, 2)
 
 
-def _avg_volume(candles: list[Candle], end_index: int, period: int = 20) -> float:
+def _pct_chg(close: float, prev_close: float) -> float:
+    if prev_close <= 0:
+        return 0.0
+    return (close - prev_close) / prev_close * 100.0
+
+
+def _avg_volume(candles: list[Candle], end_index: int, period: int = 5) -> float:
+    """含 end_index 在内的近 period 日均量。"""
     start = max(0, end_index - period + 1)
     vols = [c.volume for c in candles[start : end_index + 1] if c.volume > 0]
     return sum(vols) / len(vols) if vols else 0.0
 
 
 def is_strict_limit_up(c: Candle, prev_close: float) -> bool:
+    """收盘封住涨停（涨幅约 ≥9.8% 且收盘贴近涨停价）。"""
     if prev_close <= 0:
         return False
     lp = limit_price(prev_close)
-    return c.close >= lp - 0.005
+    if c.close < lp - 0.005:
+        return False
+    return _pct_chg(c.close, prev_close) >= 9.8
 
 
 def touches_limit_up(c: Candle, prev_close: float) -> bool:
+    """触及涨停价（可用于炸板：最高价触板即可）。"""
     if prev_close <= 0:
         return False
     lp = limit_price(prev_close)
@@ -92,8 +114,20 @@ def _fmt_date(c: Candle) -> str:
     return str(ts)[:10]
 
 
+def _pullback_shrink(candles: list[Candle], start: int, end: int, ref_vol: float) -> bool:
+    """[start, end] 区间成交量均小于参考量。"""
+    if ref_vol <= 0 or start > end:
+        return False
+    return all(candles[k].volume < ref_vol for k in range(start, end + 1))
+
+
 def scan_heima_kualan(candles: list[Candle]) -> list[TacticHit]:
-    """连续三天涨停（第三天允许炸板未回封），13 个交易日内缩量回踩不破收盘、不破十日线。"""
+    """
+    黑马跨栏：
+    1. 主板非 ST（外层过滤）
+    2. 近 7 个交易日内连续三天涨停，第三天可炸板未回封
+    3. 三连板后缩量回调不破十日线
+    """
     hits: list[TacticHit] = []
     if len(candles) < 20:
         return hits
@@ -105,39 +139,38 @@ def scan_heima_kualan(candles: list[Candle]) -> list[TacticHit]:
         pc2 = candles[i - 1].close
         if pc0 <= 0 or pc1 <= 0 or pc2 <= 0:
             continue
+        # 前两天须收盘封板；第三天触板即可（炸板未回封）
         if not is_strict_limit_up(c0, pc0):
             continue
         if not is_strict_limit_up(c1, pc1):
             continue
-        # 第三天触板即可（允许炸板未回封）
         if not touches_limit_up(c2, pc2):
             continue
 
-        # 不破收盘：以第三日收盘为支撑
-        floor_close = c2.close
-        peak_high = max(c0.high, c1.high, c2.high)
-        peak_vol = max(c0.volume, c1.volume, c2.volume)
+        limit_vol = c2.volume
+        if limit_vol <= 0:
+            continue
 
-        for j in range(i + 1, min(i + 14, len(candles))):
+        # 回调须落在三连板结束后的近 7 日内
+        for j in range(i + 1, min(i + 1 + HEIMA_LOOKBACK, len(candles))):
             if j < 9:
                 continue
             cj = candles[j]
             ma10 = calc_ma(candles, 10, j)
 
-            # 回踩：收盘低于三连板高点
-            if cj.close >= peak_high - 0.01:
+            # 整段回调：缩量 + 不破十日线
+            if not _pullback_shrink(candles, i + 1, j, limit_vol):
                 continue
-            if peak_vol > 0 and cj.volume >= peak_vol * 0.85:
+            if any(candles[k].low < calc_ma(candles, 10, k) - 0.01 for k in range(i + 1, j + 1)):
                 continue
-            if cj.low < floor_close - 0.01:
-                continue
+            # 当日也守住 MA10
             if cj.low < ma10 - 0.01:
                 continue
 
             score = 72.0
             if is_strict_limit_up(c2, pc2):
                 score += 8.0
-            if cj.volume <= peak_vol * 0.6:
+            if cj.volume <= limit_vol * 0.6:
                 score += 6.0
             if cj.low >= ma10:
                 score += 4.0
@@ -151,10 +184,11 @@ def scan_heima_kualan(candles: list[Candle]) -> list[TacticHit]:
                     score=min(100.0, score),
                     setup_date=_fmt_date(c2),
                     details={
-                        "floor_close": floor_close,
                         "ma10": round(ma10, 4),
+                        "limit_vol": limit_vol,
                         "limit_days": [_fmt_date(c0), _fmt_date(c1), _fmt_date(c2)],
                         "day3_zhaban": not is_strict_limit_up(c2, pc2),
+                        "floor_close": c2.close,
                     },
                 )
             )
@@ -163,12 +197,17 @@ def scan_heima_kualan(candles: list[Candle]) -> list[TacticHit]:
 
 
 def scan_n_fanbao(candles: list[Candle]) -> list[TacticHit]:
-    """放量涨停；8 个交易日内缩量回踩不破涨停阳线开盘价。"""
+    """
+    N字反包：
+    1. 主板非 ST（外层过滤）
+    2. 近 7 个交易日内放量涨停（量 > 5 日均量）
+    3. 涨停后缩量回调不破涨停阳线开盘价
+    """
     hits: list[TacticHit] = []
     if len(candles) < 20:
         return hits
 
-    for i in range(1, len(candles)):
+    for i in range(4, len(candles)):
         c = candles[i]
         pc = candles[i - 1].close
         if pc <= 0:
@@ -178,25 +217,25 @@ def scan_n_fanbao(candles: list[Candle]) -> list[TacticHit]:
         # 一字板通常无实质放量换手，排除
         if is_yizi_limit(c, pc):
             continue
-        avg_vol = _avg_volume(candles, i - 1, 20)
-        if avg_vol <= 0 or c.volume < avg_vol * 1.3:
+        vol_ma5 = _avg_volume(candles, i, 5)
+        if vol_ma5 <= 0 or c.volume <= vol_ma5:
             continue
 
         ref_open = c.open
-        for j in range(i + 1, min(i + 9, len(candles))):
+        limit_vol = c.volume
+        for j in range(i + 1, min(i + 1 + N_FAN_LOOKBACK, len(candles))):
             cj = candles[j]
-            if cj.low < ref_open - 0.01:
+            # 整段不破涨停开盘价
+            if any(candles[k].low < ref_open - 0.01 for k in range(i + 1, j + 1)):
                 break
-            if cj.volume >= c.volume * 0.75:
-                continue
-            if cj.close >= c.close:
+            if not _pullback_shrink(candles, i + 1, j, limit_vol):
                 continue
 
             score = 68.0
-            vol_ratio = c.volume / avg_vol if avg_vol else 0
+            vol_ratio = c.volume / vol_ma5 if vol_ma5 else 0
             if vol_ratio >= 2.0:
                 score += 10.0
-            if cj.volume <= c.volume * 0.55:
+            if cj.volume <= limit_vol * 0.55:
                 score += 6.0
 
             hits.append(
@@ -219,7 +258,13 @@ def scan_n_fanbao(candles: list[Candle]) -> list[TacticHit]:
 
 
 def scan_niu_sanjue(candles: list[Candle]) -> list[TacticHit]:
-    """跳空高开大阳线或涨停；缩量回踩不破该阳线开盘价，且不跌破 39 日均线。"""
+    """
+    牛股三绝：
+    1. 跳空高开大阳线（涨幅 ≥7%）或涨停
+    2. 之后缩量回调不跌破高开阳线开盘价
+    3. 缩量回调不跌破 39 日均线
+    4. 非 ST（外层过滤）
+    """
     hits: list[TacticHit] = []
     if len(candles) < 45:
         return hits
@@ -231,38 +276,39 @@ def scan_niu_sanjue(candles: list[Candle]) -> list[TacticHit]:
         if pc <= 0 or prev.high <= 0:
             continue
 
-        # 跳空高开
+        # 跳空高开：开盘价 > 昨高
         if c.open <= prev.high + 0.01:
             continue
 
-        yang_pct = (c.close - c.open) / max(c.open, 0.01)
-        big_yang = yang_pct >= 0.03 and c.is_bullish
+        pct = _pct_chg(c.close, pc)
         limit_up = is_strict_limit_up(c, pc)
+        big_yang = pct >= 7.0 and c.is_bullish
         if not (big_yang or limit_up):
             continue
 
         signal_open = c.open
-        avg_vol = _avg_volume(candles, i - 1, 20)
+        signal_vol = c.volume
+        if signal_vol <= 0:
+            continue
+        avg_vol = _avg_volume(candles, i - 1, 5)
 
-        for j in range(i + 1, len(candles)):
+        for j in range(i + 1, min(i + 1 + NIU_SAN_LOOKBACK, len(candles))):
             cj = candles[j]
-            ma39 = calc_ma(candles, 39, j)
             # 不破高开阳线开盘价
-            if cj.low < signal_open - 0.01:
+            if any(candles[k].low < signal_open - 0.01 for k in range(i + 1, j + 1)):
                 break
             # 不跌破 39 日均线
-            if cj.low < ma39 - 0.01:
+            if any(candles[k].low < calc_ma(candles, 39, k) - 0.01 for k in range(i + 1, j + 1)):
                 continue
-            if cj.close >= c.close:
-                continue
-            if c.volume > 0 and cj.volume >= c.volume * 0.75:
+            if not _pullback_shrink(candles, i + 1, j, signal_vol):
                 continue
 
+            ma39 = calc_ma(candles, 39, j)
             score = 68.0
             vol_ratio = (c.volume / avg_vol) if avg_vol else 0.0
             if limit_up:
                 score += 8.0
-            if cj.volume <= c.volume * 0.55:
+            if cj.volume <= signal_vol * 0.55:
                 score += 6.0
             if cj.low >= ma39:
                 score += 4.0
@@ -281,6 +327,7 @@ def scan_niu_sanjue(candles: list[Candle]) -> list[TacticHit]:
                         "ma39": round(ma39, 4),
                         "volume_ratio": round(vol_ratio, 2),
                         "limit_up": limit_up,
+                        "pct_chg": round(pct, 2),
                     },
                 )
             )

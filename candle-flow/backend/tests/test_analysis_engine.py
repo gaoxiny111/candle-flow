@@ -69,6 +69,17 @@ def test_engine_composite_without_db(monkeypatch):
     monkeypatch.setattr("app.analysis.engine.build_financial_dataframe", fake_build)
     monkeypatch.setattr("app.analysis.engine.industry_averages", lambda *a, **k: {"roe": 15, "revenue_yoy": 8})
     monkeypatch.setattr("app.analysis.engine.get_valuations", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "app.analysis.engine.calculate_comparable_valuation",
+        lambda *a, **k: {
+            "stock_code": "600519.SH",
+            "comparables": [],
+            "avg_pe": None,
+            "avg_pb": None,
+            "valuation_range": {},
+            "peer_count": 0,
+        },
+    )
 
     report = engine.run_full_analysis("600519.SH", db=None)
     assert report["composite_score"] > 0
@@ -128,6 +139,27 @@ def test_rating_label_b_plus():
     assert rating_label(74.3) == "B+"
     assert rating_label(53.2) == "D"
     assert rating_label(82) == "A-"
+
+
+def test_engine_skips_etf_fundamentals(monkeypatch):
+    engine = FundamentalEngine()
+
+    def fail_build(*_a, **_k):
+        raise AssertionError("ETF should not load stock financials")
+
+    monkeypatch.setattr("app.analysis.engine.build_financial_dataframe", fail_build)
+    monkeypatch.setattr(
+        "app.analysis.engine.get_valuations",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("ETF should not fetch valuations")),
+    )
+
+    report = engine.run_full_analysis("510300.SH", db=None)
+    assert report["skipped"] is True
+    assert report["skip_reason"] == "etf"
+    assert report["composite_score"] is None
+    assert report["final_rating"] is None
+    assert report["market"]["dividend_yield"] is None
+    assert report["modules"] == {}
 
 
 def test_dcf_shares_from_market_cap_and_reliability():

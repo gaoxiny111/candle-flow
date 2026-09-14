@@ -1,12 +1,14 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { apiErrorText, fetchFundamentalAnalysis, type FundamentalAnalysisReport } from '@/api'
+import { isEtfSymbol } from '@/utils/symbol'
 
 const props = defineProps<{ symbol: string }>()
 
 const loading = ref(false)
 const error = ref('')
 const report = ref<FundamentalAnalysisReport | null>(null)
+const skipEtf = computed(() => isEtfSymbol(props.symbol))
 
 const MODULE_ORDER = [
   'profitability',
@@ -29,13 +31,15 @@ const LEVEL_LABEL: Record<string, string> = {
   E: '危险',
 }
 
-function levelTone(level: string) {
+function levelTone(level: string | null | undefined) {
+  if (!level) return 'mid'
   if (level.startsWith('A') || level.startsWith('B')) return 'good'
   if (level === 'D' || level === 'E') return 'bad'
   return 'mid'
 }
 
-function scoreTone(score: number) {
+function scoreTone(score: number | null | undefined) {
+  if (score == null) return 'mid'
   if (score >= 80) return 'good'
   if (score >= 60) return 'mid'
   return 'bad'
@@ -43,6 +47,12 @@ function scoreTone(score: number) {
 
 async function load() {
   if (!props.symbol) return
+  if (isEtfSymbol(props.symbol)) {
+    loading.value = false
+    error.value = ''
+    report.value = null
+    return
+  }
   loading.value = true
   error.value = ''
   report.value = null
@@ -64,15 +74,16 @@ watch(() => props.symbol, load, { immediate: true })
   <div class="fundamental-panel card">
     <div class="panel-head">
       <h3>基本面分析</h3>
-      <button class="btn-ghost" type="button" :disabled="loading" @click="load">
+      <button class="btn-ghost" type="button" :disabled="loading || skipEtf" @click="load">
         {{ loading ? '分析中…' : '刷新' }}
       </button>
     </div>
 
-    <p v-if="error" class="err">{{ error }}</p>
+    <p v-if="skipEtf" class="muted">ETF 不适用个股基本面评分，股息率、综合分与评级不计算。</p>
+    <p v-else-if="error" class="err">{{ error }}</p>
     <p v-else-if="loading" class="muted">正在拉取财报并运行分析模型…</p>
 
-    <template v-else-if="report">
+    <template v-else-if="report && !report.skipped">
       <div class="hero">
         <div class="hero-score" :class="scoreTone(report.composite_score)">
           <span class="num">{{ report.composite_score }}</span>
@@ -87,7 +98,7 @@ watch(() => props.symbol, load, { immediate: true })
           <div class="rating">
             评级
             <strong :class="levelTone(report.final_rating)">{{ report.final_rating }}</strong>
-            {{ LEVEL_LABEL[report.final_rating] || '' }}
+            {{ (report.final_rating && LEVEL_LABEL[report.final_rating]) || '' }}
           </div>
           <div v-if="report.market?.price" class="market">
             现价 {{ report.market.price?.toFixed(2) }}
@@ -140,8 +151,72 @@ watch(() => props.symbol, load, { immediate: true })
             </span>
             <span v-if="v.current != null" class="val-num">{{ v.current }}</span>
             <span v-if="v.percentile_5y != null" class="val-sub">分位 {{ v.percentile_5y }}%</span>
+            <span v-if="v.industry_median != null" class="val-sub">行业 {{ v.industry_median }}</span>
           </div>
         </div>
+      </section>
+
+      <section v-if="report.valuation?.comps" class="valuation card-inner">
+        <h4>可比公司估值</h4>
+        <p v-if="report.valuation.comps.warning" class="muted">{{ report.valuation.comps.warning }}</p>
+        <div class="comps-summary">
+          <div>
+            <span class="k">可比均 PE</span>
+            <strong>{{ report.valuation.comps.avg_pe ?? '—' }}</strong>
+          </div>
+          <div>
+            <span class="k">可比均 PB</span>
+            <strong>{{ report.valuation.comps.avg_pb ?? '—' }}</strong>
+          </div>
+          <div v-if="report.valuation.comps.signal">
+            <span class="k">相对现价</span>
+            <strong
+              :class="
+                report.valuation.comps.signal === '低估'
+                  ? 'good'
+                  : report.valuation.comps.signal === '高估'
+                    ? 'bad'
+                    : 'mid'
+              "
+            >{{ report.valuation.comps.signal }}</strong>
+          </div>
+        </div>
+        <div v-if="report.valuation.comps.valuation_range?.pe_based" class="comps-range">
+          PE 套算：
+          {{ report.valuation.comps.valuation_range.pe_based.low }}
+          –
+          {{ report.valuation.comps.valuation_range.pe_based.high }}
+          <span v-if="report.valuation.comps.valuation_range.pe_based.mid != null" class="muted">
+            （中枢 {{ report.valuation.comps.valuation_range.pe_based.mid }}）
+          </span>
+        </div>
+        <div v-if="report.valuation.comps.valuation_range?.pb_based" class="comps-range">
+          PB 套算：
+          {{ report.valuation.comps.valuation_range.pb_based.low }}
+          –
+          {{ report.valuation.comps.valuation_range.pb_based.high }}
+          <span v-if="report.valuation.comps.valuation_range.pb_based.mid != null" class="muted">
+            （中枢 {{ report.valuation.comps.valuation_range.pb_based.mid }}）
+          </span>
+        </div>
+        <table v-if="report.valuation.comps.comparables?.length" class="comps-table">
+          <thead>
+            <tr>
+              <th>可比公司</th>
+              <th>代码</th>
+              <th>PE</th>
+              <th>PB</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="c in report.valuation.comps.comparables" :key="c.symbol">
+              <td>{{ c.name || '—' }}</td>
+              <td class="code">{{ c.symbol.split('.')[0] }}</td>
+              <td>{{ c.pe ?? '—' }}</td>
+              <td>{{ c.pb ?? '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
       </section>
 
       <section v-if="report.valuation?.dcf" class="valuation card-inner">
@@ -230,6 +305,19 @@ watch(() => props.symbol, load, { immediate: true })
 .val-signal.bad { color: #cf1322; }
 .val-num { display: block; margin-top: 2px; }
 .val-sub { font-size: 12px; color: var(--text-secondary); }
+.comps-summary {
+  display: flex; flex-wrap: wrap; gap: 12px 20px; margin-bottom: 8px; font-size: 13px;
+}
+.comps-summary .k { color: var(--text-secondary); margin-right: 6px; }
+.comps-summary .good { color: #cf1322; }
+.comps-summary .bad { color: #389e0d; }
+.comps-summary .mid { color: #d48806; }
+.comps-range { font-size: 13px; margin: 4px 0; }
+.comps-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+.comps-table th, .comps-table td {
+  text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border-color);
+}
+.comps-table .code { font-variant-numeric: tabular-nums; color: var(--text-secondary); }
 .summary {
   margin-top: var(--space-md); padding: 10px; background: var(--bg-secondary, #fafafa);
   border-radius: 8px; font-size: 12px; white-space: pre-wrap; color: var(--text-secondary);
