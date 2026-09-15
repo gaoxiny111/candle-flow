@@ -46,6 +46,65 @@ def _is_annual(report_date: str) -> bool:
     return str(report_date).endswith("1231")
 
 
+def fetch_deducted_parent_netprofit(symbol: str, report_date: str | None = None) -> float | None:
+    """
+    东财利润表 DEDUCT_PARENT_NETPROFIT（扣非归母净利润，元）。
+    report_date 为 YYYYMMDD 时优先对齐该期；否则取最新一期。
+    """
+    import requests
+
+    from app.utils.symbol import SymbolError, normalize_symbol, parse_symbol
+
+    try:
+        code, _ = parse_symbol(normalize_symbol(symbol))
+    except SymbolError:
+        digits = "".join(ch for ch in str(symbol) if ch.isdigit())
+        code = digits[-6:] if len(digits) >= 6 else ""
+    if not code:
+        return None
+    try:
+        r = requests.get(
+            "https://datacenter-web.eastmoney.com/api/data/v1/get",
+            params={
+                "reportName": "RPT_DMSK_FN_INCOME",
+                "columns": "SECURITY_CODE,REPORT_DATE,PARENT_NETPROFIT,DEDUCT_PARENT_NETPROFIT",
+                "filter": f'(SECURITY_CODE="{code}")',
+                "pageNumber": "1",
+                "pageSize": "8",
+                "sortColumns": "REPORT_DATE",
+                "sortTypes": "-1",
+                "source": "WEB",
+                "client": "WEB",
+            },
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://data.eastmoney.com/"},
+            timeout=12,
+        )
+        if not r.ok:
+            return None
+        rows = ((r.json() or {}).get("result") or {}).get("data") or []
+        want = ""
+        if report_date:
+            s = str(report_date).replace("-", "")[:8]
+            if len(s) == 8:
+                want = f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+        for row in rows:
+            rd = str(row.get("REPORT_DATE") or "")[:10]
+            if want and rd != want:
+                continue
+            raw = row.get("DEDUCT_PARENT_NETPROFIT")
+            if raw is None:
+                if want:
+                    continue
+                return None
+            return float(raw)
+        # 未精确命中报告期时回退最新一期
+        if rows and rows[0].get("DEDUCT_PARENT_NETPROFIT") is not None:
+            return float(rows[0]["DEDUCT_PARENT_NETPROFIT"])
+    except Exception:
+        return None
+    return None
+
+
 def _debt_ratio_fallback(symbol: str, equity: float | None, total_assets: float | None) -> float | None:
     """从权益乘数粗估资产负债率；并尝试相邻年报的 zcfz。"""
     if equity and total_assets and total_assets > 0 and equity > 0:
@@ -125,6 +184,18 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
         meta["ocf_per_share"] = _pick(latest_raw, "每股经营现金流量")
         meta["eps"] = _pick(latest_raw, "每股收益")
         meta["latest_report"] = latest_d
+        # 当期（可中报）利润含金量：每股经营现金流 / 每股收益 ≈ OCF/净利
+        ocf_ps = meta.get("ocf_per_share")
+        eps = meta.get("eps")
+        if ocf_ps is not None and eps is not None and abs(float(eps)) > 1e-9:
+            meta["latest_cash_ratio"] = float(ocf_ps) / float(eps)
+        # 扣非归母净利：识别「归母高增但主业仍亏」的利润幻增
+        ded = fetch_deducted_parent_netprofit(symbol, latest_d)
+        if ded is not None:
+            meta["deducted_net_profit"] = ded
+            parent_np = _pick(latest_raw, "净利润", "归母净利润", "净利润-净利润")
+            if parent_np is not None:
+                meta["parent_net_profit"] = parent_np
         interim_roe = _pick(latest_raw, "净资产收益率")
         if interim_roe is not None and latest_d and not _is_annual(str(latest_d)):
             meta["interim_roe"] = interim_roe

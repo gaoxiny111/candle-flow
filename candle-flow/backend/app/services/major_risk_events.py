@@ -1,4 +1,4 @@
-"""重大风险事件：抓取个股公告标题，按关键词命中合规/生存风险。"""
+"""重大风险事件：公告关键词 + 质押率；区分生存级 / 观察级。"""
 
 from __future__ import annotations
 
@@ -20,26 +20,31 @@ CACHE_TTL_SEC = 3 * 3600
 LOOKBACK_DAYS = 540  # ~18 个月
 MAX_PAGES = 3
 PAGE_SIZE = 50
-# 控股股东累计质押占持股比例超过此阈值 → 质押危机
-PLEDGE_FATAL_RATIO = 0.80
+# 观察级：占所持股份比例达到此阈值才提示（不作一票否决）
+PLEDGE_OBSERVE_RATIO = 0.50
+# 超过 100% 视为抓取异常，丢弃并标记需复核
+PLEDGE_MAX_SANE = 1.0
 
-COMPLIANCE_VETO_MESSAGE = "命中重大风险事件，财务打分不适用；请优先关注合规与生存风险"
+COMPLIANCE_VETO_MESSAGE = "命中生存级重大风险事件，财务打分不适用；请优先关注合规与生存风险"
+OBSERVE_RISK_MESSAGE = "命中观察级风险，警惕情绪杀跌；不等于公司生存危机"
 
 _HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Referer": "https://data.eastmoney.com/notices/",
 }
 
-# 命中任一即视为致命合规/生存风险（顶部红灯 + 评级强制 E）
+# severity: survival=一票否决；observe=扣分提示、不熔断
 RISK_RULES: list[dict[str, Any]] = [
     {
         "id": "pre_reorg",
         "label": "法院预重整/破产重整",
+        "severity": "survival",
         "keywords": ("预重整", "破产重整", "重整申请", "被法院裁定受理重整", "进入重整程序"),
     },
     {
         "id": "audit_nonstd",
         "label": "非标审计/持续经营不确定性",
+        "severity": "survival",
         "keywords": (
             "无法表示意见",
             "保留意见",
@@ -49,21 +54,21 @@ RISK_RULES: list[dict[str, Any]] = [
             "带强调事项段",
             "非标准无保留",
             "非标审计",
+            "非标准审计",
+            "非标准审计意见",
+            "非标准审计报告",
         ),
     },
     {
         "id": "investigation",
         "label": "立案调查",
+        "severity": "survival",
         "keywords": ("立案调查", "证监会立案", "被中国证监会立案", "被立案告知"),
-    },
-    {
-        "id": "share_freeze",
-        "label": "股份司法冻结",
-        "keywords": ("司法冻结", "股权冻结", "股份冻结", "轮候冻结", "冻结股份", "司法轮候冻结"),
     },
     {
         "id": "face_delist",
         "label": "面值/重大违法退市风险",
+        "severity": "survival",
         "keywords": (
             "面值退市",
             "可能被终止上市",
@@ -72,11 +77,40 @@ RISK_RULES: list[dict[str, Any]] = [
         ),
     },
     {
+        "id": "share_freeze",
+        "label": "股份司法冻结",
+        "severity": "observe",
+        "keywords": ("司法冻结", "股权冻结", "股份冻结", "轮候冻结", "冻结股份", "司法轮候冻结"),
+    },
+    {
         "id": "pledge_crisis",
-        "label": "质押平仓/强制平仓风险",
-        "keywords": ("质押平仓", "强制平仓", "质押违约", "触及平仓线", "高比例质押"),
+        "label": "质押平仓风险",
+        "severity": "observe",
+        "keywords": ("质押平仓", "强制平仓", "质押违约", "触及平仓线"),
+    },
+    {
+        "id": "policy_geo",
+        "label": "政策/地缘风险传闻",
+        "severity": "observe",
+        "keywords": (
+            "被列入实体清单",
+            "实体清单",
+            "出口管制",
+            "贸易制裁",
+            "FCC",
+            "禁止销售",
+            "关税制裁",
+        ),
+    },
+    {
+        "id": "reduce_hold",
+        "label": "实控人/大股东减持",
+        "severity": "observe",
+        "keywords": ("减持计划", "股份减持", "拟减持", "大宗交易减持"),
     },
 ]
+
+SEVERITY_BY_ID = {str(r["id"]): str(r["severity"]) for r in RISK_RULES}
 
 _cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
@@ -89,6 +123,7 @@ class RiskHit:
     title: str
     notice_date: str = ""
     url: str = ""
+    severity: str = "observe"
 
 
 def _code6(symbol: str) -> str | None:
@@ -122,6 +157,28 @@ def _notice_detail_url(code: str, art_code: str) -> str:
     if not art_code:
         return ""
     return f"https://data.eastmoney.com/notices/detail/{code}/{art_code}.html"
+
+
+def normalize_pledge_hold_ratio(raw: Any) -> float | None:
+    """
+    东财 PF_HOLD_RATIO 为「占所持股份比例」的百分数（如 3.45 表示 3.45%）。
+    统一转为 0~1 小数；>100% 视为脏数据返回 None。
+    """
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if v < 0:
+        return None
+    # API 恒为百分数；切勿把 1.5（1.5%）当成小数 150%
+    ratio = v / 100.0
+    if ratio > PLEDGE_MAX_SANE + 1e-9:
+        return None
+    if ratio <= 0:
+        return None
+    return ratio
 
 
 def fetch_stock_notices(symbol: str, *, max_pages: int = MAX_PAGES) -> list[dict[str, str]]:
@@ -195,20 +252,22 @@ def scan_notice_titles(notices: list[dict[str, str]]) -> list[RiskHit]:
                             title=title,
                             notice_date=n.get("notice_date") or "",
                             url=n.get("url") or "",
+                            severity=str(rule.get("severity") or "observe"),
                         )
                     )
                     break
     return hits
 
 
-def fetch_controller_pledge_ratio(symbol: str) -> float | None:
+def fetch_controller_pledge_ratio(symbol: str) -> dict[str, Any]:
     """
-    东财重要股东质押明细（RPTA_APP_ACCUMDETAILS）：
-    取近 LOOKBACK_DAYS 内「占所持股份比例」最大值。
+    东财重要股东质押明细：取近窗内控股股东（优先）单笔「占所持股份比例」的合理最大值。
+    返回 {ratio, invalid, source, holder}；ratio 为 0~1 或 None。
     """
+    empty = {"ratio": None, "invalid": False, "source": "", "holder": ""}
     code = _code6(symbol)
     if not code:
-        return None
+        return empty
     try:
         params = {
             "sortColumns": "NOTICE_DATE",
@@ -228,10 +287,16 @@ def fetch_controller_pledge_ratio(symbol: str) -> float | None:
             timeout=10,
         )
         if not r.ok:
-            return None
+            return empty
         rows = ((r.json() or {}).get("result") or {}).get("data") or []
         cutoff = date.today() - timedelta(days=LOOKBACK_DAYS)
-        best: float | None = None
+
+        ctrl_latest: float | None = None
+        any_best: float | None = None
+        ctrl_holder = ""
+        any_holder = ""
+        saw_invalid = False
+
         for row in rows:
             nd = _parse_notice_date(row.get("NOTICE_DATE"))
             if nd:
@@ -240,28 +305,83 @@ def fetch_controller_pledge_ratio(symbol: str) -> float | None:
                         continue
                 except ValueError:
                     pass
+
             raw = row.get("PF_HOLD_RATIO")
-            if raw is None:
-                continue
+            pf_num = row.get("PF_NUM")
+            hold_num = row.get("HOLD_NUM")
+            ratio: float | None = None
             try:
-                v = float(raw)
+                # 优先用官方「占所持股份比例」百分数（避免股/万股单位混淆）
+                ratio = normalize_pledge_hold_ratio(raw)
+                # 可选交叉校验：质押股数 / 持股数；持股数常为「万股」
+                if pf_num is not None and hold_num is not None:
+                    try:
+                        pf = float(pf_num)
+                        hold = float(hold_num)
+                    except (TypeError, ValueError):
+                        pf, hold = 0.0, 0.0
+                    if hold > 0 and pf > 0:
+                        # HOLD_NUM 过小多半是万股
+                        if pf / hold > PLEDGE_MAX_SANE and hold * 10000 >= pf:
+                            hold *= 10000.0
+                        share_ratio = pf / hold
+                        if share_ratio > PLEDGE_MAX_SANE + 1e-9:
+                            saw_invalid = True
+                        elif ratio is None:
+                            ratio = share_ratio
+                        elif abs(share_ratio - ratio) > 0.05 and share_ratio <= PLEDGE_MAX_SANE:
+                            ratio = share_ratio
+                if raw is not None:
+                    try:
+                        raw_f = float(raw)
+                        if raw_f / 100.0 > PLEDGE_MAX_SANE + 1e-9:
+                            saw_invalid = True
+                    except (TypeError, ValueError):
+                        pass
             except (TypeError, ValueError):
                 continue
-            if v > 1.5:
-                v = v / 100.0
-            if v <= 0:
+            if ratio is None:
                 continue
-            best = v if best is None else max(best, v)
-        return best
+
+            holder = str(row.get("HOLDER_NAME") or "")
+            is_ctrl = str(row.get("IS_CONTROL_SHAREHOLDER") or "") in ("1", "是", "Y", "true", "True")
+            # 列表已按公告日降序：控股股东取最近一笔，避免历史峰值夸大
+            if is_ctrl and ctrl_latest is None:
+                ctrl_latest = ratio
+                ctrl_holder = holder
+            if any_best is None or ratio > any_best:
+                any_best = ratio
+                any_holder = holder
+
+        if ctrl_latest is not None:
+            return {
+                "ratio": ctrl_latest,
+                "invalid": False,
+                "source": "control_pf_hold_ratio",
+                "holder": ctrl_holder,
+            }
+        if any_best is not None:
+            return {
+                "ratio": any_best,
+                "invalid": False,
+                "source": "max_pf_hold_ratio",
+                "holder": any_holder,
+            }
+        return {
+            "ratio": None,
+            "invalid": saw_invalid,
+            "source": "invalid_over_100pct" if saw_invalid else "",
+            "holder": "",
+        }
     except Exception as e:
         logger.debug("pledge ratio fetch failed for %s: %s", symbol, e)
-        return None
+        return empty
 
 
 def detect_major_risk_events(symbol: str) -> dict[str, Any]:
     """
     返回重大风险事件扫描结果。
-    fatal=True 时引擎应顶部红灯并强制评级 E。
+    fatal=True 仅当命中生存级事件；观察级只进 observe_events。
     """
     sym = symbol
     try:
@@ -277,7 +397,7 @@ def detect_major_risk_events(symbol: str) -> dict[str, Any]:
     notices = fetch_stock_notices(sym)
     hits = scan_notice_titles(notices)
 
-    events = [
+    events: list[dict[str, Any]] = [
         {
             "rule_id": h.rule_id,
             "label": h.label,
@@ -286,25 +406,46 @@ def detect_major_risk_events(symbol: str) -> dict[str, Any]:
             "notice_date": h.notice_date,
             "url": h.url,
             "source": "notice",
+            "severity": h.severity,
         }
         for h in hits
     ]
 
-    pledge_ratio = fetch_controller_pledge_ratio(sym)
-    if pledge_ratio is not None and pledge_ratio >= PLEDGE_FATAL_RATIO:
+    pledge_info = fetch_controller_pledge_ratio(sym)
+    pledge_ratio = pledge_info.get("ratio")
+    pledge_invalid = bool(pledge_info.get("invalid"))
+    if pledge_ratio is not None and pledge_ratio >= PLEDGE_OBSERVE_RATIO:
+        holder = pledge_info.get("holder") or "控股/重要股东"
         events.append(
             {
-                "rule_id": "pledge_crisis",
-                "label": "控股股东高比例质押",
+                "rule_id": "pledge_high",
+                "label": "大股东高比例质押（观察）",
                 "keyword": f"质押率{pledge_ratio:.1%}",
-                "title": f"控股股东/重要股东累计质押占所持股份约 {pledge_ratio:.1%}（≥{PLEDGE_FATAL_RATIO:.0%}）",
+                "title": (
+                    f"{holder}单笔质押占所持股份约 {pledge_ratio:.1%}"
+                    f"（≥{PLEDGE_OBSERVE_RATIO:.0%}，属个人财务安排观察项，非公司生存危机）"
+                ),
                 "notice_date": "",
                 "url": "",
                 "source": "pledge",
+                "severity": "observe",
+            }
+        )
+    elif pledge_invalid:
+        events.append(
+            {
+                "rule_id": "pledge_data_error",
+                "label": "质押率数据异常（需复核）",
+                "keyword": ">100%",
+                "title": "抓取到质押率超过100%，疑似字段误用，已忽略该数值、不触发熔断",
+                "notice_date": "",
+                "url": "",
+                "source": "pledge",
+                "severity": "observe",
             }
         )
 
-    # 每个规则只保留最新一条公告，避免红灯列表刷屏
+    # 每规则保留最新一条
     deduped: list[dict[str, Any]] = []
     seen_rules: set[str] = set()
     for ev in events:
@@ -315,21 +456,31 @@ def detect_major_risk_events(symbol: str) -> dict[str, Any]:
         deduped.append(ev)
     events = deduped
 
+    survival = [e for e in events if e.get("severity") == "survival"]
+    observe = [e for e in events if e.get("severity") != "survival"]
+
     audit_opinion = None
-    for ev in events:
+    for ev in survival:
         if ev.get("rule_id") == "audit_nonstd":
             audit_opinion = str(ev.get("title") or "")[:80]
             break
 
+    fatal = bool(survival)
     result = {
-        "fatal": bool(events),
-        "events": events,
-        "event_count": len(events),
+        "fatal": fatal,
+        "events": survival,  # 红灯只列生存级
+        "observe_events": observe,
+        "event_count": len(survival),
+        "observe_count": len(observe),
         "notice_scanned": len(notices),
         "pledge_ratio": pledge_ratio,
-        "message": COMPLIANCE_VETO_MESSAGE if events else "",
+        "pledge_invalid": pledge_invalid,
+        "pledge_holder": pledge_info.get("holder") or "",
+        "message": COMPLIANCE_VETO_MESSAGE if fatal else "",
+        "observe_message": OBSERVE_RISK_MESSAGE if observe and not fatal else "",
         "audit_opinion_hint": audit_opinion,
-        "labels": sorted({str(e["label"]) for e in events}),
+        "labels": sorted({str(e["label"]) for e in survival}),
+        "observe_labels": sorted({str(e["label"]) for e in observe}),
     }
     _cache[sym.upper()] = (now, result)
     return dict(result)

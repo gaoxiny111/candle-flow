@@ -6,7 +6,7 @@ from app.analysis.base import AnalysisLevel, BaseAnalyzer, ModuleResult, score_t
 
 
 class RiskAnalyzer(BaseAnalyzer):
-    """排雷：商誉、应收、存贷双高、现金流背离、ST/退市。"""
+    """排雷：商誉、应收、存贷双高、现金流背离、ST/退市；观察级质押不按生存危机处理。"""
 
     def analyze(self, financial_data: pd.DataFrame, **kwargs) -> ModuleResult:
         warnings: list[str] = []
@@ -37,11 +37,17 @@ class RiskAnalyzer(BaseAnalyzer):
         if ar0 > 0 and rev0 > 0:
             ar_growth = ar1 / ar0 - 1
             rev_growth = rev1 / rev0 - 1
-            if rev_growth < 0 and ar_growth > rev_growth:
+            # 营收高增且应收增速≥营收2倍 → 营运资本占用；其余应收恶化 → 回款困难
+            if rev_growth >= 0.20 and ar_growth > rev_growth * 2 and ar_growth > 0.2:
+                warnings.append(
+                    "应收账款与存货激增，营运资本占用严重，需警惕下游需求放缓带来的坏账与减值风险"
+                )
+                risk_score -= 15
+            elif rev_growth < 0 and ar_growth > rev_growth:
                 warnings.append("应收账款周转恶化，回款极其困难")
                 risk_score -= 15
-            elif rev_growth > 0 and ar_growth > rev_growth + 0.3 and ar_growth > rev_growth * 2:
-                warnings.append("应收账款增速远超营收，可能存在虚增收入风险")
+            elif rev_growth >= 0 and ar_growth > rev_growth + 0.10:
+                warnings.append("应收账款周转恶化，回款极其困难")
                 risk_score -= 15
 
         cash = float(latest.get("monetary_funds", 0) or 0)
@@ -70,10 +76,23 @@ class RiskAnalyzer(BaseAnalyzer):
             warnings.append(f"净利润连续{consec_loss}年为负，基本面持续恶化")
             risk_score -= 20
 
-        pledge_ratio = float(kwargs.get("pledge_ratio") or 0)
-        if pledge_ratio > 0.5:
-            warnings.append(f"大股东质押率 {pledge_ratio:.0%}，平仓风险")
-            risk_score -= 20
+        # 质押：脏数据不参与；高质押仅观察扣分，不按退市危机
+        if kwargs.get("pledge_invalid"):
+            warnings.append("质押率数据异常（>100%），已忽略，请人工复核字段")
+        else:
+            pledge_ratio = float(kwargs.get("pledge_ratio") or 0)
+            if pledge_ratio > 1.0:
+                warnings.append(f"质押率读数异常 {pledge_ratio:.0%}，已忽略")
+            elif pledge_ratio >= 0.8:
+                warnings.append(
+                    f"大股东质押率约 {pledge_ratio:.0%}（观察级：多为个人融资安排，≠公司生存危机）"
+                )
+                risk_score -= 15
+            elif pledge_ratio >= 0.5:
+                warnings.append(
+                    f"大股东质押率约 {pledge_ratio:.0%}（观察级，警惕情绪杀跌）"
+                )
+                risk_score -= 8
 
         audit = kwargs.get("audit_opinion", "标准无保留")
         if audit and audit != "标准无保留":
@@ -84,9 +103,16 @@ class RiskAnalyzer(BaseAnalyzer):
         if major_events:
             labels = sorted({str(e.get("label") or "") for e in major_events if e.get("label")})
             if labels:
-                warnings.append("重大风险事件：" + "、".join(labels))
+                warnings.append("生存级重大风险：" + "、".join(labels))
             risk_score = min(risk_score, 15.0)
             delist_risk = True
+
+        observe_events = kwargs.get("observe_risk_events") or []
+        if observe_events:
+            labels = sorted({str(e.get("label") or "") for e in observe_events if e.get("label")})
+            if labels:
+                warnings.append("观察级风险：" + "、".join(labels) + "（扣分但不否决）")
+            risk_score -= min(30.0, 12.0 * len(observe_events))
 
         risk_score = max(0.0, risk_score)
         return ModuleResult(
@@ -98,5 +124,6 @@ class RiskAnalyzer(BaseAnalyzer):
                 "delist_risk": delist_risk,
                 "consecutive_loss_years": int(consec_loss),
                 "major_risk_count": len(major_events),
+                "observe_risk_count": len(observe_events),
             },
         )

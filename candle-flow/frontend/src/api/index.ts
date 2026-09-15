@@ -902,11 +902,26 @@ export interface FundamentalAnalysisReport {
       notice_date?: string
       url?: string
       source?: string
+      severity?: string
+    }>
+    observe_events?: Array<{
+      rule_id?: string
+      label?: string
+      keyword?: string
+      title?: string
+      notice_date?: string
+      url?: string
+      source?: string
+      severity?: string
     }>
     event_count?: number
+    observe_count?: number
     message?: string
+    observe_message?: string
     labels?: string[]
+    observe_labels?: string[]
     pledge_ratio?: number | null
+    pledge_invalid?: boolean
   }
   peer_sample_ok?: boolean
   modules: Record<string, AnalysisModule>

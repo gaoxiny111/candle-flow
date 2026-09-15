@@ -109,9 +109,36 @@ class GrowthAnalyzer(BaseAnalyzer):
                 )
             )
 
+        # 扣非一票否决：归母净利同比高增（或已转正）但扣非仍为负 → 利润幻增
+        deducted = kwargs.get("deducted_net_profit")
+        parent_np = kwargs.get("parent_net_profit")
+        profit_illusion = False
+        if deducted is not None and float(deducted) < 0:
+            parent_pos = parent_np is not None and float(parent_np) > 0
+            yoy_strong = yoy_profit is not None and float(yoy_profit) >= 15
+            if parent_pos or yoy_strong:
+                profit_illusion = True
+                ded_wan = float(deducted) / 1e4
+                indicators.append(
+                    IndicatorResult(
+                        name="扣非净利润(万元)",
+                        value=round(ded_wan, 2),
+                        score=25.0,
+                        level=AnalysisLevel.POOR,
+                        weight=4.0,
+                        period=yoy_period,
+                        comment="扣非仍为负：主业未恢复，表观盈利依赖非经常性损益",
+                    )
+                )
+                warnings.append(
+                    "主业造血能力未恢复，利润依赖非经常性损益（扣非净利润仍为负）"
+                )
+
         # V 型反转：历史 CAGR 为负，但最新同比显著转正（含温和复苏）
+        # 扣非仍为负时不给 V 型高分，避免「非经常性损益」制造假拐点
         v_shape = (
-            profit_cagr_3y < 0
+            not profit_illusion
+            and profit_cagr_3y < 0
             and yoy_profit is not None
             and float(yoy_profit) >= 8
             and yoy_rev is not None
@@ -136,17 +163,24 @@ class GrowthAnalyzer(BaseAnalyzer):
                 )
             )
             warnings.append("近3年净利润复合增速为负，但最新报告期已现拐点，需观察持续性")
-        elif profit_cagr_3y < 0:
+        elif profit_cagr_3y < 0 and not profit_illusion:
             warnings.append("近3年净利润复合增速为负，盈利能力持续下滑")
         if yoy_rev is not None and float(yoy_rev) < -15:
             warnings.append("最新报告期营收同比下滑超15%，需重点关注")
 
         module_score = self._weighted_score(indicators)
+        # 扣非否决：成长性强制压至 D 档（≤40）
+        if profit_illusion:
+            module_score = min(module_score, 38.0)
         return ModuleResult(
             module_name="成长性",
             score=round(module_score, 1),
             level=score_to_level(module_score),
             indicators=indicators,
             warnings=warnings,
-            metadata={"v_shape": bool(v_shape)},
+            metadata={
+                "v_shape": bool(v_shape),
+                "profit_illusion": bool(profit_illusion),
+                "deducted_net_profit": float(deducted) if deducted is not None else None,
+            },
         )

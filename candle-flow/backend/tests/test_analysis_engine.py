@@ -286,6 +286,36 @@ def test_ar_warning_collection_vs_inflation():
     assert not any("虚增收入" in w for w in result.warnings)
 
 
+def test_ar_surge_warns_working_capital_not_fraud():
+    """营收高增且应收增速≥2倍 → 营运资本占用/坏账减值，不指控虚增收入。"""
+    rows = [
+        {"revenue": 100e8, "net_profit": 10e8, "equity": 50e8, "operating_cashflow": 12e8,
+         "capital_expenditure": 2e8, "accounts_receivable": 10e8},
+        {"revenue": 130e8, "net_profit": 12e8, "equity": 55e8, "operating_cashflow": 8e8,
+         "capital_expenditure": 2e8, "accounts_receivable": 28e8},
+    ]
+    fd = pd.DataFrame(rows, index=["20241231", "20251231"])
+    result = CashflowAnalyzer().analyze(fd)
+    assert any("营运资本占用" in w for w in result.warnings)
+    assert any("坏账与减值" in w for w in result.warnings)
+    assert not any("虚增收入" in w for w in result.warnings)
+
+
+def test_ar_moderate_growth_warns_collection():
+    """温和增收但应收增速更快 → 回款困难，而非营运资本/造假话术。"""
+    rows = [
+        {"revenue": 100e8, "net_profit": 5e8, "equity": 40e8, "operating_cashflow": 6e8,
+         "capital_expenditure": 1e8, "accounts_receivable": 20e8},
+        {"revenue": 113e8, "net_profit": 5.5e8, "equity": 41e8, "operating_cashflow": 4e8,
+         "capital_expenditure": 1e8, "accounts_receivable": 28e8},
+    ]
+    fd = pd.DataFrame(rows, index=["20241231", "20251231"])
+    result = CashflowAnalyzer().analyze(fd)
+    assert any("回款极其困难" in w for w in result.warnings)
+    assert not any("虚增收入" in w for w in result.warnings)
+    assert not any("营运资本占用" in w for w in result.warnings)
+
+
 def test_value_trap_caps_valuation_for_st_loss(monkeypatch):
     """ST + 连续亏损时，低 PB 不得把估值分打到高分。"""
     from app.analysis.base import AnalysisLevel, ModuleResult

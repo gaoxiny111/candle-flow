@@ -25,6 +25,7 @@ class CashflowAnalyzer(BaseAnalyzer):
         capex = fd.get("capital_expenditure", pd.Series(0, index=fd.index))
         fcf = ocf - capex
         cash_ratio: float | None = None
+        use_latest = False
 
         # 连续亏损 + 经营/自由现金流为正 → 「纸面富贵」（常靠拖欠应付挤出现金）
         profit_clean = fd["net_profit"].dropna()
@@ -48,28 +49,77 @@ class CashflowAnalyzer(BaseAnalyzer):
             and ocf_latest > 0
         )
 
+        cash_ratio_series = pd.Series(dtype=float)
+        annual_cash_ratio: float | None = None
         if len(ocf.dropna()) and len(net_profit.dropna()):
             cash_ratio_series = (ocf / net_profit).replace([np.inf, -np.inf], np.nan).dropna()
-            cash_ratio = float(cash_ratio_series.iloc[-1]) if len(cash_ratio_series) else 0.0
-            # 净利为负时 OCF/净利 符号失真，不按「含金量」高分逻辑
-            if float(profit_clean.iloc[-1]) < 0:
+            annual_cash_ratio = float(cash_ratio_series.iloc[-1]) if len(cash_ratio_series) else None
+
+        latest_cr = kwargs.get("latest_cash_ratio")
+        use_latest = bool(
+            latest_cr is not None
+            and latest_period
+            and (not annual_period or latest_period != annual_period)
+        )
+        if use_latest or annual_cash_ratio is not None or latest_cr is not None:
+            if use_latest:
+                cash_ratio = float(latest_cr)  # type: ignore[arg-type]
+                period_for_cr = latest_period
+            elif latest_cr is not None and annual_cash_ratio is None:
+                cash_ratio = float(latest_cr)
+                period_for_cr = latest_period or annual_period
+                use_latest = True
+            else:
+                cash_ratio = float(annual_cash_ratio or 0.0)
+                period_for_cr = annual_period
+
+            profit_for_sign = float(profit_clean.iloc[-1]) if len(profit_clean) else 0.0
+            if use_latest and kwargs.get("eps") is not None and float(kwargs.get("eps") or 0) < 0:
+                profit_for_sign = -1.0
+            if profit_for_sign < 0:
                 score, level = 35.0, AnalysisLevel.POOR
                 cr_comment = "净利为负时该比率失真，不按利润含金量解读"
             else:
                 score, level = self._score_by_range(cash_ratio, (1.0, 5.0), (0.7, 1.0), (0.4, 0.7))
                 cr_comment = ">1 利润含金量高，<0.5 警惕利润注水"
+                if use_latest and cash_ratio < 0.4:
+                    score = min(score, 25.0)
+                    level = AnalysisLevel.DANGER
+                    cr_comment = (
+                        f"当期({period_for_cr})经营现金流/净利仅 {cash_ratio:.1%}，"
+                        f"显著弱于健康阈值；勿被上年年报高含金量掩盖"
+                    )
+                    warnings.append(
+                        f"当期现金流恶化：经营现金流/净利润={cash_ratio:.1%}（{period_for_cr}），"
+                        f"利润含金量偏低"
+                    )
             indicators.append(
                 IndicatorResult(
                     name="经营现金流/净利润",
                     value=round(cash_ratio, 2),
                     score=score,
                     level=level,
-                    trend=self._calc_trend(cash_ratio_series),
-                    weight=3.0,
+                    trend=self._calc_trend(cash_ratio_series) if len(cash_ratio_series) else "flat",
+                    weight=3.5 if use_latest and cash_ratio < 0.4 else 3.0,
                     comment=cr_comment,
-                    period=annual_period,
+                    period=period_for_cr,
                 )
             )
+            if use_latest and annual_cash_ratio is not None:
+                a_score, a_level = self._score_by_range(
+                    annual_cash_ratio, (1.0, 5.0), (0.7, 1.0), (0.4, 0.7)
+                )
+                indicators.append(
+                    IndicatorResult(
+                        name="年报经营现金流/净利润",
+                        value=round(annual_cash_ratio, 2),
+                        score=a_score,
+                        level=a_level,
+                        weight=1.0,
+                        comment="对照上年年报口径，当期以最新报告期为准",
+                        period=annual_period,
+                    )
+                )
 
         if len(fcf.dropna()):
             fcf_val = float(fcf.iloc[-1])
@@ -189,11 +239,16 @@ class CashflowAnalyzer(BaseAnalyzer):
             rev = fd["revenue"].pct_change(fill_method=None).iloc[-1]
             if pd.notna(ar) and pd.notna(rev):
                 ar_g, rev_g = float(ar), float(rev)
-                if rev_g < 0 and ar_g > rev_g:
-                    # 营收下滑而应收降幅更小/仍增 → 回款困难，非虚增
+                # 营收高增且应收增速≥营收2倍 → 营运资本占用（非财务造假指控）
+                if rev_g >= 0.20 and ar_g > rev_g * 2 and ar_g > 0.2:
+                    warnings.append(
+                        "应收账款与存货激增，营运资本占用严重，需警惕下游需求放缓带来的坏账与减值风险"
+                    )
+                # 营收下滑或温和增长下应收相对恶化 → 回款困难（如文旅等长账期）
+                elif rev_g < 0 and ar_g > rev_g:
                     warnings.append("应收账款周转恶化，回款极其困难")
-                elif rev_g > 0 and ar_g > rev_g * 2 and ar_g > 0.2:
-                    warnings.append("应收账款增速远超营收，可能存在虚增收入风险")
+                elif rev_g >= 0 and ar_g > rev_g + 0.10:
+                    warnings.append("应收账款周转恶化，回款极其困难")
 
         if len(ocf.dropna()) >= 3 and (ocf.iloc[-3:] < 0).all():
             warnings.append("经营现金流连续3期为负，造血能力严重不足")

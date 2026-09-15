@@ -74,15 +74,17 @@ const displayWarnings = computed(() => {
   const skip = new Set<string>()
   if (report.value?.cashflow_veto) skip.add('现金流不合格，暂不具备价值投资条件')
   if (report.value?.compliance_veto) {
+    skip.add('命中生存级重大风险事件，财务打分不适用；请优先关注合规与生存风险')
     skip.add('命中重大风险事件，财务打分不适用；请优先关注合规与生存风险')
   }
+  skip.add('命中观察级风险，警惕情绪杀跌；不等于公司生存危机')
   // 行业 N/A 已在模块头展示，避免风险提示重复刷屏
   skip.add('N/A（样本不足）')
-  // 重大风险事件明细已在顶部红灯卡片展示
-  return list.filter((w) => !skip.has(w) && !w.startsWith('【'))
+  // 重大风险事件明细已在顶部卡片展示
+  return list.filter((w) => !skip.has(w) && !w.startsWith('【') && !w.startsWith('〔观察〕'))
 })
-
 const majorRiskEvents = computed(() => report.value?.major_risks?.events ?? [])
+const observeRiskEvents = computed(() => report.value?.major_risks?.observe_events ?? [])
 </script>
 
 <template>
@@ -134,12 +136,30 @@ const majorRiskEvents = computed(() => report.value?.major_risks?.events ?? [])
       </div>
 
       <div v-if="report.compliance_veto" class="veto-banner compliance" role="alert">
-        <div class="veto-title">重大风险事件 · 合规与生存风险一票否决</div>
+        <div class="veto-title">生存级重大风险 · 一票否决</div>
         <div class="veto-msg">
-          {{ report.major_risks?.message || '命中重大风险事件，财务打分不适用；请优先关注合规与生存风险' }}
+          {{ report.major_risks?.message || '命中生存级重大风险事件，财务打分不适用；请优先关注合规与生存风险' }}
         </div>
         <ul v-if="majorRiskEvents.length" class="veto-events">
           <li v-for="(ev, i) in majorRiskEvents" :key="i">
+            <span class="ev-label">{{ ev.label }}</span>
+            <span v-if="ev.notice_date" class="ev-date">{{ ev.notice_date }}</span>
+            <span class="ev-title">{{ ev.title }}</span>
+          </li>
+        </ul>
+      </div>
+
+      <div
+        v-else-if="observeRiskEvents.length"
+        class="veto-banner observe"
+        role="status"
+      >
+        <div class="veto-title">观察级风险 · 扣分但不否决</div>
+        <div class="veto-msg">
+          {{ report.major_risks?.observe_message || '警惕情绪杀跌；大股东质押等≠公司生存危机' }}
+        </div>
+        <ul class="veto-events">
+          <li v-for="(ev, i) in observeRiskEvents" :key="i">
             <span class="ev-label">{{ ev.label }}</span>
             <span v-if="ev.notice_date" class="ev-date">{{ ev.notice_date }}</span>
             <span class="ev-title">{{ ev.title }}</span>
@@ -360,6 +380,25 @@ const majorRiskEvents = computed(() => report.value?.major_risks?.events ?? [])
 }
 .veto-banner.compliance {
   font-weight: 500;
+}
+.veto-banner.observe {
+  background: #fffbe6;
+  border-color: #ffe58f;
+  color: #ad6800;
+  font-weight: 500;
+}
+.veto-banner.observe .ev-date,
+.veto-banner.observe .ev-title {
+  color: #876800;
+}
+[data-theme='dark'] .veto-banner.observe {
+  background: #2b2111;
+  border-color: #ad6800;
+  color: #ffc069;
+}
+[data-theme='dark'] .veto-banner.observe .ev-date,
+[data-theme='dark'] .veto-banner.observe .ev-title {
+  color: #ffe7ba;
 }
 .veto-banner .veto-title {
   font-weight: 700;

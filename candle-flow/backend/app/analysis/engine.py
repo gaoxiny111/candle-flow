@@ -207,7 +207,13 @@ class FundamentalEngine:
             "name": meta.get("name") or market.get("name") or "",
             "audit_opinion": major_risks.get("audit_opinion_hint") or "标准无保留",
             "pledge_ratio": major_risks.get("pledge_ratio") or 0,
+            "pledge_invalid": bool(major_risks.get("pledge_invalid")),
             "major_risk_events": major_risks.get("events") or [],
+            "observe_risk_events": major_risks.get("observe_events") or [],
+            "latest_cash_ratio": meta.get("latest_cash_ratio"),
+            "eps": meta.get("eps"),
+            "deducted_net_profit": meta.get("deducted_net_profit"),
+            "parent_net_profit": meta.get("parent_net_profit"),
             "industry_avg": industry_averages(meta.get("industry", ""), meta.get("latest_report")),
             **kwargs,
         }
@@ -277,7 +283,7 @@ class FundamentalEngine:
             if CASHFLOW_VETO_MESSAGE not in all_warnings:
                 all_warnings.insert(0, CASHFLOW_VETO_MESSAGE)
 
-        # 公告关键词重大风险：顶部红灯，强制 E，估值陷阱否决，财务分仅作参考
+        # 生存级重大风险：顶部红灯，强制 E；观察级仅警告/扣分，不熔断
         compliance_veto = bool(major_risks.get("fatal"))
         if compliance_veto:
             letter = "E"
@@ -300,13 +306,28 @@ class FundamentalEngine:
                 (base_r + "；" if base_r else "")
                 + "合规/生存风险一票否决，财务与相对估值仅作参考"
             )
-            pr = major_risks.get("pledge_ratio")
-            if pr is not None and module_results.get("risk") is not None:
-                # 同步质押率到风险模块元数据（展示用）
-                risk_dict = module_results["risk"]
-                risk_dict.metadata["pledge_ratio"] = pr
-                risk_dict.metadata["compliance_veto"] = True
+            if module_results.get("risk") is not None:
+                module_results["risk"].metadata["compliance_veto"] = True
 
+        observe_events = major_risks.get("observe_events") or []
+        if observe_events and not compliance_veto:
+            obs_msg = major_risks.get("observe_message") or "命中观察级风险，警惕情绪杀跌"
+            if obs_msg not in all_warnings:
+                all_warnings.insert(0, obs_msg)
+            for ev in observe_events:
+                line = f"〔观察〕【{ev.get('label')}】{ev.get('notice_date') or ''} {ev.get('title') or ''}".strip()
+                if line and line not in all_warnings:
+                    all_warnings.append(line)
+            # 观察级软扣分：综合分下调，但不强制 E、不触发价值陷阱
+            composite = round(max(0.0, composite - min(30.0, 8.0 * len(observe_events))), 1)
+            letter = rating_label(composite)
+
+        pr = major_risks.get("pledge_ratio")
+        if pr is not None and module_results.get("risk") is not None:
+            module_results["risk"].metadata["pledge_ratio"] = pr
+            module_results["risk"].metadata["pledge_invalid"] = bool(
+                major_risks.get("pledge_invalid")
+            )
         peer_sample_ok = bool(valuation.get("peer_sample_ok"))
         ind = module_results.get("industry")
         if ind is not None and ind.metadata.get("insufficient_sample"):
