@@ -229,11 +229,15 @@ def industry_averages(industry: str, report_date: str | None) -> dict[str, float
     """同行业 ROE / 营收增速中位数（避免均值被极值拉偏）。"""
     if not industry or not report_date:
         return {}
-    # 行业对比用年报更稳
-    d = str(report_date)
-    if not _is_annual(d) and len(d) >= 4:
-        d = f"{d[:4]}1231"
-    df = _fetch_yjbb(d)
+    # 行业对比用年报更稳；中报回退上一完整年报，并在空表时再回退
+    from app.analysis.models.comps import _yjbb_annual_candidates
+
+    df = None
+    for d in _yjbb_annual_candidates(report_date):
+        cand = _fetch_yjbb(d)
+        if cand is not None and not cand.empty and "所处行业" in cand.columns:
+            df = cand
+            break
     if df is None or df.empty:
         return {}
     sub = df[df["所处行业"].astype(str) == industry]

@@ -608,67 +608,109 @@ async function switchBoardTab(tab: 'watch' | 'market') {
         <div v-if="!marketScanning && !marketItems.length && !marketScanError" class="empty">
           暂无达标看涨强共振。可点「重新扫描」，或先在图表页同步更多股票的 K 线。
         </div>
-        <div v-else-if="filteredMarketItems.length" class="watch-table-wrap">
-          <table class="watch-table market-table">
-            <thead>
-              <tr>
-                <th>等级</th>
-                <th>股票</th>
-                <th>代码</th>
-                <th>形态</th>
-                <th>共振</th>
-                <th>综合强度</th>
-                <th>ROE</th>
-                <th>PE</th>
-                <th>负债率</th>
-                <th>日期</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr
-                v-for="item in filteredMarketItems"
-                :key="item.symbol + item.pattern_name + item.candle_date"
-                class="watch-row market-hit"
-                :class="'tier-row-' + (item.tier || '').toLowerCase()"
-              >
-                <td>
-                  <span class="tier-badge" :class="'tier-' + (item.tier || '').toLowerCase()">
-                    {{ tierLabel(item.tier) }}
-                  </span>
-                </td>
-                <td class="symbol-name">{{ item.name || '—' }}</td>
-                <td class="symbol-code">{{ item.symbol.split('.')[0] }}</td>
-                <td>
-                  <div class="pattern-cell">{{ patternNameZh(item.pattern_name) }}</div>
-                  <div class="muted">形态分 {{ item.pattern_score }}</div>
-                </td>
-                <td>
-                  <div class="confluence-highlight">汇聚 {{ item.confluence_count }} 项</div>
-                  <div class="hit-tags">
-                    <span v-for="h in item.confluence_detail.slice(0, 4)" :key="h.name" class="hit-tag">
-                      {{ h.name }}
+        <template v-else-if="filteredMarketItems.length">
+          <div class="watch-table-wrap">
+            <table class="watch-table market-table">
+              <thead>
+                <tr>
+                  <th>等级</th>
+                  <th>股票</th>
+                  <th>代码</th>
+                  <th>形态</th>
+                  <th>共振</th>
+                  <th>综合强度</th>
+                  <th>ROE</th>
+                  <th>PE</th>
+                  <th>负债率</th>
+                  <th>日期</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="item in filteredMarketItems"
+                  :key="item.symbol + item.pattern_name + item.candle_date"
+                  class="watch-row market-hit"
+                  :class="'tier-row-' + (item.tier || '').toLowerCase()"
+                >
+                  <td>
+                    <span class="tier-badge" :class="'tier-' + (item.tier || '').toLowerCase()">
+                      {{ tierLabel(item.tier) }}
                     </span>
-                  </div>
-                </td>
-                <td class="score-cell strong">{{ item.combined_score }}</td>
-                <td class="div-cell">
-                  {{ item.roe != null ? item.roe.toFixed(1) + '%' : '—' }}
-                </td>
-                <td class="div-cell">
-                  {{ item.pe_ttm != null ? item.pe_ttm.toFixed(1) : '—' }}
-                </td>
-                <td class="div-cell">
-                  {{ item.debt_ratio != null ? item.debt_ratio.toFixed(1) + '%' : '—' }}
-                </td>
-                <td>{{ item.candle_date }}</td>
-                <td>
-                  <button type="button" class="link-btn" @click="openDetail(item.symbol)">详情</button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
+                  </td>
+                  <td class="symbol-name">{{ item.name || '—' }}</td>
+                  <td class="symbol-code">{{ item.symbol.split('.')[0] }}</td>
+                  <td>
+                    <div class="pattern-cell">{{ patternNameZh(item.pattern_name) }}</div>
+                    <div class="muted">形态分 {{ item.pattern_score }}</div>
+                  </td>
+                  <td>
+                    <div class="confluence-highlight">汇聚 {{ item.confluence_count }} 项</div>
+                    <div class="hit-tags">
+                      <span v-for="h in item.confluence_detail.slice(0, 4)" :key="h.name" class="hit-tag">
+                        {{ h.name }}
+                      </span>
+                    </div>
+                  </td>
+                  <td class="score-cell strong">{{ item.combined_score }}</td>
+                  <td class="div-cell">
+                    {{ item.roe != null ? item.roe.toFixed(1) + '%' : '—' }}
+                  </td>
+                  <td class="div-cell">
+                    {{ item.pe_ttm != null ? item.pe_ttm.toFixed(1) : '—' }}
+                  </td>
+                  <td class="div-cell">
+                    {{ item.debt_ratio != null ? item.debt_ratio.toFixed(1) + '%' : '—' }}
+                  </td>
+                  <td>{{ item.candle_date }}</td>
+                  <td>
+                    <button type="button" class="link-btn" @click="openDetail(item.symbol)">详情</button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="watch-cards market-cards">
+            <article
+              v-for="item in filteredMarketItems"
+              :key="'mkt-' + item.symbol + item.pattern_name + item.candle_date"
+              class="watch-card market-card"
+              :class="'tier-row-' + (item.tier || '').toLowerCase()"
+              @click="openDetail(item.symbol)"
+            >
+              <div class="watch-card-head">
+                <div>
+                  <div class="watch-card-name">{{ item.name || '—' }}</div>
+                  <div class="symbol-code">{{ item.symbol.split('.')[0] }}</div>
+                </div>
+                <span class="tier-badge" :class="'tier-' + (item.tier || '').toLowerCase()">
+                  {{ tierLabel(item.tier) }}
+                </span>
+              </div>
+              <div class="watch-card-quote">
+                <span>综合 {{ item.combined_score }}</span>
+                <span class="muted">{{ item.candle_date }}</span>
+              </div>
+              <div class="watch-card-metrics">
+                <div><span class="k">形态</span><span>{{ patternNameZh(item.pattern_name) }}</span></div>
+                <div><span class="k">共振</span><span>{{ item.confluence_count }} 项</span></div>
+                <div><span class="k">ROE</span><span>{{ item.roe != null ? item.roe.toFixed(1) + '%' : '—' }}</span></div>
+                <div><span class="k">PE</span><span>{{ item.pe_ttm != null ? item.pe_ttm.toFixed(1) : '—' }}</span></div>
+                <div><span class="k">负债率</span><span>{{ item.debt_ratio != null ? item.debt_ratio.toFixed(1) + '%' : '—' }}</span></div>
+                <div><span class="k">形态分</span><span>{{ item.pattern_score }}</span></div>
+              </div>
+              <div v-if="item.confluence_detail?.length" class="hit-tags market-card-tags">
+                <span v-for="h in item.confluence_detail.slice(0, 4)" :key="h.name" class="hit-tag">
+                  {{ h.name }}
+                </span>
+              </div>
+              <div class="watch-card-head market-card-foot">
+                <span class="muted">点按查看详情</span>
+                <button type="button" class="link-btn" @click.stop="openDetail(item.symbol)">详情</button>
+              </div>
+            </article>
+          </div>
+        </template>
         <div v-else-if="marketItems.length" class="empty">当前等级下暂无股票，可切换筛选。</div>
       </template>
     </section>
@@ -991,6 +1033,8 @@ th { color: var(--text-secondary); font-weight: 500; }
   .watch-card-metrics .k { color: var(--text-secondary); margin-right: 0; }
   .watch-card-signals { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-color); display: flex; flex-direction: column; gap: 8px; }
   .watch-card.has-hold { border-color: color-mix(in srgb, var(--color-primary) 35%, var(--border-color)); }
+  .market-card-tags { margin-top: 8px; flex-wrap: wrap; }
+  .market-card-foot { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-color); }
   th, td { padding: 8px; }
   .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 }

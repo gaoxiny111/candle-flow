@@ -163,6 +163,50 @@ def test_calculate_comparable_valuation_enough_peers(monkeypatch):
     assert result["signal"] == "低估"
 
 
+def test_annual_report_date_falls_back_for_interim():
+    from app.analysis.models.comps import _annual_report_date, _yjbb_annual_candidates
+
+    assert _annual_report_date("20260630") == "20251231"
+    assert _annual_report_date("20251231") == "20251231"
+    assert _annual_report_date("20250331") == "20241231"
+    cands = _yjbb_annual_candidates("20260630")
+    assert cands[0] == "20251231"
+    assert "20241231" in cands
+
+
+def test_select_comparables_relaxes_cap_for_leader(monkeypatch):
+    """龙头市值远大于同行时，最终取消市值闸门仍能选出可比。"""
+    peers = [
+        {"symbol": f"60000{i}.SH", "name": f"P{i}", "net_profit": 1e8, "net_assets": 5e8, "revenue": 8e8, "eps": 1.0, "roe": 15}
+        for i in range(1, 7)
+    ]
+    monkeypatch.setattr("app.analysis.models.comps._industry_peer_rows", lambda *a, **k: peers)
+
+    def fake_quotes(symbols, db=None):
+        # 目标市值 300e8，同行全在 50e8（偏离 >100%）
+        return {
+            s.upper(): {
+                "symbol": s,
+                "name": s,
+                "pe_ttm": 10.0 + i,
+                "pb": 2.0,
+                "market_cap": 50e8,
+                "price": 10.0,
+            }
+            for i, s in enumerate(symbols)
+        }
+
+    monkeypatch.setattr("app.analysis.models.comps._batch_quotes", fake_quotes)
+    comps = select_comparables(
+        "600000.SH",
+        industry="测试",
+        report_date="20260630",
+        target_market_cap=300e8,
+        limit=5,
+    )
+    assert len(comps) == 5
+
+
 def test_select_comparables_filters_cap_and_limits(monkeypatch):
     peers = [
         {"symbol": f"60000{i}.SH", "name": f"P{i}", "net_profit": 1e8, "net_assets": 5e8, "revenue": 8e8, "eps": 1.0, "roe": 15}

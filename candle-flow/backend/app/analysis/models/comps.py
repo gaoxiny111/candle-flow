@@ -44,12 +44,35 @@ def _pick(row: Any, *keys: str) -> float | None:
 
 
 def _annual_report_date(report_date: str | None) -> str | None:
+    """
+    同业对比用年报口径。
+    中报/季报不能映射到「当年 1231」——当年年报通常尚未披露，应回退到上一完整年报。
+    例：20260630 → 20251231；20251231 → 20251231。
+    """
     if not report_date:
         return None
-    d = str(report_date)
-    if len(d) >= 8 and not d.endswith("1231"):
-        return f"{d[:4]}1231"
-    return d
+    d = str(report_date).replace("-", "")[:8]
+    if len(d) < 8:
+        return str(report_date)
+    if d.endswith("1231"):
+        return d
+    try:
+        y = int(d[:4])
+    except ValueError:
+        return d
+    return f"{y - 1}1231"
+
+
+def _yjbb_annual_candidates(report_date: str | None) -> list[str]:
+    """优先最近可用年报，再逐年回退（避免空表/未披露年报）。"""
+    primary = _annual_report_date(report_date)
+    if not primary or len(primary) < 4:
+        return []
+    try:
+        y = int(primary[:4])
+    except ValueError:
+        return [primary]
+    return [f"{yy}1231" for yy in range(y, y - 4, -1)]
 
 
 def _shares_from_market(market: dict[str, Any]) -> float | None:
@@ -117,11 +140,17 @@ def _industry_peer_rows(
     exclude: str,
 ) -> list[dict[str, Any]]:
     """同行业股票池（业绩快报），已剔除指数/ETF/ST/亏损。"""
-    d = _annual_report_date(report_date)
-    if not industry or not d:
+    if not industry:
         return []
-    df = _fetch_yjbb(d)
-    if df is None or df.empty or "所处行业" not in df.columns:
+    df = None
+    used_date = None
+    for d in _yjbb_annual_candidates(report_date):
+        cand = _fetch_yjbb(d)
+        if cand is not None and not cand.empty and "所处行业" in cand.columns:
+            df = cand
+            used_date = d
+            break
+    if df is None or df.empty:
         return []
 
     exclude_key = exclude.upper()
@@ -159,6 +188,7 @@ def _industry_peer_rows(
                 "revenue": _pick(row, "营业总收入", "营业总收入-营业总收入"),
                 "eps": _pick(row, "每股收益"),
                 "roe": roe,
+                "peer_report_date": used_date,
             }
         )
     # 精确同行优先；不足再并入近似行业
@@ -244,6 +274,9 @@ def select_comparables(
     # 样本不足时放宽市值偏离，尽量凑够 MIN_PEER_SAMPLE
     if len(selected) < MIN_PEER_SAMPLE and cap_diff_max < CAP_DIFF_RELAXED:
         selected = _rank(CAP_DIFF_RELAXED)
+    # 龙头相对小同行市值差常 >100%，最后取消市值闸门（仍按接近度排序取 limit）
+    if len(selected) < MIN_PEER_SAMPLE:
+        selected = _rank(999.0)
     return selected
 
 
