@@ -8,6 +8,7 @@ import {
   runBullTacticsDaily,
   type BullTacticDailyReport,
   type BullTacticRule,
+  type JobProgress,
 } from '@/api'
 import { formatSymbol } from '@/utils/symbol'
 
@@ -22,6 +23,7 @@ const runningDaily = ref(false)
 const error = ref('')
 const message = ref('')
 const dailyReport = ref<BullTacticDailyReport | null>(null)
+const progress = ref<JobProgress | null>(null)
 
 const currentRule = computed(() => ruleFor(selectedTactic.value))
 const dailyItems = computed(() => {
@@ -46,6 +48,13 @@ const dailyEmptyText = computed(() => {
     return dailyReport.value.message
   }
   return `${selectedTactic.value} 今日暂无命中。可切换战法查看，或点「立即生成今日列表」。`
+})
+const progressPct = computed(() => {
+  if (!progress.value) return 0
+  if (progress.value.pct != null) return Math.max(0, Math.min(100, Number(progress.value.pct)))
+  const tot = Number(progress.value.total || 0)
+  const done = Number(progress.value.done || 0)
+  return tot > 0 ? Math.round((100 * done) / tot) : 0
 })
 
 function ruleFor(name: TacticId) {
@@ -86,9 +95,13 @@ async function loadDaily() {
 async function runDailyNow() {
   runningDaily.value = true
   error.value = ''
+  progress.value = { status: 'running', phase: 'starting', message: '任务启动中…', pct: 0 }
   message.value = '正在增量同步未更新的主板 K 线并生成今日列表…'
   try {
-    const { data } = await runBullTacticsDaily()
+    const { data } = await runBullTacticsDaily((job) => {
+      progress.value = job
+      if (job.message) message.value = job.message
+    })
     dailyReport.value = data.data || null
     const n = dailyReport.value?.count ?? 0
     const note = dailyReport.value?.message
@@ -108,6 +121,7 @@ async function runDailyNow() {
     error.value = apiErrorText(e, '生成今日列表失败')
   } finally {
     runningDaily.value = false
+    progress.value = null
   }
 }
 
@@ -150,6 +164,12 @@ onMounted(async () => {
         <button class="btn-secondary" type="button" :disabled="runningDaily" @click="runDailyNow">
           {{ runningDaily ? '生成中…' : '立即生成今日列表' }}
         </button>
+      </div>
+      <div v-if="runningDaily" class="progress-block">
+        <div class="progress-track">
+          <div class="progress-fill" :style="{ width: `${progressPct}%` }" />
+        </div>
+        <p class="progress-label">{{ progress?.message || '处理中…' }} · {{ progressPct }}%</p>
       </div>
       <p v-if="dailyStale && dailyReport?.message" class="daily-banner">{{ dailyReport.message }}</p>
       <p v-if="error" class="error">{{ error }}</p>
@@ -252,6 +272,24 @@ onMounted(async () => {
 .daily-table .code {
   font-variant-numeric: tabular-nums;
   font-weight: 600;
+}
+
+.progress-block { margin: 0 0 var(--space-md); }
+.progress-track {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--bg-page, #f0f2f5);
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  background: var(--color-primary);
+  transition: width 0.25s ease;
+}
+.progress-label {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--text-secondary);
 }
 
 .tabs {

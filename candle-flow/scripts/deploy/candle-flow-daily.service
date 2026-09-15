@@ -1,0 +1,12 @@
+[Unit]
+Description=Candle Flow daily kline sync + bull tactics
+After=network.target
+
+[Service]
+Type=oneshot
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/candle-flow/backend
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Shanghai
+ExecStart=/opt/candle-flow/backend/.venv/bin/python -m app.workers.daily_scan

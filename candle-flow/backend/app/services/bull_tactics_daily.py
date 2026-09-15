@@ -203,30 +203,61 @@ def run_daily_bull_tactics_scan(
     recent_bars: int = 7,
     refresh_list: bool = False,
     sync_klines: bool = False,
+    job_id: str | None = None,
 ) -> dict[str, Any]:
     """
     全市场扫描三条战法，筛选当日买点，写入 JSON/CSV。
     新鲜度不达标时不宣称今日列表（status=stale_data，items 为空）。
     """
+    from app.services.job_progress import finish_job, update_job
+
     global _running
     with _run_lock:
         if _running:
-            return {"status": "already_running", "trade_date": trade_date or _today()}
+            payload = {"status": "already_running", "trade_date": trade_date or _today()}
+            if job_id:
+                finish_job(job_id, payload, error="already_running")
+            return payload
         _running = True
 
     day = trade_date or _today()
     started = datetime.now(TZ)
     sync_info: dict[str, Any] | None = None
+
+    def _progress(done: int, total: int, phase: str) -> None:
+        if not job_id:
+            return
+        labels = {"scan": "扫描战法", "sync": "同步K线", "tier": "分层", "fundamentals": "基本面", "done": "完成"}
+        update_job(
+            job_id,
+            phase=phase,
+            done=done,
+            total=total,
+            message=f"{labels.get(phase, phase)} {done}/{total}" if total else labels.get(phase, phase),
+        )
+
     try:
         if sync_klines:
             from app.services.main_board_kline_sync import sync_main_board_klines
 
+            if job_id:
+                update_job(job_id, phase="sync", message="增量同步主板 K 线…", done=0, total=0)
             logger.info("daily bull tactics: incremental kline sync before scan…")
             sync_info = sync_main_board_klines(
                 refresh_universe_list=refresh_list,
                 incremental=True,
                 as_of=_parse_day(day),
             )
+            if job_id and sync_info:
+                needed = int(sync_info.get("needed") or 0)
+                synced = int(sync_info.get("synced") or 0)
+                update_job(
+                    job_id,
+                    phase="sync",
+                    done=synced,
+                    total=max(needed, synced),
+                    message=f"K线同步完成 {synced}/{needed or synced}",
+                )
 
         db = SessionLocal()
         try:
@@ -255,12 +286,17 @@ def run_daily_bull_tactics_scan(
                 }
                 _persist_report(day, payload)
                 logger.warning("daily bull tactics gated: %s", message)
+                if job_id:
+                    finish_job(job_id, payload)
                 return payload
 
+            if job_id:
+                update_job(job_id, phase="scan", message="扫描主板战法…", done=0, total=0)
             scan = BullTacticsService(db).scan_market(
                 recent_bars=recent_bars,
                 refresh_list=False if sync_klines else refresh_list,
                 tactics=None,
+                progress=_progress if job_id else None,
             )
         finally:
             db.close()
@@ -278,6 +314,8 @@ def run_daily_bull_tactics_scan(
             "elapsed_sec": round(elapsed, 1),
             "scanned": scan.get("scanned", 0),
             "universe_size": scan.get("universe_size", 0),
+            "prefiltered": scan.get("prefiltered"),
+            "prefilter": scan.get("prefilter"),
             "scan_skipped": scan.get("skipped", 0),
             "scan_errors": scan.get("errors", 0),
             "recent_hit_count": recent_hit_count,
@@ -305,6 +343,8 @@ def run_daily_bull_tactics_scan(
         )
         if message:
             logger.warning("daily bull tactics note: %s", message)
+        if job_id:
+            finish_job(job_id, payload)
         return payload
     except Exception as exc:
         logger.exception("daily bull tactics scan failed")
@@ -324,7 +364,41 @@ def run_daily_bull_tactics_scan(
             _persist_report(day, fail)
         except Exception:
             pass
+        if job_id:
+            finish_job(job_id, fail, error=str(exc))
         return fail
     finally:
         with _run_lock:
             _running = False
+
+
+def start_daily_bull_tactics_async(
+    *,
+    trade_date: str | None = None,
+    recent_bars: int = 7,
+    refresh_list: bool = False,
+    sync_klines: bool = True,
+) -> dict[str, Any]:
+    """后台启动日报生成，立即返回 job_id。"""
+    from app.services.job_progress import get_job, run_in_background
+
+    existing = get_job(kind="bull_tactics_daily")
+    if existing and existing.get("status") == "running":
+        return {"status": "already_running", "job_id": existing.get("job_id"), "progress": existing}
+
+    def _run(job_id: str) -> None:
+        run_daily_bull_tactics_scan(
+            trade_date=trade_date,
+            recent_bars=recent_bars,
+            refresh_list=refresh_list,
+            sync_klines=sync_klines,
+            job_id=job_id,
+        )
+
+    job_id = run_in_background(
+        "bull_tactics_daily",
+        _run,
+        phase="starting",
+        message="任务已启动",
+    )
+    return {"status": "started", "job_id": job_id, "progress": get_job(job_id)}

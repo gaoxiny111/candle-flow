@@ -8,8 +8,13 @@ from app.core.bull_tactics import TACTIC_NAMES
 from app.database import get_db
 from app.models.user_config import UserConfig
 from app.schemas.common import ApiResponse
-from app.services.bull_tactics_daily import load_daily_report, run_daily_bull_tactics_scan
+from app.services.bull_tactics_daily import (
+    load_daily_report,
+    run_daily_bull_tactics_scan,
+    start_daily_bull_tactics_async,
+)
 from app.services.bull_tactics_service import TACTIC_RULES, BullTacticsService
+from app.services.job_progress import get_job
 from app.services.stock_universe import resolve_symbol
 from app.services.watchlist import parse_watchlist
 from app.utils.symbol import SymbolError
@@ -35,7 +40,7 @@ def bull_tactics_rules():
                 for name in TACTIC_NAMES
             ],
             "universe": "沪深主板（600/601/603/605、000/001/002/003），排除 ST",
-            "schedule": "工作日 16:35（Asia/Shanghai）增量同步未更新 K 线后自动扫描；K 线未达新鲜度门槛时不生成今日列表",
+            "schedule": "工作日 16:35（Asia/Shanghai）增量同步未更新 K 线后自动扫描；也可由独立 worker/cron 执行；K 线未达新鲜度门槛时不生成今日列表",
         }
     )
 
@@ -59,13 +64,32 @@ def get_bull_tactics_daily(
     return ApiResponse(data=report)
 
 
+@router.get("/bull-tactics/daily/progress")
+def bull_tactics_daily_progress(job_id: Optional[str] = Query(None)):
+    job = get_job(job_id, kind="bull_tactics_daily")
+    if not job:
+        return ApiResponse(data={"status": "empty"})
+    return ApiResponse(data=job)
+
+
 @router.post("/bull-tactics/daily/run")
 def run_bull_tactics_daily(
     recent_bars: int = Query(7, ge=3, le=30),
     refresh_universe: bool = Query(False),
     sync_klines: bool = Query(True, description="生成前增量同步未更新的主板 K 线"),
+    background: bool = Query(True, description="后台运行并返回 job_id，前端轮询 progress"),
 ):
-    """手动触发一次收盘战法扫描（与定时任务相同逻辑；默认先增量同步 K 线）。"""
+    """手动触发一次收盘战法扫描（默认后台异步）。"""
+    if background:
+        data = start_daily_bull_tactics_async(
+            recent_bars=recent_bars,
+            refresh_list=refresh_universe,
+            sync_klines=sync_klines,
+        )
+        if data.get("status") == "already_running":
+            raise HTTPException(status_code=409, detail="扫描正在进行中，请稍后再试")
+        return ApiResponse(data=data)
+
     data = run_daily_bull_tactics_scan(
         recent_bars=recent_bars,
         refresh_list=refresh_universe,

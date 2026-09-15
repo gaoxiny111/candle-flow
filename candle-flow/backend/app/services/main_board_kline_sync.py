@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -70,6 +71,65 @@ def list_stale_main_board_symbols(db: Session, as_of: date | None = None) -> lis
         if mx is None or mx < day:
             need.append(sym)
     return need
+
+
+def list_scannable_main_board(
+    db: Session,
+    *,
+    as_of: date | None = None,
+    min_bars: int = 45,
+    require_fresh: bool = True,
+) -> dict:
+    """
+    扫描前过滤：主板非 ST，且本地 K 线足够。
+    require_fresh=True 时要求 max(date) >= 目标交易日。
+    返回 {symbols, universe_size, scannable, no_kline, short_bars, stale_kline}。
+    """
+    day = as_of or target_trade_date()
+    universe = _main_board_symbols(db)
+    if not universe:
+        return {
+            "symbols": [],
+            "as_of": day.isoformat(),
+            "universe_size": 0,
+            "scannable": 0,
+            "no_kline": 0,
+            "short_bars": 0,
+            "stale_kline": 0,
+        }
+
+    max_dates = dict(db.query(KlineData.symbol, func.max(KlineData.date)).group_by(KlineData.symbol).all())
+    bar_counts = dict(
+        db.query(KlineData.symbol, func.count(KlineData.id)).group_by(KlineData.symbol).all()
+    )
+
+    scannable: list[str] = []
+    no_kline = 0
+    short_bars = 0
+    stale_kline = 0
+    for sym in universe:
+        mx = max_dates.get(sym)
+        cnt = int(bar_counts.get(sym) or 0)
+        if mx is None or cnt <= 0:
+            no_kline += 1
+            continue
+        if cnt < min_bars:
+            short_bars += 1
+            continue
+        if require_fresh and mx < day:
+            stale_kline += 1
+            continue
+        scannable.append(sym)
+
+    return {
+        "symbols": scannable,
+        "as_of": day.isoformat(),
+        "universe_size": len(universe),
+        "scannable": len(scannable),
+        "no_kline": no_kline,
+        "short_bars": short_bars,
+        "stale_kline": stale_kline,
+    }
 
 
 def is_fresh_enough(fresh: dict) -> bool:
@@ -219,8 +279,13 @@ def _scheduled_sync():
 
 
 def start_kline_sync_scheduler() -> None:
+    """进程内定时任务。设 ENABLE_INPROCESS_SCHEDULER=0 时跳过（改由独立 worker/cron）。"""
     global _scheduler
     if _scheduler is not None:
+        return
+    enabled = os.environ.get("ENABLE_INPROCESS_SCHEDULER", "1").strip().lower()
+    if enabled in ("0", "false", "no", "off"):
+        logger.info("in-process kline/bull-tactics scheduler disabled (ENABLE_INPROCESS_SCHEDULER=%s)", enabled)
         return
     _scheduler = BackgroundScheduler(timezone=ZoneInfo("Asia/Shanghai"))
     _scheduler.add_job(

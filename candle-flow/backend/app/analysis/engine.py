@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 from sqlalchemy.orm import Session
@@ -20,10 +23,17 @@ from app.analysis.modules.industry import IndustryAnalyzer
 from app.analysis.modules.profitability import ProfitabilityAnalyzer
 from app.analysis.modules.risk import RiskAnalyzer
 from app.analysis.modules.solvency import SolvencyAnalyzer
+from app.database import SessionLocal
 from app.services.valuation import get_valuations
-from app.utils.symbol import is_etf_symbol, normalize_symbol
+from app.utils.symbol import SymbolError, is_etf_symbol, normalize_symbol
 
 logger = logging.getLogger(__name__)
+
+ANALYSIS_CACHE_TTL_SEC = 6 * 3600
+ANALYSIS_BATCH_WORKERS = 4
+_analysis_cache: dict[str, tuple[float, str, dict[str, Any]]] = {}
+_analysis_cache_lock = threading.Lock()
+ProgressCb = Callable[[int, int, str], None]
 
 
 def _json_safe(obj: Any) -> Any:
@@ -491,5 +501,98 @@ def skipped_etf_report(symbol: str) -> dict[str, Any]:
     }
 
 
-def analyze_symbol_full(db: Session, symbol: str, **kwargs) -> dict[str, Any]:
-    return _json_safe(FundamentalEngine().run_full_analysis(symbol, db=db, **kwargs))
+def analyze_symbol_full(
+    db: Session,
+    symbol: str,
+    *,
+    use_cache: bool = True,
+    **kwargs,
+) -> dict[str, Any]:
+    sym = normalize_symbol(symbol)
+    if use_cache:
+        with _analysis_cache_lock:
+            hit = _analysis_cache.get(sym)
+            if hit and time.time() - hit[0] < ANALYSIS_CACHE_TTL_SEC:
+                return _json_safe(hit[2])
+
+    report = _json_safe(FundamentalEngine().run_full_analysis(sym, db=db, **kwargs))
+    fingerprint = ",".join(str(x) for x in (report.get("report_dates") or [])[-3:])
+    if use_cache and not report.get("skipped"):
+        with _analysis_cache_lock:
+            _analysis_cache[sym] = (time.time(), fingerprint, report)
+    return report
+
+
+def analyze_symbols_batch(
+    symbols: list[str],
+    *,
+    use_cache: bool = True,
+    progress: ProgressCb | None = None,
+) -> dict[str, Any]:
+    """批量深度基本面分析：共享财报预热 + 进程内缓存 + 有限并发。"""
+    wanted: list[str] = []
+    seen: set[str] = set()
+    for raw in symbols:
+        try:
+            sym = normalize_symbol(str(raw).strip())
+        except SymbolError:
+            continue
+        key = sym.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        wanted.append(sym)
+        if len(wanted) >= 50:
+            break
+
+    if not wanted:
+        return {"items": [], "count": 0, "cached": 0}
+
+    # 预热业绩快照，避免每票冷启动拉 yjbb
+    try:
+        from app.services.fundamental_screen import resolve_latest_report_frame, resolve_report_frames
+
+        resolve_latest_report_frame()
+        resolve_report_frames(5)
+    except Exception as exc:
+        logger.debug("analysis batch warmup skipped: %s", exc)
+
+    items: list[dict[str, Any] | None] = [None] * len(wanted)
+    cached = 0
+    done = 0
+    total = len(wanted)
+    if progress:
+        progress(0, total, "analysis")
+
+    def _one(idx: int, sym: str) -> tuple[int, dict[str, Any], bool]:
+        from_cache = False
+        if use_cache:
+            with _analysis_cache_lock:
+                hit = _analysis_cache.get(sym)
+                if hit and time.time() - hit[0] < ANALYSIS_CACHE_TTL_SEC:
+                    return idx, hit[2], True
+        db = SessionLocal()
+        try:
+            report = analyze_symbol_full(db, sym, use_cache=use_cache)
+            return idx, report, from_cache
+        finally:
+            db.close()
+
+    workers = min(ANALYSIS_BATCH_WORKERS, max(1, len(wanted)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_one, i, sym) for i, sym in enumerate(wanted)]
+        for fut in as_completed(futures):
+            idx, report, from_cache = fut.result()
+            items[idx] = report
+            if from_cache:
+                cached += 1
+            done += 1
+            if progress:
+                progress(done, total, "analysis")
+
+    return {
+        "items": [x for x in items if x is not None],
+        "count": sum(1 for x in items if x is not None),
+        "cached": cached,
+        "requested": len(wanted),
+    }

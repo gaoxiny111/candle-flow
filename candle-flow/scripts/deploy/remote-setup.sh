@@ -30,6 +30,15 @@ chown -R www-data:www-data "$APP"
 chmod 640 "$BACKEND/.env" || true
 
 install -m 644 "$APP/scripts/deploy/candle-flow.service" /etc/systemd/system/candle-flow.service
+# Optional independent worker (disable in-process scheduler via env on API unit if enabled)
+if [ -f "$APP/scripts/deploy/candle-flow-daily.service" ]; then
+  install -m 644 "$APP/scripts/deploy/candle-flow-daily.service" /etc/systemd/system/candle-flow-daily.service
+fi
+if [ -f "$APP/scripts/deploy/candle-flow-daily.timer" ]; then
+  install -m 644 "$APP/scripts/deploy/candle-flow-daily.timer" /etc/systemd/system/candle-flow-daily.timer
+  systemctl daemon-reload
+  systemctl enable --now candle-flow-daily.timer || true
+fi
 systemctl daemon-reload
 systemctl enable --now candle-flow
 

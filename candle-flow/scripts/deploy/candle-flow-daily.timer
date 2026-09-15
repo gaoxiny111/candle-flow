@@ -1,0 +1,10 @@
+[Unit]
+Description=Candle Flow daily scan timer (weekdays 16:35 Asia/Shanghai)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 16:35:00
+Persistent=true
+Unit=candle-flow-daily.service
+
+[Install]
+WantedBy=timers.target

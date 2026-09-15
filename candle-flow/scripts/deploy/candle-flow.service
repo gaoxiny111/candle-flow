@@ -8,6 +8,8 @@ User=www-data
 Group=www-data
 WorkingDirectory=/opt/candle-flow/backend
 Environment=PYTHONUNBUFFERED=1
+# Use systemd timer (candle-flow-daily.timer) instead of in-process APScheduler
+Environment=ENABLE_INPROCESS_SCHEDULER=0
 ExecStart=/opt/candle-flow/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8002
 Restart=always
 RestartSec=3

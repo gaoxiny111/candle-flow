@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Literal
+from typing import Callable, Literal
 
 from sqlalchemy.orm import Session
 
@@ -14,7 +14,6 @@ from app.core.bull_tactics import (
     N_FAN,
     NIU_SAN,
     MIN_SCAN_BARS,
-    TACTIC_NAMES,
     is_main_board,
     is_st_name,
     kline_limit_for_tactics,
@@ -25,12 +24,15 @@ from app.core.pattern_engine import kline_to_candles
 from app.database import SessionLocal
 from app.models.stock import StockInfo
 from app.services.kline_service import KlineService
+from app.services.main_board_kline_sync import list_scannable_main_board, target_trade_date
 from app.services.stock_universe import ensure_seeded, lookup_name, refresh_universe
 from app.utils.symbol import normalize_symbol, SymbolError
 
 logger = logging.getLogger(__name__)
 
 SCAN_WORKERS = 6
+
+ProgressCb = Callable[[int, int, str], None]
 
 
 TACTIC_RULES = {
@@ -130,23 +132,34 @@ class BullTacticsService:
             return None
         return result
 
-    def _parallel_scan_jobs(self, jobs: list[_ScanJob]) -> tuple[list[dict], int, int]:
+    def _parallel_scan_jobs(
+        self,
+        jobs: list[_ScanJob],
+        progress: ProgressCb | None = None,
+    ) -> tuple[list[dict], int, int]:
         if not jobs:
+            if progress:
+                progress(0, 0, "scan")
             return [], 0, 0
         items: list[dict] = []
         skipped = 0
         errors = 0
         workers = min(SCAN_WORKERS, len(jobs))
+        done = 0
+        total = len(jobs)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(self._scan_job, job): job for job in jobs}
             for fut in as_completed(futures):
                 result, outcome = fut.result()
+                done += 1
                 if outcome == "hit" and result:
                     items.append(result)
                 elif outcome == "error":
                     errors += 1
                 elif outcome == "skipped":
                     skipped += 1
+                if progress:
+                    progress(done, total, "scan")
         items.sort(key=lambda r: max((h["score"] for h in r["hits"]), default=0), reverse=True)
         return items, skipped, errors
 
@@ -174,8 +187,16 @@ class BullTacticsService:
             "errors": errors,
         }
 
-    def scan_market(self, recent_bars: int = 30, refresh_list: bool = True, tactics: list[str] | None = None) -> dict:
-        """Scan all main-board non-ST stocks from local kline cache."""
+    def scan_market(
+        self,
+        recent_bars: int = 30,
+        refresh_list: bool = True,
+        tactics: list[str] | None = None,
+        *,
+        require_fresh: bool = True,
+        progress: ProgressCb | None = None,
+    ) -> dict:
+        """Scan scannable main-board non-ST stocks from local kline cache."""
         ensure_seeded(self.db)
         if refresh_list:
             try:
@@ -184,17 +205,34 @@ class BullTacticsService:
                 logger.warning("universe refresh skipped: %s", exc)
 
         stocks = self._main_board_stocks()
+        name_map = {r.symbol: r.name for r in stocks}
+        filt = list_scannable_main_board(
+            self.db,
+            as_of=target_trade_date(),
+            min_bars=MIN_SCAN_BARS,
+            require_fresh=require_fresh,
+        )
+        symbols = filt["symbols"]
         kline_limit = kline_limit_for_tactics(tactics)
         jobs = [
-            _ScanJob(row.symbol, row.name, recent_bars, tactics, kline_limit)
-            for row in stocks
+            _ScanJob(sym, name_map.get(sym) or lookup_name(self.db, sym) or "", recent_bars, tactics, kline_limit)
+            for sym in symbols
         ]
-        items, skipped, errors = self._parallel_scan_jobs(jobs)
+        if progress:
+            progress(0, len(jobs), "scan")
+        items, skipped, errors = self._parallel_scan_jobs(jobs, progress=progress)
         selected = normalize_tactics(tactics)
         return {
             "items": items,
             "scanned": len(jobs),
-            "universe_size": len(stocks),
+            "universe_size": filt["universe_size"],
+            "prefiltered": filt["scannable"],
+            "prefilter": {
+                "as_of": filt["as_of"],
+                "no_kline": filt["no_kline"],
+                "short_bars": filt["short_bars"],
+                "stale_kline": filt["stale_kline"],
+            },
             "skipped": skipped,
             "errors": errors,
             "count": len(items),

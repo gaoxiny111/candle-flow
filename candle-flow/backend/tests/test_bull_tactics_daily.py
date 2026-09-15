@@ -65,7 +65,7 @@ def test_run_daily_writes_json_and_csv(tmp_path, monkeypatch):
         def __init__(self, db):
             pass
 
-        def scan_market(self, recent_bars=7, refresh_list=False, tactics=None):
+        def scan_market(self, recent_bars=7, refresh_list=False, tactics=None, **kwargs):
             return {
                 "items": [
                     {
@@ -176,7 +176,7 @@ def test_run_daily_uses_incremental_sync(tmp_path, monkeypatch):
         def __init__(self, db):
             pass
 
-        def scan_market(self, recent_bars=7, refresh_list=False, tactics=None):
+        def scan_market(self, recent_bars=7, refresh_list=False, tactics=None, **kwargs):
             return {"items": [], "scanned": 10, "universe_size": 10, "errors": 0, "skipped": 0}
 
     import app.services.main_board_kline_sync as sync_mod

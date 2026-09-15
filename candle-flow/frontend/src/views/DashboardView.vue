@@ -6,8 +6,8 @@ import { usePatternStore } from '@/stores/pattern'
 import { useSignalStore } from '@/stores/signal'
 import { useConfigStore } from '@/stores/config'
 import { useWatchlistStore } from '@/stores/watchlist'
-import { apiErrorText, fetchFundamentalAnalysis, fetchValuations, resolveSymbolQuery, scanMarketConfluence } from '@/api'
-import type { FundamentalAnalysisReport, MarketConfluenceItem, SymbolValuation } from '@/api'
+import { apiErrorText, analyzeFundamentalsBatch, fetchValuations, resolveSymbolQuery, scanMarketConfluence } from '@/api'
+import type { FundamentalAnalysisReport, JobProgress, MarketConfluenceItem, SymbolValuation } from '@/api'
 import { directionZh, patternNameZh } from '@/utils/labels'
 import { isEtfSymbol, rememberSymbol, symbolName, tryNormalizeSymbol } from '@/utils/symbol'
 import SymbolSearch from '@/components/SymbolSearch.vue'
@@ -25,10 +25,12 @@ const valuations = ref<Record<string, SymbolValuation>>({})
 const valuationLoading = ref(false)
 const analysisLoading = ref(false)
 const analysisError = ref('')
+const analysisProgress = ref<JobProgress | null>(null)
 const analysisBySymbol = ref<Record<string, FundamentalAnalysisReport>>({})
 const boardTab = ref<'watch' | 'market'>('watch')
 const watchKind = ref<'stock' | 'etf'>('stock')
 const marketScanning = ref(false)
+const marketProgress = ref<JobProgress | null>(null)
 const marketScanError = ref('')
 const marketScanHint = ref('')
 const marketItems = ref<MarketConfluenceItem[]>([])
@@ -274,6 +276,23 @@ async function openChart() {
   }
 }
 
+const analysisProgressPct = computed(() => {
+  const p = analysisProgress.value
+  if (!p) return 0
+  if (p.pct != null) return Math.max(0, Math.min(100, Number(p.pct)))
+  const tot = Number(p.total || 0)
+  const done = Number(p.done || 0)
+  return tot > 0 ? Math.round((100 * done) / tot) : 0
+})
+const marketProgressPct = computed(() => {
+  const p = marketProgress.value
+  if (!p) return 0
+  if (p.pct != null) return Math.max(0, Math.min(100, Number(p.pct)))
+  const tot = Number(p.total || 0)
+  const done = Number(p.done || 0)
+  return tot > 0 ? Math.round((100 * done) / tot) : 0
+})
+
 async function loadAnalysisReports() {
   const syms = stockSymbols.value
   const token = ++analysisToken
@@ -281,33 +300,33 @@ async function loadAnalysisReports() {
     analysisBySymbol.value = {}
     analysisLoading.value = false
     analysisError.value = ''
+    analysisProgress.value = null
     return
   }
   analysisLoading.value = true
   analysisError.value = ''
-  const map: Record<string, FundamentalAnalysisReport> = {}
+  analysisProgress.value = { status: 'running', message: '批量分析启动中…', pct: 0 }
   try {
-    await Promise.all(
-      syms.map(async (sym) => {
-        try {
-          const { data } = await fetchFundamentalAnalysis(sym)
-          if (token !== analysisToken) return
-          const report = data.data
-          if (!report || report.skipped) return
-          map[sym.toUpperCase()] = report
-          if (report.name) rememberSymbol(sym, report.name)
-        } catch {
-          /* 单票失败不影响其余 */
-        }
-      }),
-    )
+    const { data } = await analyzeFundamentalsBatch(syms, (job) => {
+      if (token !== analysisToken) return
+      analysisProgress.value = job
+    })
     if (token !== analysisToken) return
+    const map: Record<string, FundamentalAnalysisReport> = {}
+    for (const report of data.data?.items || []) {
+      if (!report || report.skipped) continue
+      map[report.symbol.toUpperCase()] = report
+      if (report.name) rememberSymbol(report.symbol, report.name)
+    }
     analysisBySymbol.value = map
   } catch (e) {
     if (token !== analysisToken) return
     analysisError.value = apiErrorText(e, '基本面分析失败')
   } finally {
-    if (token === analysisToken) analysisLoading.value = false
+    if (token === analysisToken) {
+      analysisLoading.value = false
+      analysisProgress.value = null
+    }
   }
 }
 
@@ -318,9 +337,13 @@ function openDetail(sym: string) {
 async function loadMarketScan(force = false) {
   marketScanning.value = true
   marketScanError.value = ''
+  marketProgress.value = { status: 'running', message: force ? '正在重新扫描…' : '扫描启动中…', pct: 0 }
   marketScanHint.value = force ? '正在重新扫描全市场…' : '正在扫描全市场强技术共振信号…'
   try {
-    const { data } = await scanMarketConfluence({ force, recent_bars: 2 })
+    const { data } = await scanMarketConfluence({ force, recent_bars: 2 }, (job) => {
+      marketProgress.value = job
+      if (job.message) marketScanHint.value = job.message
+    })
     const payload = data.data
     marketItems.value = payload?.items || []
     marketTierFilter.value = 'all'
@@ -339,15 +362,17 @@ async function loadMarketScan(force = false) {
     marketLoaded = true
     const tc = payload?.tier_counts
     const age = payload?.cache_age_sec
+    const pref = payload?.prefiltered
     marketScanHint.value = payload?.cached
       ? `缓存结果（${age ?? 0}s 前）：看涨候选 ${payload.bullish_count ?? '—'} → 展示 ${payload.count} 只（S ${tc?.S ?? 0} / A ${tc?.A ?? 0} / B ${tc?.B ?? 0}）`
-      : `已扫 ${payload?.scanned ?? 0} 只；看涨候选 ${payload?.bullish_count ?? 0} → 分层后 ${payload?.count ?? 0} 只（S ${tc?.S ?? 0} / A ${tc?.A ?? 0} / B ${tc?.B ?? 0}）` +
+      : `有效标的 ${pref ?? payload?.scanned ?? 0}/${payload?.universe_size ?? 0}；看涨候选 ${payload?.bullish_count ?? 0} → 分层后 ${payload?.count ?? 0} 只（S ${tc?.S ?? 0} / A ${tc?.A ?? 0} / B ${tc?.B ?? 0}）` +
         (payload?.fund_removed ? `，基本面剔除 ${payload.fund_removed}` : '')
   } catch (e) {
     marketScanError.value = apiErrorText(e, '市场扫描失败')
     marketScanHint.value = ''
   } finally {
     marketScanning.value = false
+    marketProgress.value = null
   }
 }
 
@@ -402,7 +427,9 @@ async function switchBoardTab(tab: 'watch' | 'market') {
         <h2>我的关注</h2>
         <div class="watch-head-actions">
           <span v-if="valuationLoading" class="hold-scanning">行情更新中…</span>
-          <span v-else-if="analysisLoading" class="hold-scanning">基本面计算中…</span>
+          <span v-else-if="analysisLoading" class="hold-scanning">
+            {{ analysisProgress?.message || '基本面计算中…' }} {{ analysisProgressPct }}%
+          </span>
           <button
             v-if="watchKind === 'stock' && stockSymbols.length"
             type="button"
@@ -413,6 +440,9 @@ async function switchBoardTab(tab: 'watch' | 'market') {
             {{ analysisLoading ? '计算中…' : '计算基本面' }}
           </button>
         </div>
+      </div>
+      <div v-if="analysisLoading" class="progress-block">
+        <div class="progress-track"><div class="progress-fill" :style="{ width: `${analysisProgressPct}%` }" /></div>
       </div>
       <div v-if="!boardEmpty" class="watch-tabs" role="tablist">
         <button
@@ -513,7 +543,9 @@ async function switchBoardTab(tab: 'watch' | 'market') {
         <div class="watch-head">
           <h2>市场扫描</h2>
           <div class="watch-head-actions">
-            <span v-if="marketScanning" class="hold-scanning">扫描中…</span>
+            <span v-if="marketScanning" class="hold-scanning">
+              {{ marketProgress?.message || '扫描中…' }} {{ marketProgressPct }}%
+            </span>
             <button
               type="button"
               class="btn-secondary"
@@ -523,6 +555,9 @@ async function switchBoardTab(tab: 'watch' | 'market') {
               重新扫描
             </button>
           </div>
+        </div>
+        <div v-if="marketScanning" class="progress-block">
+          <div class="progress-track"><div class="progress-fill" :style="{ width: `${marketProgressPct}%` }" /></div>
         </div>
         <p class="market-desc">
           自动扫描主板非 ST，仅保留<strong>看涨</strong>强共振，再按综合强度分层：
@@ -838,6 +873,18 @@ th { color: var(--text-secondary); font-weight: 500; }
 }
 .btn-secondary:disabled { opacity: 0.55; cursor: not-allowed; }
 .hold-scanning { font-size: 13px; color: var(--text-secondary); }
+.progress-block { margin: 0 0 var(--space-md); }
+.progress-track {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--bg-page, #f0f2f5);
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  background: var(--color-primary);
+  transition: width 0.25s ease;
+}
 .watch-tabs {
   display: flex;
   gap: 0;

@@ -189,6 +189,13 @@ export interface MarketConfluenceScanResult {
   fund_removed?: number
   scanned: number
   universe_size: number
+  prefiltered?: number
+  prefilter?: {
+    as_of?: string
+    no_kline?: number
+    short_bars?: number
+    stale_kline?: number
+  }
   skipped: number
   errors: number
   recent_bars: number
@@ -197,17 +204,75 @@ export interface MarketConfluenceScanResult {
   description?: string
 }
 
+export interface JobProgress {
+  job_id?: string
+  kind?: string
+  status?: string
+  phase?: string
+  message?: string
+  done?: number
+  total?: number
+  pct?: number
+  result?: unknown
+  error?: string | null
+}
+
+async function pollJobProgress(
+  fetchProgress: () => Promise<{ data: ApiResponse<JobProgress> }>,
+  opts?: { intervalMs?: number; timeoutMs?: number },
+): Promise<JobProgress> {
+  const interval = opts?.intervalMs ?? 1500
+  const timeout = opts?.timeoutMs ?? 900000
+  const started = Date.now()
+  while (Date.now() - started < timeout) {
+    const { data } = await fetchProgress()
+    const job = data.data || { status: 'empty' }
+    if (job.status === 'done' || job.status === 'error') return job
+    await new Promise((r) => setTimeout(r, interval))
+  }
+  throw new Error('任务超时')
+}
+
 export const fetchMarketConfluenceScan = () =>
   api.get<ApiResponse<MarketConfluenceScanResult>>('/signals/market-scan', { timeout: 300000 })
 
-export const scanMarketConfluence = (opts?: { force?: boolean; recent_bars?: number }) =>
-  api.post<ApiResponse<MarketConfluenceScanResult>>('/signals/scan/market', null, {
-    timeout: 300000,
-    params: {
-      force: opts?.force ?? false,
-      recent_bars: opts?.recent_bars ?? 2,
-    },
+export const fetchMarketConfluenceProgress = (jobId?: string) =>
+  api.get<ApiResponse<JobProgress>>('/signals/scan/market/progress', {
+    params: { job_id: jobId || undefined },
   })
+
+export const scanMarketConfluence = async (
+  opts?: { force?: boolean; recent_bars?: number },
+  onProgress?: (job: JobProgress) => void,
+) => {
+  const start = await api.post<ApiResponse<{ status: string; job_id?: string; progress?: JobProgress } | MarketConfluenceScanResult>>(
+    '/signals/scan/market',
+    null,
+    {
+      timeout: 60000,
+      params: {
+        force: opts?.force ?? false,
+        recent_bars: opts?.recent_bars ?? 2,
+        background: true,
+      },
+    },
+  )
+  const body = checkApi(start).data
+  if (body && 'job_id' in body && body.job_id) {
+    const jobId = body.job_id
+    const job = await pollJobProgress(
+      async () => {
+        const res = await fetchMarketConfluenceProgress(jobId)
+        if (onProgress && res.data.data) onProgress(res.data.data)
+        return res
+      },
+      { timeoutMs: 300000 },
+    )
+    if (job.status === 'error') throw new Error(job.error || job.message || '市场扫描失败')
+    return { data: { code: 200, message: 'success', data: job.result as MarketConfluenceScanResult, meta: null } }
+  }
+  return { data: checkApi(start) as ApiResponse<MarketConfluenceScanResult> }
+}
 
 export const calculateRisk = (params: {
   entry_price: number
@@ -518,8 +583,34 @@ export const fetchBullTacticsDaily = (tradeDate?: string) =>
     params: { trade_date: tradeDate || undefined },
   })
 
-export const runBullTacticsDaily = () =>
-  api.post<ApiResponse<BullTacticDailyReport>>('/bull-tactics/daily/run', null, { timeout: 900000 })
+export const fetchBullTacticsDailyProgress = (jobId?: string) =>
+  api.get<ApiResponse<JobProgress>>('/bull-tactics/daily/progress', {
+    params: { job_id: jobId || undefined },
+  })
+
+export const runBullTacticsDaily = async (onProgress?: (job: JobProgress) => void) => {
+  const start = await api.post<
+    ApiResponse<{ status: string; job_id?: string; progress?: JobProgress } | BullTacticDailyReport>
+  >('/bull-tactics/daily/run', null, {
+    timeout: 60000,
+    params: { background: true },
+  })
+  const body = checkApi(start).data
+  if (body && 'job_id' in body && body.job_id) {
+    const jobId = body.job_id
+    const job = await pollJobProgress(
+      async () => {
+        const res = await fetchBullTacticsDailyProgress(jobId)
+        if (onProgress && res.data.data) onProgress(res.data.data)
+        return res
+      },
+      { timeoutMs: 900000 },
+    )
+    if (job.status === 'error') throw new Error(job.error || job.message || '生成今日列表失败')
+    return { data: { code: 200, message: 'success', data: job.result as BullTacticDailyReport, meta: null } }
+  }
+  return { data: checkApi(start) as ApiResponse<BullTacticDailyReport> }
+}
 
 export const scanBullTacticsSymbol = (symbol: string, recentBars = 30, tactic?: string) =>
   api.get<ApiResponse<BullTacticScanRow>>(`/bull-tactics/scan/${encodeURIComponent(symbol)}`, {
@@ -813,6 +904,43 @@ export const fetchFundamentalAnalysis = async (symbol: string) => {
     timeout: 180000,
   })
   return { data: checkApi(res) }
+}
+
+export const fetchAnalysisBatchProgress = (jobId?: string) =>
+  api.get<ApiResponse<JobProgress>>('/analysis/batch/progress', {
+    params: { job_id: jobId || undefined },
+  })
+
+export const analyzeFundamentalsBatch = async (
+  symbols: string[],
+  onProgress?: (job: JobProgress) => void,
+) => {
+  const start = await api.post<
+    ApiResponse<{ status: string; job_id?: string; progress?: JobProgress }>
+  >('/analysis/batch', { symbols }, { timeout: 60000 })
+  const body = checkApi(start).data
+  if (!body?.job_id) throw new Error('批量分析启动失败')
+  const job = await pollJobProgress(
+    async () => {
+      const res = await fetchAnalysisBatchProgress(body.job_id)
+      if (onProgress && res.data.data) onProgress(res.data.data)
+      return res
+    },
+    { timeoutMs: 600000 },
+  )
+  if (job.status === 'error') throw new Error(job.error || job.message || '批量分析失败')
+  return {
+    data: {
+      code: 200,
+      message: 'success',
+      data: (job.result || { items: [], count: 0 }) as {
+        items: FundamentalAnalysisReport[]
+        count: number
+        cached?: number
+      },
+      meta: null,
+    },
+  }
 }
 
 export const runFundamentalScreen = async (body: {
