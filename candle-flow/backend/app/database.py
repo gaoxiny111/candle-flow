@@ -56,6 +56,9 @@ def _migrate_sqlite():
     if "confluence_detail" not in cols:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE trading_signals ADD COLUMN confluence_detail TEXT"))
+    if "invalidation_price" not in cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE trading_signals ADD COLUMN invalidation_price NUMERIC(10, 4)"))
     if "user_config" in insp.get_table_names():
         ucols = {c["name"] for c in insp.get_columns("user_config")}
         if "password_hash" not in ucols:

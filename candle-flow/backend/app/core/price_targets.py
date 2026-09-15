@@ -182,6 +182,53 @@ def measure_box_breakout(klines: Sequence, index: int, direction: str) -> Option
 
 def measure_equal_move(klines: Sequence, index: int, direction: str) -> Optional[MeasuredTarget]:
     """Measured / equal move: first leg A→B, pullback to C, project from C."""
+    swings = _impulse_swings(klines, index, direction)
+    if not swings:
+        return None
+    a, b, c, leg = swings
+    bullish = direction == "bullish"
+    if bullish:
+        price = c + leg
+        return MeasuredTarget(
+            round(price, 4),
+            "对等运动",
+            f"第一波 {_px(a)}→{_px(b)} 高度 {_px(leg)}，叠加调整低点 {_px(c)}",
+        )
+    price = c - leg
+    return MeasuredTarget(
+        round(price, 4),
+        "对等运动",
+        f"第一波 {_px(a)}→{_px(b)} 高度 {_px(leg)}，自调整高点 {_px(c)} 下减",
+    )
+
+
+def measure_fib_extensions(klines: Sequence, index: int, direction: str) -> list[MeasuredTarget]:
+    """斐波那契伸展 1.272 / 1.618，与对等运动交叉验证。"""
+    swings = _impulse_swings(klines, index, direction)
+    if not swings:
+        return []
+    a, b, c, leg = swings
+    bullish = direction == "bullish"
+    out: list[MeasuredTarget] = []
+    for ratio, label in ((1.272, "Fib 1.272"), (1.618, "Fib 1.618")):
+        if bullish:
+            price = c + leg * ratio
+        else:
+            price = c - leg * ratio
+        out.append(
+            MeasuredTarget(
+                round(price, 4),
+                label,
+                f"第一波 {_px(a)}→{_px(b)} 高度 {_px(leg)}，自 {_px(c)} 伸展 ×{ratio}",
+            )
+        )
+    return out
+
+
+def _impulse_swings(
+    klines: Sequence, index: int, direction: str
+) -> tuple[float, float, float, float] | None:
+    """Return (A, B, C, leg) for equal-move / fib projection, or None."""
     if index < 10:
         return None
     look = min(35, index)
@@ -203,17 +250,11 @@ def measure_equal_move(klines: Sequence, index: int, direction: str) -> Optional
         leg = b - a
         if leg / max(a, 1e-9) < 0.02:
             return None
-        # Need a real pullback (at least ~30% of the impulse) and recovery off the low.
         if (b - c) < leg * 0.25:
             return None
         if _f(klines[index], "close") <= c:
             return None
-        price = c + leg
-        return MeasuredTarget(
-            round(price, 4),
-            "对等运动",
-            f"第一波 {_px(a)}→{_px(b)} 高度 {_px(leg)}，叠加调整低点 {_px(c)}",
-        )
+        return a, b, c, leg
     b_i = min(range(start, index + 1), key=lambda i: _f(klines[i], "low"))
     b = _f(klines[b_i], "low")
     if b_i <= start + 2 or b_i >= index:
@@ -233,12 +274,7 @@ def measure_equal_move(klines: Sequence, index: int, direction: str) -> Optional
         return None
     if _f(klines[index], "close") >= c:
         return None
-    price = c - leg
-    return MeasuredTarget(
-        round(price, 4),
-        "对等运动",
-        f"第一波 {_px(a)}→{_px(b)} 高度 {_px(leg)}，自调整高点 {_px(c)} 下减",
-    )
+    return a, b, c, leg
 
 
 def _px(v: float) -> str:
@@ -264,6 +300,7 @@ def collect_measured_targets(
         t = fn(klines, index, direction)
         if t:
             out.append(t)
+    out.extend(measure_fib_extensions(klines, index, direction))
     # de-dupe by rounded price
     seen: set[float] = set()
     uniq: list[MeasuredTarget] = []
@@ -297,7 +334,7 @@ def resolve_take_profits(
         return (
             round(rr2, 4),
             round(rr3, 4),
-            "蜡烛图不提供目标价；暂无清晰箱体/对等/旗形测幅，止盈按风险回报 2R/3R。",
+            "蜡烛图不提供目标价；暂无清晰箱体/对等/旗形/Fib测幅，止盈按风险回报 2R/3R。",
         )
 
     # Prefer nearer conservative objective as tp1 (Nison: exit early rather than chase last tick).
@@ -322,8 +359,15 @@ def resolve_take_profits(
     if not bullish and tp2 > tp1:
         tp1, tp2 = tp2, tp1
 
+    fib_note = ""
+    fibs = [t for t in measured if t.method.startswith("Fib")]
+    if fibs:
+        bits = "、".join(f"{t.method} {_px(t.price)}" for t in fibs[:2])
+        fib_note = f" Fib交叉验证：{bits}。"
+
     notes = (
         f"第十六章测幅：{primary.method} → {_px(primary.price)}（{primary.detail}）。"
-        f"目标用于减仓/平仓，不单独据此开反向仓；未达目标也可能提前反转。"
+        f"{fib_note}"
+        f"减仓价/清仓价用于分批兑现，不单独据此开反向仓；未达目标也可能提前反转。"
     )
     return round(tp1, 4), round(tp2, 4), notes

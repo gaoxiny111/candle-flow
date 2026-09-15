@@ -21,6 +21,7 @@ class RiskService:
         risk_per_trade: Decimal = Decimal("1.0"),
         take_profit: Decimal | None = None,
         lot_round: LotRound = "up",
+        position_factor: Decimal = Decimal("1"),
     ) -> RiskCalculateResponse:
         if entry_price <= 0 or capital <= 0:
             raise ValueError("entry_price and capital must be positive")
@@ -28,8 +29,12 @@ class RiskService:
         if risk_distance == 0:
             raise ValueError("stop_loss must differ from entry_price")
 
+        factor = position_factor if position_factor > 0 else Decimal("1")
+        if factor > 1:
+            factor = Decimal("1")
+
         capital_at_risk = (capital * risk_per_trade / Decimal("100")).quantize(Decimal("0.01"))
-        raw_shares = capital_at_risk / risk_distance
+        raw_shares = (capital_at_risk / risk_distance) * factor
         lots = raw_shares / Decimal(self.LOT_SIZE)
         rounding = ROUND_CEILING if lot_round == "up" else ROUND_DOWN
         n_lots = int(lots.to_integral_value(rounding=rounding))
@@ -57,6 +62,8 @@ class RiskService:
             tp2 = assumed_3r
 
         min_rr = Decimal(str(MIN_RISK_REWARD))
+        notional = (Decimal(position_size) * entry_price).quantize(Decimal("0.01"))
+        capital_pct = (notional / capital * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         return RiskCalculateResponse(
             position_size=position_size,
             risk_reward_ratio=rr,
@@ -69,6 +76,9 @@ class RiskService:
             assumed_2r=assumed_2r,
             raw_shares=raw_shares.quantize(Decimal("0.01")),
             lot_round=lot_round,
+            position_factor=factor,
+            position_capital_pct=capital_pct,
+            position_notional=notional,
         )
 
     def get_history(self, db: Session, page: int = 1, page_size: int = 20) -> Tuple[List[TradingSignal], int]:

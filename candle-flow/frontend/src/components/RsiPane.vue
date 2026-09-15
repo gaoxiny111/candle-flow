@@ -2,12 +2,15 @@
 import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
 import { createChart, ColorType, CrosshairMode, LineStyle, type IChartApi, type ISeriesApi, type LogicalRange } from 'lightweight-charts'
 import type { KlineItem } from '@/api'
-import { calcRsi, sanitizeKlines, barTime } from '@/utils/indicators'
+import { calcRsi, sanitizeKlines, barTime, asOfStamp } from '@/utils/indicators'
 
 const props = defineProps<{ klineData: KlineItem[] }>()
 
 const containerRef = ref<HTMLDivElement | null>(null)
 const legend = ref(0)
+const asOf = ref('')
+let lastPoint: { time: string; value: number } | null = null
+let byTime = new Map<string, number>()
 let chart: IChartApi | null = null
 let rsiSeries: ISeriesApi<'Line'> | null = null
 let syncing = false
@@ -25,11 +28,21 @@ const rsiHint = computed(() => {
   return '中性区，多空均衡'
 })
 
+function applyPoint(time: string | null, value: number | null) {
+  if (value == null || !time) {
+    legend.value = 0
+    asOf.value = ''
+    return
+  }
+  legend.value = value
+  asOf.value = asOfStamp(time)
+}
+
 function updateData() {
   if (!rsiSeries) return
   const bars = sanitizeKlines(props.klineData)
   const rows = calcRsi(bars)
-  const byTime = new Map(rows.map((r) => [r.time, r.value]))
+  byTime = new Map(rows.map((r) => [r.time, r.value]))
   rsiSeries.setData(
     bars.map((k) => {
       const t = barTime(k)
@@ -37,7 +50,8 @@ function updateData() {
       return v == null ? { time: t } : { time: t, value: v }
     }),
   )
-  legend.value = rows.length ? rows[rows.length - 1].value : 0
+  lastPoint = rows.length ? rows[rows.length - 1] : null
+  applyPoint(lastPoint?.time ?? null, lastPoint?.value ?? null)
 }
 
 function initChart() {
@@ -77,6 +91,11 @@ function initChart() {
     if (syncing || !range) return
     emit('rangeChange', range)
   })
+  chart.subscribeCrosshairMove((param) => {
+    const t = param.time != null ? String(param.time) : ''
+    if (t && byTime.has(t)) applyPoint(t, byTime.get(t)!)
+    else applyPoint(lastPoint?.time ?? null, lastPoint?.value ?? null)
+  })
   updateData()
 }
 
@@ -112,6 +131,7 @@ watch(() => props.klineData, updateData, { deep: true })
   <div class="sub-pane">
     <div class="legend">
       <b>RSI(14)</b>
+      <span v-if="asOf" class="asof">{{ asOf }}</span>
       <span :class="legend >= 70 ? 'up' : legend <= 30 ? 'down' : ''">{{ legend.toFixed(2) }} · {{ rsiHint }}</span>
     </div>
     <div ref="containerRef" class="sub-chart" />
@@ -126,6 +146,7 @@ watch(() => props.klineData, updateData, { deep: true })
   display: flex; gap: 10px; font-size: 11px; font-variant-numeric: tabular-nums; pointer-events: none;
 }
 .legend b { font-weight: 600; }
+.asof { color: var(--text-secondary); font-weight: 500; }
 .up { color: #f5222d; }
 .down { color: #52c41a; }
 </style>

@@ -55,3 +55,26 @@ def test_no_target_is_assumed_2r():
     assert out.rr_source == "assumed_2r"
     assert out.risk_reward_ratio == Decimal("2.00")
     assert out.take_profit_1 == out.assumed_2r
+
+
+def test_position_factor_cuts_raw_shares():
+    base = RiskService().calculate(
+        entry_price=Decimal("10"),
+        stop_loss=Decimal("9"),
+        capital=Decimal("100000"),
+        risk_per_trade=Decimal("1.0"),
+        lot_round="up",
+    )
+    cut = RiskService().calculate(
+        entry_price=Decimal("10"),
+        stop_loss=Decimal("9"),
+        capital=Decimal("100000"),
+        risk_per_trade=Decimal("1.0"),
+        lot_round="up",
+        position_factor=Decimal("0.7"),
+    )
+    assert base.position_size == 1000
+    assert cut.position_size == 700
+    assert cut.position_factor == Decimal("0.7")
+    assert base.position_capital_pct == Decimal("10.00")
+    assert base.position_notional == Decimal("10000.00")

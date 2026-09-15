@@ -55,18 +55,29 @@ async function confirm(action: 'confirm' | 'dismiss') {
             <label>同向依据</label>
             <ul class="hit-list">
               <li v-for="h in confluenceHits" :key="h.name">
-                <span class="hit">{{ h.name }}</span>
-                <span>{{ h.detail || h.name }}</span>
+                <span class="hit" :class="{ penalty: h.penalty }">{{ h.name }}</span>
+                <span :class="{ penalty: h.penalty }">{{ h.detail || h.name }}</span>
               </li>
             </ul>
           </div>
           <div><label>入场价</label><strong>{{ signal.entry_price }}</strong></div>
           <div><label>止损价</label><strong>{{ signal.stop_loss }}</strong></div>
-          <div><label>目标价 1</label><strong>{{ signal.take_profit_1 ?? '-' }}</strong></div>
-          <div><label>目标价 2</label><strong>{{ signal.take_profit_2 ?? '-' }}</strong></div>
+          <div v-if="signal.invalidation_price != null">
+            <label>形态否定价</label><strong>{{ signal.invalidation_price }}</strong>
+          </div>
+          <div><label>减仓价</label><strong>{{ signal.take_profit_1 ?? '-' }}</strong></div>
+          <div><label>清仓价</label><strong>{{ signal.take_profit_2 ?? '-' }}</strong></div>
           <div class="note"><label>说明</label><strong>{{ signal.notes || '蜡烛图不提供目标价；有箱体/对等/旗形时用第十六章测幅，否则 2R/3R。' }}</strong></div>
           <div><label>风险回报比</label><strong>{{ signal.risk_reward_ratio }}</strong></div>
-          <div><label>建议仓位</label><strong>{{ signal.position_size }} 股</strong></div>
+          <div>
+            <label>建议仓位</label>
+            <strong>
+              {{ signal.position_size }} 股
+              <template v-if="signal.position_capital_pct != null">
+                （约占资金 {{ Number(signal.position_capital_pct).toFixed(1) }}%）
+              </template>
+            </strong>
+          </div>
           <div><label>风险金额</label><strong>¥{{ signal.capital_at_risk }}</strong></div>
         </div>
         <div v-if="signal.status === 'pending'" class="actions">
@@ -110,6 +121,8 @@ async function confirm(action: 'confirm' | 'dismiss') {
   color: #1677ff;
   line-height: 1.6;
 }
+.hit.penalty, .penalty { color: #cf1322; }
+.hit.penalty { background: rgba(245, 34, 45, 0.1); }
 .up { color: #f5222d; }
 .down { color: #52c41a; }
 .actions { display: flex; gap: var(--space-md); margin-top: var(--space-lg); }

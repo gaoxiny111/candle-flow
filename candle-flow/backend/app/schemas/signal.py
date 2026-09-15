@@ -10,6 +10,8 @@ from app.schemas.common import BaseSchema
 class ConfluenceHitOut(BaseSchema):
     name: str
     detail: str = ""
+    penalty: bool = False
+    weight: float | None = None
 
 
 class SignalOut(BaseSchema):
@@ -26,11 +28,13 @@ class SignalOut(BaseSchema):
     confluence_detail: Optional[list[ConfluenceHitOut]] = None
     entry_price: Decimal
     stop_loss: Decimal
+    invalidation_price: Optional[Decimal] = None
     take_profit_1: Optional[Decimal] = None
     take_profit_2: Optional[Decimal] = None
     risk_reward_ratio: Decimal
     position_size: int
     capital_at_risk: Decimal
+    position_capital_pct: Optional[Decimal] = None
     status: str
     last_price: Optional[Decimal] = None
     prev_close: Optional[Decimal] = None

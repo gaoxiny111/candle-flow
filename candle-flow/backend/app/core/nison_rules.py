@@ -87,10 +87,40 @@ NEEDS_NEXT_CONFIRM = {
 NO_CHASE = {"红三兵"}
 
 MIN_RISK_REWARD = 1.5
+ATR_STOP_MULT = 1.5
 
 
 def pattern_bar_count(name: str) -> int:
     return PATTERN_BARS.get(name, 1)
+
+
+def _atr_at(klines: Sequence, index: int, period: int = 14) -> Optional[float]:
+    if index < period or index >= len(klines):
+        return None
+    trs: list[float] = []
+    for i in range(index - period + 1, index + 1):
+        high = float(klines[i].high)
+        low = float(klines[i].low)
+        prev_close = float(klines[i - 1].close) if i > 0 else float(klines[i].close)
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    return sum(trs) / len(trs) if trs else None
+
+
+def atr_stop(
+    klines: Sequence,
+    index: int,
+    entry: float,
+    direction: str,
+    mult: float = ATR_STOP_MULT,
+) -> Optional[float]:
+    """入场价 ± ATR×倍数 的动态风控止损。"""
+    atr = _atr_at(klines, index)
+    if atr is None or atr <= 0 or entry <= 0:
+        return None
+    if direction == "bullish":
+        return round(entry - mult * atr, 4)
+    return round(entry + mult * atr, 4)
 
 
 def pattern_stop(klines: Sequence, end_index: int, direction: str, name: str) -> Optional[float]:
@@ -104,6 +134,73 @@ def pattern_stop(klines: Sequence, end_index: int, direction: str, name: str) ->
         return round(extreme * 0.998, 4)
     extreme = float(max(k.high for k in window))
     return round(extreme * 1.002, 4)
+
+
+def pattern_invalidation(
+    klines: Sequence,
+    end_index: int,
+    direction: str,
+    name: str,
+) -> Optional[float]:
+    """形态否定价：收盘穿越即形态失效，应退出观望（可严于风控止损）。
+
+    窗口类优先用缺口边沿；其余取形态窗口极值（不加缓冲）。
+    """
+    try:
+        from app.core.windows import active_windows
+
+        for z in reversed(active_windows(klines, end_index)):
+            if direction == "bullish" and z.kind == "rising":
+                return round(z.bottom, 4)
+            if direction == "bearish" and z.kind == "falling":
+                return round(z.top, 4)
+    except Exception:
+        pass
+
+    n = pattern_bar_count(name)
+    start = max(0, end_index - n + 1)
+    window = klines[start : end_index + 1]
+    if not window:
+        return None
+    if direction == "bullish":
+        return round(float(min(k.low for k in window)), 4)
+    return round(float(max(k.high for k in window)), 4)
+
+
+def resolve_trading_stop(
+    klines: Sequence,
+    index: int,
+    direction: str,
+    name: str,
+    entry: float,
+) -> tuple[Optional[float], str]:
+    """形态止损与 ATR×1.5 止损取离入场更近者（更紧风控）。"""
+    candidates: list[tuple[float, str]] = []
+    p = pattern_stop(klines, index, direction, name)
+    a = atr_stop(klines, index, entry, direction)
+    if p is not None:
+        if direction == "bullish" and p < entry:
+            candidates.append((p, "形态止损"))
+        elif direction == "bearish" and p > entry:
+            candidates.append((p, "形态止损"))
+    if a is not None:
+        if direction == "bullish" and a < entry:
+            candidates.append((a, f"ATR×{ATR_STOP_MULT:g}"))
+        elif direction == "bearish" and a > entry:
+            candidates.append((a, f"ATR×{ATR_STOP_MULT:g}"))
+    if not candidates:
+        return p or a, "形态止损" if p is not None else (f"ATR×{ATR_STOP_MULT:g}" if a else "")
+    best_price, best_src = min(candidates, key=lambda x: abs(entry - x[0]))
+    if len(candidates) > 1:
+        other = next(c for c in candidates if c[0] != best_price or c[1] != best_src)
+        detail = f"{best_src} {_fmt(best_price)}（较{other[1]} {_fmt(other[0])} 更近入场）"
+    else:
+        detail = f"{best_src} {_fmt(best_price)}"
+    return best_price, detail
+
+
+def _fmt(v: float) -> str:
+    return f"{v:.4f}".rstrip("0").rstrip(".")
 
 
 def is_extended_high(klines: Sequence, index: int, lookback: int = 20) -> bool:

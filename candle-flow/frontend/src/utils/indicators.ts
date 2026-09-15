@@ -13,6 +13,18 @@ export function barTime(k: KlineItem): string {
   return String(k.date).slice(0, 10)
 }
 
+/** 指标卡统一时间戳：日线为日期，带时刻则精确到分钟 */
+export function asOfStamp(dateLike?: string | null): string {
+  if (!dateLike) return ''
+  const s = String(dateLike)
+  const day = s.slice(0, 10)
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return ''
+  const sep = s[10]
+  const hm = sep === 'T' || sep === ' ' ? s.slice(11, 16) : ''
+  if (hm && /^\d{2}:\d{2}$/.test(hm) && hm !== '00:00') return `截至 ${day} ${hm}`
+  return `截至 ${day}`
+}
+
 export function sanitizeKlines(data: KlineItem[]): KlineItem[] {
   if (!data.length) return data
   // Drop duplicate / invalid dates (keep last) — LWC requires strictly ascending times.

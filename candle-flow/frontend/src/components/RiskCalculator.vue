@@ -13,6 +13,8 @@ const props = defineProps<{
   signalEntry?: number
   takeProfit?: number
   signalType?: 'buy' | 'sell' | string
+  /** 超买/超卖仓位折减，默认 1 */
+  positionFactor?: number
 }>()
 
 const emit = defineEmits<{ calculated: [result: RiskResult] }>()
@@ -143,6 +145,12 @@ const chaseHint = computed(() => {
   return `入场价相对信号触发价 ${sig.toFixed(2)} 偏离 ${pct}%（按现价风控）`
 })
 
+const stochHint = computed(() => {
+  const f = Number(props.positionFactor ?? 1)
+  if (!Number.isFinite(f) || f >= 0.999) return ''
+  return `随机指标超买/超卖：仓位已按系数 ${f} 折减；等待%K离开极端区再考虑满仓入场`
+})
+
 async function calc() {
   error.value = ''
   const e = entry.value
@@ -172,6 +180,7 @@ async function calc() {
       risk_per_trade: riskPct.value,
       take_profit: finiteOrNull(props.takeProfit) ?? undefined,
       lot_round: config.lotRound === 'down' ? 'down' : 'up',
+      position_factor: Number(props.positionFactor ?? 1),
     })
     result.value = data.data
     if (data.data) {
@@ -200,6 +209,7 @@ if (saved) {
   <div class="risk-calculator card">
     <h3>风控计算器</h3>
     <p v-if="chaseHint" class="chase-hint">{{ chaseHint }}</p>
+    <p v-if="stochHint" class="chase-hint">{{ stochHint }}</p>
     <div class="form-grid">
       <label>总资金<input v-model.number="capital" type="number" min="0" /></label>
       <label>风险比例(%)<input v-model.number="riskPct" type="number" step="0.1" min="0.1" /></label>
@@ -228,6 +238,9 @@ if (saved) {
     <p v-if="error" class="error">{{ error }}</p>
     <div v-if="result" class="result" :class="{ warn: result.rr_meets_min === false }">
       <div class="result-item"><span>建议仓位</span><strong>{{ result.position_size }} 股</strong></div>
+      <div v-if="result.position_capital_pct != null" class="result-item">
+        <span>约占总资金</span><strong>{{ Number(result.position_capital_pct).toFixed(1) }}%</strong>
+      </div>
       <div class="result-item"><span>风险金额</span><strong>¥{{ result.capital_at_risk }}</strong></div>
       <div class="result-item">
         <span>{{ result.rr_source === 'target' ? '真实盈亏比' : '盈亏比（按 2R 假设）' }}</span>
@@ -244,7 +257,11 @@ if (saved) {
         真实盈亏比低于 1.5，信号降级：当前价位不满足盈亏比门槛。
       </p>
       <p v-if="result.raw_shares != null" class="raw-hint span-2">
-        理论仓位 {{ Number(result.raw_shares).toFixed(0) }} 股，已{{ result.lot_round === 'down' ? '向下' : '向上' }}取整到 {{ result.position_size }} 股。
+        风险预算：仓位 = 总资金×风险% ÷ |入场−止损|，再取整到 100 股。
+        理论 {{ Number(result.raw_shares).toFixed(0) }} 股，已{{ result.lot_round === 'down' ? '向下' : '向上' }}取整到 {{ result.position_size }} 股
+        <template v-if="result.position_notional != null">
+          （名义约 ¥{{ Number(result.position_notional).toFixed(0) }}）。
+        </template>
       </p>
     </div>
     <div v-if="history.length" class="history">

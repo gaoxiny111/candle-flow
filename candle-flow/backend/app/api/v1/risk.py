@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
@@ -22,6 +24,7 @@ def calculate_risk(body: RiskCalculateRequest):
             risk_per_trade=body.risk_per_trade,
             take_profit=body.take_profit,
             lot_round=lot_round,
+            position_factor=body.position_factor if body.position_factor and body.position_factor > 0 else Decimal("1"),
         )
         return ApiResponse(data=result)
     except ValueError as e:

@@ -70,11 +70,13 @@ export interface SignalItem {
   quote_date?: string
   entry_price: number
   stop_loss: number
+  invalidation_price?: number | null
   take_profit_1?: number
   take_profit_2?: number
   risk_reward_ratio: number
   position_size: number
   capital_at_risk: number
+  position_capital_pct?: number | null
   status: string
   created_at: string
   confirmed_at?: string
@@ -96,6 +98,9 @@ export interface RiskResult {
   assumed_2r?: number | null
   raw_shares?: number | null
   lot_round?: 'up' | 'down' | string
+  position_factor?: number
+  position_capital_pct?: number | null
+  position_notional?: number | null
 }
 
 export interface KlineSyncResult {
@@ -286,6 +291,7 @@ export const calculateRisk = (params: {
   risk_per_trade: number
   take_profit?: number
   lot_round?: 'up' | 'down'
+  position_factor?: number
 }) => api.post<ApiResponse<RiskResult>>('/risk/calculate', params)
 
 export const fetchConfig = () =>
@@ -877,6 +883,8 @@ export interface FundamentalAnalysisReport {
   report_dates: string[]
   composite_score: number | null
   final_rating: string | null
+  /** 现金流得分过低时的一票否决标记 */
+  cashflow_veto?: boolean
   modules: Record<string, AnalysisModule>
   valuation: {
     relative?: Record<string, { current?: number; percentile_5y?: number | null; signal?: string; value?: number; industry_median?: number | null }>

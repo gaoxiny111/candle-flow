@@ -2,12 +2,15 @@
 import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
 import { createChart, ColorType, CrosshairMode, LineStyle, type IChartApi, type ISeriesApi, type LogicalRange } from 'lightweight-charts'
 import type { KlineItem } from '@/api'
-import { calcMacd, sanitizeKlines, barTime } from '@/utils/indicators'
+import { calcMacd, sanitizeKlines, barTime, asOfStamp } from '@/utils/indicators'
 
 const props = defineProps<{ klineData: KlineItem[] }>()
 
 const containerRef = ref<HTMLDivElement | null>(null)
 const legend = ref({ dif: 0, dea: 0, macd: 0 })
+const asOf = ref('')
+let lastPoint: { dif: number; dea: number; macd: number; time: string } | null = null
+let byTime = new Map<string, { dif: number; dea: number; macd: number; time: string }>()
 let chart: IChartApi | null = null
 let histSeries: ISeriesApi<'Histogram'> | null = null
 let difSeries: ISeriesApi<'Line'> | null = null
@@ -45,11 +48,21 @@ const reading = computed(() => {
   return '当前：多空胶着'
 })
 
+function applyPoint(p: { dif: number; dea: number; macd: number; time: string } | null) {
+  if (!p) {
+    legend.value = { dif: 0, dea: 0, macd: 0 }
+    asOf.value = ''
+    return
+  }
+  legend.value = { dif: p.dif, dea: p.dea, macd: p.macd }
+  asOf.value = asOfStamp(p.time)
+}
+
 function updateData() {
   if (!histSeries || !difSeries || !deaSeries) return
   const bars = sanitizeKlines(props.klineData)
   const rows = calcMacd(bars)
-  const byTime = new Map(rows.map((r) => [r.time, r]))
+  byTime = new Map(rows.map((r) => [r.time, r]))
   histSeries.setData(
     bars.map((k) => {
       const r = byTime.get(barTime(k))
@@ -73,8 +86,8 @@ function updateData() {
       return r ? { time: r.time, value: r.dea } : { time: barTime(k) }
     }),
   )
-  const last = rows[rows.length - 1]
-  legend.value = last ? { dif: last.dif, dea: last.dea, macd: last.macd } : { dif: 0, dea: 0, macd: 0 }
+  lastPoint = rows[rows.length - 1] ?? null
+  applyPoint(lastPoint)
 }
 
 function initChart() {
@@ -122,6 +135,10 @@ function initChart() {
     if (syncing || !range) return
     emit('rangeChange', range)
   })
+  chart.subscribeCrosshairMove((param) => {
+    const t = param.time != null ? String(param.time) : ''
+    applyPoint((t && byTime.get(t)) || lastPoint)
+  })
   updateData()
 }
 
@@ -157,6 +174,7 @@ watch(() => props.klineData, updateData, { deep: true })
   <div class="sub-pane">
     <div class="legend">
       <b>MACD(12,26,9)</b>
+      <span v-if="asOf" class="asof">{{ asOf }}</span>
       <span class="dif">DIF {{ legend.dif.toFixed(3) }} · {{ difHint }}</span>
       <span class="dea">DEA {{ legend.dea.toFixed(3) }} · {{ deaHint }}</span>
       <span :class="legend.macd >= 0 ? 'up' : 'down'">MACD {{ legend.macd.toFixed(3) }} · {{ macdHint }}</span>
@@ -175,6 +193,7 @@ watch(() => props.klineData, updateData, { deep: true })
   pointer-events: none; max-width: calc(100% - 24px); line-height: 1.35;
 }
 .legend b { font-weight: 600; }
+.asof { color: var(--text-secondary); font-weight: 500; }
 .dif { color: #1677ff; }
 .dea { color: #d48806; }
 .up { color: #f5222d; }

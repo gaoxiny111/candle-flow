@@ -89,6 +89,7 @@ class ConfluenceHit:
 class SoftConflict:
     kind: SoftConflictKind
     message: str
+    position_factor: float = 1.0
 
 
 @dataclass
@@ -97,7 +98,13 @@ class ConfluenceResult:
     conflicts: list[str] = field(default_factory=list)
     soft_conflict_items: list[SoftConflict] = field(default_factory=list)
     _candidates: list[ConfluenceHit] = field(default_factory=list, repr=False)
+    _penalties: list[ConfluenceHit] = field(default_factory=list, repr=False)
     _finalized: bool = field(default=False, repr=False)
+
+    @property
+    def position_factor(self) -> float:
+        factors = [sc.position_factor for sc in self.soft_conflict_items if sc.position_factor < 1]
+        return min(factors) if factors else 1.0
 
     @property
     def effective_count(self) -> float:
@@ -133,18 +140,26 @@ class ConfluenceResult:
     @property
     def details_json(self) -> str:
         self._ensure_finalized()
-        return json.dumps(
-            [
+        rows = [
+            {
+                "name": h.name,
+                "detail": h.detail,
+                "weight": round(h.weight, 2),
+                "dimension": h.dimension,
+            }
+            for h in self.hits
+        ]
+        for p in self._penalties:
+            rows.append(
                 {
-                    "name": h.name,
-                    "detail": h.detail,
-                    "weight": round(h.weight, 2),
-                    "dimension": h.dimension,
+                    "name": p.name,
+                    "detail": p.detail,
+                    "weight": round(-abs(p.weight), 2),
+                    "dimension": p.dimension,
+                    "penalty": True,
                 }
-                for h in self.hits
-            ],
-            ensure_ascii=False,
-        )
+            )
+        return json.dumps(rows, ensure_ascii=False)
 
     def _ensure_finalized(self) -> None:
         if not self._finalized:
@@ -158,12 +173,21 @@ class ConfluenceResult:
         )
         self._finalized = False
 
-    def add_soft(self, kind: SoftConflictKind, message: str) -> None:
-        if any(sc.message == message for sc in self.soft_conflict_items):
+    def add_soft(self, kind: SoftConflictKind, message: str, position_factor: float = 1.0) -> None:
+        existing = next((sc for sc in self.soft_conflict_items if sc.message == message), None)
+        if existing:
+            existing.position_factor = min(existing.position_factor, position_factor)
             return
-        self.soft_conflict_items.append(SoftConflict(kind, message))
+        self.soft_conflict_items.append(
+            SoftConflict(kind, message, position_factor=position_factor)
+        )
         if message not in self.conflicts:
             self.conflicts.append(message)
+
+    def add_penalty(self, name: str, detail: str, weight: float = 1.0) -> None:
+        if any(h.name == name for h in self._penalties):
+            return
+        self._penalties.append(ConfluenceHit(name, detail, weight=weight, dimension="momentum"))
 
     def finalize(self) -> None:
         """按维度正交：每维度仅保留权重×优先级最高的一项。"""
@@ -203,6 +227,17 @@ def _low(k) -> float:
 
 def _vol(k) -> float:
     return float(getattr(k, "volume", 0) or 0)
+
+
+def _bar_as_of(klines: Sequence, index: int) -> str:
+    raw = getattr(klines[index], "date", None)
+    if raw is None:
+        return ""
+    return str(raw)[:10]
+
+
+def _stamp(as_of: str, text: str) -> str:
+    return f"截至 {as_of}：{text}" if as_of else text
 
 
 def _px(v: float) -> str:
@@ -395,6 +430,7 @@ def evaluate_confluence(klines: Sequence, index: int, direction: str) -> Conflue
     if index < 20 or index >= len(klines):
         return result
     bullish = direction == "bullish"
+    as_of = _bar_as_of(klines, index)
     closes = [_close(k) for k in klines]
     close = closes[index]
     ma20 = _sma(closes, 20, index)
@@ -484,7 +520,7 @@ def evaluate_confluence(klines: Sequence, index: int, direction: str) -> Conflue
                 bits.append(f"DIF {_px(dif)} 仍低于 DEA {_px(dea)}")
             if turning_up:
                 bits.append(f"柱 {_px(hist)} 较前值 {_px(prev_hist)} 抬升")
-            result.add("MACD", "；".join(bits))
+            result.add("MACD", _stamp(as_of, "；".join(bits)))
         elif not bullish and (dif <= dea or turning_down):
             bits = []
             if dif <= dea:
@@ -493,14 +529,14 @@ def evaluate_confluence(klines: Sequence, index: int, direction: str) -> Conflue
                 bits.append(f"DIF {_px(dif)} 仍高于 DEA {_px(dea)}")
             if turning_down:
                 bits.append(f"柱 {_px(hist)} 较前值 {_px(prev_hist)} 回落")
-            result.add("MACD", "；".join(bits))
+            result.add("MACD", _stamp(as_of, "；".join(bits)))
 
     rsi = rsi_at(closes, index)
     if rsi is not None:
         if bullish and rsi <= 48:
-            result.add("RSI", f"RSI(14)={rsi:.1f}，低于 48，未超买，支持做多")
+            result.add("RSI", _stamp(as_of, f"RSI(14)={rsi:.1f}，低于 48，未超买，支持做多"))
         elif not bullish and rsi >= 52:
-            result.add("RSI", f"RSI(14)={rsi:.1f}，高于 52，未超卖，支持做空")
+            result.add("RSI", _stamp(as_of, f"RSI(14)={rsi:.1f}，高于 52，未超卖，支持做空"))
 
     from app.core.oscillators import (
         bearish_divergence,
@@ -515,13 +551,27 @@ def evaluate_confluence(klines: Sequence, index: int, direction: str) -> Conflue
         if bullish and (k_val <= 25 or (k_val > d_val and k_val < 40)):
             result.add(
                 "随机指标",
-                f"%K={k_val:.1f} %D={d_val:.1f}，超卖区或低位金叉，支持做多",
+                _stamp(as_of, f"%K={k_val:.1f} %D={d_val:.1f}，超卖区或低位金叉，支持做多"),
             )
         elif not bullish and (k_val >= 75 or (k_val < d_val and k_val > 60)):
             result.add(
                 "随机指标",
-                f"%K={k_val:.1f} %D={d_val:.1f}，超买区或高位死叉，支持做空",
+                _stamp(as_of, f"%K={k_val:.1f} %D={d_val:.1f}，超买区或高位死叉，支持做空"),
             )
+        if bullish and k_val >= 90:
+            msg = _stamp(
+                as_of,
+                f"随机指标超买：%K={k_val:.1f} %D={d_val:.1f}，仓位×0.7；等待%K回落至80下方再入场",
+            )
+            result.add_soft("emotion_extreme", msg, position_factor=0.7)
+            result.add_penalty("随机超买", msg)
+        elif not bullish and k_val <= 10:
+            msg = _stamp(
+                as_of,
+                f"随机指标超卖：%K={k_val:.1f} %D={d_val:.1f}，仓位×0.7；等待%K反弹至20上方再入场",
+            )
+            result.add_soft("emotion_extreme", msg, position_factor=0.7)
+            result.add_penalty("随机超卖", msg)
 
     rsi_line = rsi_series(closes)
     if bullish and bullish_divergence(closes, rsi_line, index):
@@ -542,32 +592,33 @@ def evaluate_confluence(klines: Sequence, index: int, direction: str) -> Conflue
         elif not bullish and bearish_divergence(closes, hist_line, index):
             result.add("MACD背离", "价格创新高而 MACD 柱未创新高（看跌背离）")
 
-    # Ch.15 volume: breakout thrust, dry-up pullback, confirmation of turn
+    # Ch.15 volume: breakout thrust needs ≥1.5×；1.2~1.5 仅标「量能一般」并降权
     vols = [_vol(k) for k in klines[max(0, index - 19) : index + 1]]
     if len(vols) >= 5:
         avg_vol = sum(vols[:-1]) / max(len(vols) - 1, 1)
         today_vol = _vol(klines[index])
         prev_vol = _vol(klines[index - 1]) if index > 0 else 0.0
-        if avg_vol > 0 and today_vol >= avg_vol * 1.15:
+        if avg_vol > 0:
             ratio = today_vol / avg_vol
             breaking_high = prior and close > prior_high
             breaking_low = prior and close < prior_low
-            if bullish and (breaking_high or today_vol >= avg_vol * 1.4):
-                result.add(
-                    "放量",
-                    f"确认放量 {_vol_zh(today_vol)}≈均量 {ratio:.2f} 倍"
-                    + ("，收盘越过前高" if breaking_high else ""),
-                )
-            elif not bullish and (breaking_low or today_vol >= avg_vol * 1.4):
-                result.add(
-                    "放量",
-                    f"确认放量 {_vol_zh(today_vol)}≈均量 {ratio:.2f} 倍"
-                    + ("，收盘跌破前低" if breaking_low else ""),
-                )
-            elif today_vol >= avg_vol:
-                result.add(
-                    "放量",
-                    f"当日量 {_vol_zh(today_vol)}，约为近 20 日均量 {_vol_zh(avg_vol)} 的 {ratio:.2f} 倍",
+            if today_vol >= avg_vol * 1.5:
+                if bullish:
+                    result.add(
+                        "放量",
+                        f"确认放量 {_vol_zh(today_vol)}≈均量 {ratio:.2f} 倍"
+                        + ("，收盘越过前高" if breaking_high else ""),
+                    )
+                else:
+                    result.add(
+                        "放量",
+                        f"确认放量 {_vol_zh(today_vol)}≈均量 {ratio:.2f} 倍"
+                        + ("，收盘跌破前低" if breaking_low else ""),
+                    )
+            elif 1.2 <= ratio < 1.5:
+                result.add_soft(
+                    "low_momentum",
+                    f"量能一般：约均量 {ratio:.2f} 倍（1.2~1.5），突破确认偏弱，信号降权",
                 )
         # 缩量回撤：近几日量能低于均量后今日转强/转弱
         if avg_vol > 0 and index >= 3:

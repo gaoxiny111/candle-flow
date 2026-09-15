@@ -10,7 +10,8 @@ from app.core.nison_rules import (
     NO_CHASE,
     WESTERN_NOT_CANDLES,
     is_extended_high,
-    pattern_stop,
+    pattern_invalidation,
+    resolve_trading_stop,
 )
 from app.core.confluence import SoftConflict, evaluate_confluence
 from app.core.price_targets import resolve_take_profits
@@ -164,6 +165,7 @@ class SignalService:
                 start = max(0, len(klines) - 20)
             entry = float(signal.entry_price)
             stop = float(signal.stop_loss)
+            inv = float(signal.invalidation_price) if signal.invalidation_price is not None else None
             tp1 = float(signal.take_profit_1) if signal.take_profit_1 is not None else None
             size = int(signal.position_size or 0)
             buy = signal.signal_type == "buy"
@@ -171,15 +173,19 @@ class SignalService:
                 close_px = None
                 reason = None
                 if buy:
-                    if float(k.low) <= stop:
+                    if inv is not None and float(k.close) <= inv:
+                        close_px, reason = float(k.close), "形态否定"
+                    elif float(k.low) <= stop:
                         close_px, reason = stop, "止损"
                     elif tp1 is not None and float(k.close) >= tp1:
-                        close_px, reason = tp1, "风控建议2R"
+                        close_px, reason = tp1, "减仓价"
                 else:
-                    if float(k.high) >= stop:
+                    if inv is not None and float(k.close) >= inv:
+                        close_px, reason = float(k.close), "形态否定"
+                    elif float(k.high) >= stop:
                         close_px, reason = stop, "止损"
                     elif tp1 is not None and float(k.close) <= tp1:
-                        close_px, reason = tp1, "风控建议2R"
+                        close_px, reason = tp1, "减仓价"
                 if close_px is None:
                     continue
                 pnl = (close_px - entry) * size if buy else (entry - close_px) * size
@@ -285,6 +291,14 @@ class SignalService:
                     "quote_date": quote["quote_date"],
                 }
             )
+        # 风险预算仓位语义：股数对应名义市值占默认 10 万资金的比例（前端可按自有资金重算）
+        try:
+            entry = float(signal.entry_price)
+            size = int(signal.position_size or 0)
+            if entry > 0 and size > 0:
+                updates["position_capital_pct"] = round(size * entry / 100000.0 * 100, 2)
+        except (TypeError, ValueError):
+            pass
         return base.model_copy(update=updates) if updates else base
 
     def _level_from_confluence(
@@ -374,6 +388,8 @@ class SignalService:
         kline_index: Optional[int] = None,
         soft_warning: str = "",
         soft_items: Optional[list[SoftConflict]] = None,
+        stop_note: str = "",
+        invalidation: Optional[float] = None,
     ) -> bool:
         signal_type = "buy" if pattern.direction == "bullish" else "sell"
         if signal_type == "buy" and stop >= entry:
@@ -395,6 +411,13 @@ class SignalService:
             tp1, tp2 = entry - risk_distance * 2, entry - risk_distance * 3
             notes = "蜡烛图不提供目标价；止盈按风险回报 2R/3R。"
 
+        if stop_note:
+            notes = f"{notes} 风控止损：{stop_note}。"
+        if invalidation is not None:
+            notes = (
+                f"{notes} 形态否定价 {invalidation}：收盘穿越则形态失效，应退出观望"
+                f"（可严于风控止损 {stop}）。"
+            )
         if soft_warning:
             notes = f"{notes} | 注意：{soft_warning}" if notes else f"注意：{soft_warning}"
 
@@ -408,6 +431,7 @@ class SignalService:
             capital=Decimal(str(capital)),
             risk_per_trade=Decimal(str(risk_pct)),
             take_profit=Decimal(str(round(tp1, 4))),
+            position_factor=Decimal(str(min((sc.position_factor for sc in (soft_items or [])), default=1.0))),
         )
 
         eff = confluence_effective if confluence_effective > 0 else float(confluence_count)
@@ -428,6 +452,7 @@ class SignalService:
             confluence_detail=confluence_detail or None,
             entry_price=Decimal(str(round(entry, 4))),
             stop_loss=Decimal(str(round(stop, 4))),
+            invalidation_price=Decimal(str(round(invalidation, 4))) if invalidation is not None else None,
             take_profit_1=Decimal(str(round(tp1, 4))),
             take_profit_2=Decimal(str(round(tp2, 4))),
             risk_reward_ratio=risk_result.risk_reward_ratio,
@@ -505,9 +530,12 @@ class SignalService:
             if existing_name:
                 continue
             entry = float(ordered[idx].close)
-            stop = pattern_stop(ordered, idx, p.direction, p.pattern_name)
+            stop, stop_note = resolve_trading_stop(
+                ordered, idx, p.direction, p.pattern_name, entry
+            )
             if stop is None:
                 continue
+            inv = pattern_invalidation(ordered, idx, p.direction, p.pattern_name)
             soft_warning = "；".join(confluence.soft_conflicts) if confluence.soft_conflicts else ""
             if self._create_signal_for_pattern(
                 p,
@@ -523,6 +551,8 @@ class SignalService:
                 idx,
                 soft_warning,
                 confluence.soft_conflict_items,
+                stop_note,
+                inv,
             ):
                 created += 1
         if created:

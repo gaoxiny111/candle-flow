@@ -16,6 +16,7 @@ import { resolveSymbolQuery } from '@/api'
 import { patternNameZh } from '@/utils/labels'
 import { rememberSymbol, formatSymbol, tryNormalizeSymbol, isEtfSymbol, isIndexSymbol } from '@/utils/symbol'
 import { mapPatternsToWeekly, toWeekly, weeklyBias } from '@/utils/timeframe'
+import { calcStoch, sanitizeKlines } from '@/utils/indicators'
 import type { SignalItem } from '@/api'
 
 const route = useRoute()
@@ -75,6 +76,15 @@ const displayPatterns = computed(() =>
 const weekBias = computed(() => weeklyBias(kline.klineList))
 const watched = computed(() => watchlist.has(symbol.value))
 const isEtf = computed(() => isEtfSymbol(symbol.value))
+const stochPositionFactor = computed(() => {
+  const rows = calcStoch(sanitizeKlines(displayKlines.value))
+  const last = rows[rows.length - 1]
+  if (!last) return 1
+  const sell = selectedSignal.value?.signal_type === 'sell'
+  if (!sell && last.k >= 90) return 0.7
+  if (sell && last.k <= 10) return 0.7
+  return 1
+})
 
 function setPeriod(period: 'daily' | 'weekly') {
   kline.currentPeriod = period
@@ -298,6 +308,7 @@ watch(symbol, (s) => {
             :take-profit="finiteNum(selectedSignal?.take_profit_1)"
             :signal-type="selectedSignal?.signal_type"
             :capital="config.defaultCapital"
+            :position-factor="stochPositionFactor"
           />
         </aside>
       </div>

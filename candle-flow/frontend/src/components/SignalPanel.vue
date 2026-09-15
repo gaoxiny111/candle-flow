@@ -3,6 +3,7 @@ import { computed } from 'vue'
 import type { KlineItem, PatternItem, SignalItem } from '@/api'
 import { patternNameZh, signalLevelZh, signalStatusZh } from '@/utils/labels'
 import { parseConfluence } from '@/utils/confluence'
+import { asOfStamp } from '@/utils/indicators'
 
 type RrContext = {
   signalRr: number | null
@@ -232,6 +233,28 @@ function formatDate(value?: string) {
   return String(value).slice(0, 10)
 }
 
+/** 风险预算仓位：股数对应名义市值占资金比例（非满仓%） */
+function positionPct(s: SignalItem) {
+  if (s.position_capital_pct != null && Number.isFinite(Number(s.position_capital_pct))) {
+    return Number(s.position_capital_pct).toFixed(1)
+  }
+  const entry = Number(s.entry_price)
+  const size = Number(s.position_size)
+  if (!Number.isFinite(entry) || !Number.isFinite(size) || entry <= 0 || size <= 0) return ''
+  return ((size * entry) / 100000 * 100).toFixed(1)
+}
+
+const chartAsOf = computed(() => {
+  const bars = props.klineData || []
+  if (!bars.length) return ''
+  return formatDate(bars[bars.length - 1].date)
+})
+
+function asOfMismatch(patternDate: string) {
+  const day = formatDate(patternDate)
+  return Boolean(chartAsOf.value && day !== '-' && chartAsOf.value !== day)
+}
+
 function directionBadge(pattern: PatternItem) {
   if (pattern.direction === 'bullish') {
     return { cls: 'badge-bullish', text: props.isIndex ? '看多' : '看涨' }
@@ -291,28 +314,57 @@ function isActive(item: DisplayItem) {
           </div>
           <div class="signal-dates">
             <span>形态日期 {{ formatDate(item.pattern_date) }}</span>
+            <span>{{ asOfStamp(item.pattern_date) }}</span>
             <span v-if="item.signal.confluence_count">汇聚 {{ item.signal.confluence_count }} 项</span>
             <span v-if="targetReached(item.signal)" class="target-hit">已触及目标</span>
           </div>
+          <p v-if="asOfMismatch(item.pattern_date)" class="asof-mismatch">
+            副图指标{{ asOfStamp(chartAsOf) || ('截至 ' + chartAsOf) }}，与形态日不同，勿混读金叉/死叉。
+          </p>
           <div v-if="hitList(item.signal).length" class="confluence">
             <div v-for="h in hitList(item.signal)" :key="h.name" class="hit-row">
-              <span class="hit">{{ h.name }}</span>
-              <span v-if="h.detail" class="hit-detail">{{ h.detail }}</span>
+              <span class="hit" :class="{ penalty: h.penalty }">{{ h.name }}</span>
+              <span v-if="h.detail" class="hit-detail" :class="{ penalty: h.penalty }">{{ h.detail }}</span>
             </div>
           </div>
           <div class="signal-detail">
-            <span>{{ isIndex ? '参考点' : '信号入场' }} {{ item.signal.entry_price }}</span>
-            <span>止损 {{ item.signal.stop_loss }}</span>
-            <span>目标1 {{ item.signal.take_profit_1 ?? '-' }}</span>
-            <span>目标2 {{ item.signal.take_profit_2 ?? '-' }}</span>
-            <span>信号盈亏比 {{ item.rr?.signalRr?.toFixed(2) ?? item.signal.risk_reward_ratio }}</span>
-            <span
+            <div class="price-cell">
+              <span class="lbl">{{ isIndex ? '参考点' : '信号入场' }}</span>
+              <strong>{{ item.signal.entry_price }}</strong>
+            </div>
+            <div class="price-cell stop">
+              <span class="lbl">止损</span>
+              <strong>{{ item.signal.stop_loss }}</strong>
+            </div>
+            <div v-if="item.signal.invalidation_price != null" class="price-cell inv">
+              <span class="lbl">形态否定</span>
+              <strong>{{ item.signal.invalidation_price }}</strong>
+            </div>
+            <div class="price-cell tp">
+              <span class="lbl">减仓价</span>
+              <strong>{{ item.signal.take_profit_1 ?? '-' }}</strong>
+            </div>
+            <div class="price-cell tp">
+              <span class="lbl">清仓价</span>
+              <strong>{{ item.signal.take_profit_2 ?? '-' }}</strong>
+            </div>
+            <div class="price-cell">
+              <span class="lbl">信号盈亏比</span>
+              <strong>{{ item.rr?.signalRr?.toFixed(2) ?? item.signal.risk_reward_ratio }}</strong>
+            </div>
+            <div
               v-if="item.rr?.chasing && item.rr.liveRr != null"
+              class="price-cell"
               :class="['live-rr', { bad: item.rr.liveRr < 1.5 }]"
             >
-              现价盈亏比 {{ item.rr.liveRr.toFixed(2) }}
-            </span>
-            <span v-if="!isIndex">仓位 {{ item.signal.position_size }}</span>
+              <span class="lbl">现价盈亏比</span>
+              <strong>{{ item.rr.liveRr.toFixed(2) }}</strong>
+            </div>
+            <div v-if="!isIndex" class="price-cell pos">
+              <span class="lbl">仓位（股）</span>
+              <strong>{{ item.signal.position_size }} 股</strong>
+              <span v-if="positionPct(item.signal)" class="sub">约占资金 {{ positionPct(item.signal) }}%</span>
+            </div>
           </div>
           <p v-if="item.rr?.warning" class="chase-warn">{{ item.rr.warning }}</p>
           <p v-if="item.signal.notes" class="signal-notes">{{ item.signal.notes }}</p>
@@ -409,9 +461,56 @@ function isActive(item: DisplayItem) {
   color: var(--text-secondary);
   line-height: 1.5;
 }
-.signal-detail { display: flex; flex-wrap: wrap; gap: var(--space-sm) var(--space-md); font-size: 13px; color: var(--text-secondary); margin-bottom: var(--space-sm); }
-.live-rr { color: #d48806; font-weight: 600; }
-.live-rr.bad { color: #cf1322; }
+.hit.penalty {
+  background: rgba(245, 34, 45, 0.1);
+  color: #cf1322;
+}
+.hit-detail.penalty { color: #cf1322; }
+.asof-mismatch {
+  margin: 0 0 var(--space-sm);
+  font-size: 12px;
+  color: #d48806;
+  line-height: 1.5;
+}
+.signal-detail {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: var(--space-sm);
+  padding: 10px;
+  background: var(--bg-secondary, #f5f5f5);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+}
+.price-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.price-cell .lbl {
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.2;
+}
+.price-cell strong {
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary, #1f1f1f);
+  line-height: 1.3;
+}
+.price-cell.stop strong { color: #cf1322; }
+.price-cell.inv strong { color: #d48806; }
+.price-cell.tp strong { color: #389e0d; }
+.price-cell.pos .sub {
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+.live-rr strong { color: #d48806; }
+.live-rr.bad strong { color: #cf1322; }
+[data-theme='dark'] .signal-detail { background: rgba(255, 255, 255, 0.04); }
 .chase-warn {
   margin: 0 0 var(--space-sm);
   padding: 8px 10px;

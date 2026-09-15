@@ -141,6 +141,54 @@ def test_rating_label_b_plus():
     assert rating_label(82) == "A-"
 
 
+def test_downgrade_rating():
+    from app.analysis.engine import downgrade_rating
+
+    assert downgrade_rating("C") == "D"
+    assert downgrade_rating("A") == "A-"
+    assert downgrade_rating("E") == "E"
+    assert downgrade_rating("B+", 2) == "B-"
+
+
+def test_cashflow_veto_masks_fatal_shortfall():
+    """图四：高成长+差现金流不得以均分维持中性；应压分并触发否决降档。"""
+    from app.analysis.config import CASHFLOW_VETO_MESSAGE, MODULE_WEIGHTS
+    from app.analysis.engine import (
+        _penalized_module_score,
+        downgrade_rating,
+        rating_label,
+    )
+
+    # 对照图例：盈利 75.7 / 成长 87 / 现金流 25.5 / 偿债 55 / 估值 65
+    scores = {
+        "profitability": 75.7,
+        "growth": 87.0,
+        "cashflow": 25.5,
+        "solvency": 55.0,
+        "valuation": 65.0,
+    }
+    composite = 0.0
+    weight_sum = 0.0
+    for name, w in MODULE_WEIGHTS.items():
+        composite += _penalized_module_score(scores[name]) * w
+        weight_sum += w
+    composite = round(composite / weight_sum, 1)
+
+    assert composite < 55  # 应落入 D 档分数区间（不再被均分成 C）
+    letter = rating_label(composite)
+    if scores["cashflow"] < 40:
+        letter = downgrade_rating(letter, 1)
+    assert letter in ("D", "E")
+    assert CASHFLOW_VETO_MESSAGE
+
+
+def test_penalized_module_score_e_grade():
+    from app.analysis.engine import _penalized_module_score
+
+    assert _penalized_module_score(80) == 80
+    assert _penalized_module_score(25.5) == 25.5 * 0.5
+
+
 def test_engine_skips_etf_fundamentals(monkeypatch):
     engine = FundamentalEngine()
 

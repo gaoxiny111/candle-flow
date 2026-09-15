@@ -10,6 +10,7 @@ class RiskCalculateRequest(BaseSchema):
     risk_per_trade: Decimal = Decimal("1.0")
     take_profit: Decimal | None = None
     lot_round: str = "up"
+    position_factor: Decimal = Decimal("1")
 
 
 class RiskCalculateResponse(BaseSchema):
@@ -24,3 +25,6 @@ class RiskCalculateResponse(BaseSchema):
     assumed_2r: Decimal | None = None
     raw_shares: Decimal | None = None
     lot_round: str = "up"
+    position_factor: Decimal = Decimal("1")
+    position_capital_pct: Decimal | None = None
+    position_notional: Decimal | None = None

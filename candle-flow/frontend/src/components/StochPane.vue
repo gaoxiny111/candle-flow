@@ -2,12 +2,15 @@
 import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
 import { createChart, ColorType, CrosshairMode, LineStyle, type IChartApi, type ISeriesApi, type LogicalRange } from 'lightweight-charts'
 import type { KlineItem } from '@/api'
-import { calcStoch, sanitizeKlines, barTime } from '@/utils/indicators'
+import { calcStoch, sanitizeKlines, barTime, asOfStamp } from '@/utils/indicators'
 
 const props = defineProps<{ klineData: KlineItem[] }>()
 
 const containerRef = ref<HTMLDivElement | null>(null)
 const legend = ref({ k: 0, d: 0 })
+const asOf = ref('')
+let lastPoint: { time: string; k: number; d: number } | null = null
+let byTime = new Map<string, { time: string; k: number; d: number }>()
 let chart: IChartApi | null = null
 let kSeries: ISeriesApi<'Line'> | null = null
 let dSeries: ISeriesApi<'Line'> | null = null
@@ -26,11 +29,21 @@ const stochHint = computed(() => {
   return '多空均衡'
 })
 
+function applyPoint(p: { time: string; k: number; d: number } | null) {
+  if (!p) {
+    legend.value = { k: 0, d: 0 }
+    asOf.value = ''
+    return
+  }
+  legend.value = { k: p.k, d: p.d }
+  asOf.value = asOfStamp(p.time)
+}
+
 function updateData() {
   if (!kSeries || !dSeries) return
   const bars = sanitizeKlines(props.klineData)
   const rows = calcStoch(bars)
-  const byTime = new Map(rows.map((r) => [r.time, r]))
+  byTime = new Map(rows.map((r) => [r.time, r]))
   kSeries.setData(
     bars.map((b) => {
       const r = byTime.get(barTime(b))
@@ -43,8 +56,8 @@ function updateData() {
       return r ? { time: r.time, value: r.d } : { time: barTime(b) }
     }),
   )
-  const last = rows[rows.length - 1]
-  legend.value = last ? { k: last.k, d: last.d } : { k: 0, d: 0 }
+  lastPoint = rows[rows.length - 1] ?? null
+  applyPoint(lastPoint)
 }
 
 function initChart() {
@@ -87,6 +100,10 @@ function initChart() {
     if (syncing || !range) return
     emit('rangeChange', range)
   })
+  chart.subscribeCrosshairMove((param) => {
+    const t = param.time != null ? String(param.time) : ''
+    applyPoint((t && byTime.get(t)) || lastPoint)
+  })
   updateData()
 }
 
@@ -122,6 +139,7 @@ watch(() => props.klineData, updateData, { deep: true })
   <div class="sub-pane">
     <div class="legend">
       <b>Stoch(14,3)</b>
+      <span v-if="asOf" class="asof">{{ asOf }}</span>
       <span class="k">%K {{ legend.k.toFixed(1) }}</span>
       <span class="d">%D {{ legend.d.toFixed(1) }}</span>
       <span>{{ stochHint }}</span>
@@ -138,6 +156,7 @@ watch(() => props.klineData, updateData, { deep: true })
   display: flex; gap: 10px; font-size: 11px; font-variant-numeric: tabular-nums; pointer-events: none;
 }
 .legend b { font-weight: 600; }
+.asof { color: var(--text-secondary); font-weight: 500; }
 .k { color: #1677ff; }
 .d { color: #d48806; }
 </style>

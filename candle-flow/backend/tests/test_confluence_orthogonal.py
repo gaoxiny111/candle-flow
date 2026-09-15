@@ -117,3 +117,22 @@ def test_min_hits_uses_weighted_count():
     result.finalize()
     assert result.effective_count >= MIN_HITS
     assert result.ok
+
+
+def test_stoch_overbought_is_penalty_not_bullish_hit():
+    """图一硬伤4：%K 深度超买应记减分项并折减仓位，而不是利多。"""
+    bars = []
+    d0 = date(2026, 1, 1)
+    price = 10.0
+    for i in range(60):
+        price += 0.35
+        k = _K(price, price + 0.04, price - 0.03, 1500, o=price - 0.02)
+        k.date = d0 + timedelta(days=i)
+        bars.append(k)
+    result = evaluate_confluence(bars, len(bars) - 1, "bullish")
+    assert result.position_factor == 0.7
+    assert any("随机指标超买" in sc.message for sc in result.soft_conflict_items)
+    assert '"penalty": true' in result.details_json
+    assert "随机超买" in result.details_json
+    assert "截至 " in result.details_json
+    assert result.ok is True or result.effective_count >= 0

@@ -11,7 +11,14 @@ import pandas as pd
 from sqlalchemy.orm import Session
 
 from app.analysis.base import ModuleResult, score_to_level
-from app.analysis.config import MODULE_WEIGHTS, RISK_THRESHOLD
+from app.analysis.config import (
+    CASHFLOW_VETO_MESSAGE,
+    CASHFLOW_VETO_THRESHOLD,
+    E_GRADE_PENALTY,
+    E_GRADE_SCORE,
+    MODULE_WEIGHTS,
+    RISK_THRESHOLD,
+)
 from app.analysis.financials import build_financial_dataframe, industry_averages
 from app.analysis.models.dcf import DCFModel
 from app.analysis.models.relative import RelativeValuation
@@ -92,6 +99,25 @@ def rating_label(score: float) -> str:
     return "E"
 
 
+RATING_ORDER = ("A", "A-", "B+", "B", "B-", "C", "D", "E")
+
+
+def downgrade_rating(letter: str, steps: int = 1) -> str:
+    """字母评级下调 steps 档（最低 E）。"""
+    try:
+        idx = RATING_ORDER.index(letter)
+    except ValueError:
+        return letter
+    return RATING_ORDER[min(len(RATING_ORDER) - 1, idx + max(0, steps))]
+
+
+def _penalized_module_score(score: float) -> float:
+    """E 档（<40）维度贡献按系数打折，避免均分掩盖致命短板。"""
+    if score < E_GRADE_SCORE:
+        return score * E_GRADE_PENALTY
+    return score
+
+
 class FundamentalEngine:
     """基本面分析总引擎。"""
 
@@ -150,18 +176,19 @@ class FundamentalEngine:
         valuation = self._run_valuation(fin_df, market, meta, db=db)
         val_score = float(valuation.get("composite_valuation_score", 50.0))
 
-        # 对照报告：盈利/成长/偿债/现金流/估值 加权；效率与行业仅展示
+        # 对照报告：盈利/成长/偿债/现金流/估值 加权；效率与行业仅展示。
+        # E 档维度按 E_GRADE_PENALTY 打折后再加权。
         composite = 0.0
         weight_sum = 0.0
         for name, w in self.weights.items():
             if name == "valuation":
-                composite += val_score * w
+                composite += _penalized_module_score(val_score) * w
                 weight_sum += w
                 continue
             result = module_results.get(name)
             if result is None:
                 continue
-            composite += result.score * w
+            composite += _penalized_module_score(result.score) * w
             weight_sum += w
         if weight_sum > 0:
             composite /= weight_sum
@@ -176,6 +203,14 @@ class FundamentalEngine:
             all_warnings.extend(r.warnings)
 
         letter = rating_label(composite)
+        cashflow_veto = False
+        cf = module_results.get("cashflow")
+        if cf is not None and cf.score < CASHFLOW_VETO_THRESHOLD:
+            cashflow_veto = True
+            letter = downgrade_rating(letter, 1)
+            if CASHFLOW_VETO_MESSAGE not in all_warnings:
+                all_warnings.insert(0, CASHFLOW_VETO_MESSAGE)
+
         return {
             "symbol": sym,
             "name": meta.get("name") or market.get("name") or "",
@@ -184,6 +219,7 @@ class FundamentalEngine:
             "composite_score": composite,
             "final_rating": letter,
             "final_rating_letter": letter,
+            "cashflow_veto": cashflow_veto,
             "modules": {k: _module_to_dict(v) for k, v in module_results.items()},
             "valuation": valuation,
             "market": {
@@ -196,7 +232,9 @@ class FundamentalEngine:
                 "dividend_yield": market.get("dividend_yield"),
             },
             "warnings": all_warnings,
-            "summary": self._generate_summary(composite, letter, module_results, all_warnings, val_score),
+            "summary": self._generate_summary(
+                composite, letter, module_results, all_warnings, val_score, cashflow_veto=cashflow_veto
+            ),
         }
 
     def _run_valuation(self, fin_df: pd.DataFrame, market: dict, meta: dict, db: Session | None = None) -> dict:
@@ -459,8 +497,11 @@ class FundamentalEngine:
         modules: dict[str, ModuleResult],
         warnings: list[str],
         val_score: float,
+        cashflow_veto: bool = False,
     ) -> str:
         lines = [f"综合评分 {score:.1f} 分，评级 {letter}。"]
+        if cashflow_veto:
+            lines.append(f"  ※ {CASHFLOW_VETO_MESSAGE}")
         for key in ("profitability", "growth", "cashflow", "solvency"):
             r = modules.get(key)
             if r:
@@ -483,6 +524,7 @@ def skipped_etf_report(symbol: str) -> dict[str, Any]:
         "composite_score": None,
         "final_rating": None,
         "final_rating_letter": None,
+        "cashflow_veto": False,
         "modules": {},
         "valuation": {},
         "market": {

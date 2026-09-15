@@ -21,6 +21,7 @@ class TradingSignal(Base):
     confluence_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     entry_price: Mapped[float] = mapped_column(Numeric(10, 4), nullable=False)
     stop_loss: Mapped[float] = mapped_column(Numeric(10, 4), nullable=False)
+    invalidation_price: Mapped[float | None] = mapped_column(Numeric(10, 4), nullable=True)
     take_profit_1: Mapped[float | None] = mapped_column(Numeric(10, 4), nullable=True)
     take_profit_2: Mapped[float | None] = mapped_column(Numeric(10, 4), nullable=True)
     risk_reward_ratio: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False)

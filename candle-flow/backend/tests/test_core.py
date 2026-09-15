@@ -131,6 +131,41 @@ def test_nison_pattern_stop():
     assert stop_h > 10.2
 
 
+def test_resolve_trading_stop_prefers_nearer_atr():
+    from app.core.nison_rules import atr_stop, resolve_trading_stop
+
+    class K:
+        def __init__(self, o, h, l, c):
+            self.open, self.high, self.low, self.close = o, h, l, c
+
+    # ATR≈1；形态低点很远 → 应选 ATR×1.5
+    bars = [K(10, 11, 9, 10) for _ in range(20)]
+    bars.append(K(20, 21, 5, 20))  # pattern low 5, entry 20
+    entry = 20.0
+    stop, note = resolve_trading_stop(bars, len(bars) - 1, "bullish", "看涨吞没", entry)
+    a = atr_stop(bars, len(bars) - 1, entry, "bullish")
+    assert stop is not None and a is not None
+    assert abs(stop - a) < 1e-6
+    assert "ATR" in note
+
+
+def test_pattern_invalidation_is_structure_extreme():
+    from app.core.nison_rules import pattern_invalidation, pattern_stop
+
+    class K:
+        def __init__(self, high, low):
+            self.high = high
+            self.low = low
+            self.close = (high + low) / 2
+            self.open = self.close
+
+    klines = [K(10, 9), K(10.2, 8.5)]
+    inv = pattern_invalidation(klines, 1, "bullish", "刺透")
+    stop = pattern_stop(klines, 1, "bullish", "刺透")
+    assert inv == 8.5
+    assert stop < inv
+
+
 class _K:
     def __init__(self, close, high=None, low=None, volume=1000):
         self.close = close

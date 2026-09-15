@@ -68,6 +68,12 @@ async function load() {
 }
 
 watch(() => props.symbol, load, { immediate: true })
+
+const displayWarnings = computed(() => {
+  const list = report.value?.warnings ?? []
+  if (!report.value?.cashflow_veto) return list
+  return list.filter((w) => w !== '现金流不合格，暂不具备价值投资条件')
+})
 </script>
 
 <template>
@@ -110,10 +116,14 @@ watch(() => props.symbol, load, { immediate: true })
         </div>
       </div>
 
-      <div v-if="report.warnings?.length" class="warnings">
+      <div v-if="report.cashflow_veto" class="veto-banner" role="alert">
+        现金流不合格，暂不具备价值投资条件
+      </div>
+
+      <div v-if="displayWarnings.length" class="warnings">
         <div class="warn-title">风险提示</div>
         <ul>
-          <li v-for="(w, i) in report.warnings" :key="i">{{ w }}</li>
+          <li v-for="(w, i) in displayWarnings" :key="i">{{ w }}</li>
         </ul>
       </div>
 
@@ -269,6 +279,21 @@ watch(() => props.symbol, load, { immediate: true })
 .rating strong.good { color: #389e0d; }
 .rating strong.bad { color: #cf1322; }
 .market { font-size: 13px; color: var(--text-secondary); margin-top: 4px; }
+.veto-banner {
+  background: #fff1f0;
+  border: 1px solid #ffa39e;
+  color: #cf1322;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: var(--space-md);
+  font-size: 14px;
+  font-weight: 600;
+}
+[data-theme='dark'] .veto-banner {
+  background: #2a1215;
+  border-color: #a8071a;
+  color: #ff7875;
+}
 .warnings {
   background: #fff7e6; border: 1px solid #ffd591; border-radius: 8px;
   padding: 10px 12px; margin-bottom: var(--space-md); font-size: 13px;
