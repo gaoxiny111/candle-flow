@@ -80,6 +80,14 @@ class RiskAnalyzer(BaseAnalyzer):
             warnings.append(f"审计意见：{audit}")
             risk_score -= 30
 
+        major_events = kwargs.get("major_risk_events") or []
+        if major_events:
+            labels = sorted({str(e.get("label") or "") for e in major_events if e.get("label")})
+            if labels:
+                warnings.append("重大风险事件：" + "、".join(labels))
+            risk_score = min(risk_score, 15.0)
+            delist_risk = True
+
         risk_score = max(0.0, risk_score)
         return ModuleResult(
             module_name="风险预警",
@@ -89,5 +97,6 @@ class RiskAnalyzer(BaseAnalyzer):
             metadata={
                 "delist_risk": delist_risk,
                 "consecutive_loss_years": int(consec_loss),
+                "major_risk_count": len(major_events),
             },
         )

@@ -890,6 +890,24 @@ export interface FundamentalAnalysisReport {
   final_rating: string | null
   /** 现金流得分过低时的一票否决标记 */
   cashflow_veto?: boolean
+  /** 公告关键词命中重大合规/生存风险时的一票否决 */
+  compliance_veto?: boolean
+  major_risks?: {
+    fatal?: boolean
+    events?: Array<{
+      rule_id?: string
+      label?: string
+      keyword?: string
+      title?: string
+      notice_date?: string
+      url?: string
+      source?: string
+    }>
+    event_count?: number
+    message?: string
+    labels?: string[]
+    pledge_ratio?: number | null
+  }
   peer_sample_ok?: boolean
   modules: Record<string, AnalysisModule>
   valuation: {

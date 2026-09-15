@@ -73,10 +73,16 @@ const displayWarnings = computed(() => {
   const list = report.value?.warnings ?? []
   const skip = new Set<string>()
   if (report.value?.cashflow_veto) skip.add('现金流不合格，暂不具备价值投资条件')
+  if (report.value?.compliance_veto) {
+    skip.add('命中重大风险事件，财务打分不适用；请优先关注合规与生存风险')
+  }
   // 行业 N/A 已在模块头展示，避免风险提示重复刷屏
   skip.add('N/A（样本不足）')
-  return list.filter((w) => !skip.has(w))
+  // 重大风险事件明细已在顶部红灯卡片展示
+  return list.filter((w) => !skip.has(w) && !w.startsWith('【'))
 })
+
+const majorRiskEvents = computed(() => report.value?.major_risks?.events ?? [])
 </script>
 
 <template>
@@ -125,6 +131,20 @@ const displayWarnings = computed(() => {
             </span>
           </div>
         </div>
+      </div>
+
+      <div v-if="report.compliance_veto" class="veto-banner compliance" role="alert">
+        <div class="veto-title">重大风险事件 · 合规与生存风险一票否决</div>
+        <div class="veto-msg">
+          {{ report.major_risks?.message || '命中重大风险事件，财务打分不适用；请优先关注合规与生存风险' }}
+        </div>
+        <ul v-if="majorRiskEvents.length" class="veto-events">
+          <li v-for="(ev, i) in majorRiskEvents" :key="i">
+            <span class="ev-label">{{ ev.label }}</span>
+            <span v-if="ev.notice_date" class="ev-date">{{ ev.notice_date }}</span>
+            <span class="ev-title">{{ ev.title }}</span>
+          </li>
+        </ul>
       </div>
 
       <div v-if="report.cashflow_veto" class="veto-banner" role="alert">
@@ -338,10 +358,44 @@ const displayWarnings = computed(() => {
   font-size: 14px;
   font-weight: 600;
 }
+.veto-banner.compliance {
+  font-weight: 500;
+}
+.veto-banner .veto-title {
+  font-weight: 700;
+  font-size: 15px;
+  margin-bottom: 4px;
+}
+.veto-banner .veto-msg {
+  margin-bottom: 8px;
+}
+.veto-banner .veto-events {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.55;
+}
+.veto-banner .ev-label {
+  font-weight: 600;
+  margin-right: 6px;
+}
+.veto-banner .ev-date {
+  color: #a8071a;
+  margin-right: 6px;
+  white-space: nowrap;
+}
+.veto-banner .ev-title {
+  color: #5c0011;
+}
 [data-theme='dark'] .veto-banner {
   background: #2a1215;
   border-color: #a8071a;
   color: #ff7875;
+}
+[data-theme='dark'] .veto-banner .ev-date,
+[data-theme='dark'] .veto-banner .ev-title {
+  color: #ffccc7;
 }
 .warnings {
   background: #fff7e6; border: 1px solid #ffd591; border-radius: 8px;

@@ -350,6 +350,10 @@ def test_value_trap_caps_valuation_for_st_loss(monkeypatch):
             "insufficient_sample": True,
         },
     )
+    monkeypatch.setattr(
+        "app.analysis.engine.detect_major_risk_events",
+        lambda *_a, **_k: {"fatal": False, "events": [], "event_count": 0, "message": ""},
+    )
 
     report = engine.run_full_analysis("600491.SH", db=None)
     val = report["valuation"]

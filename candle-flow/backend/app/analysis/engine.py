@@ -32,6 +32,7 @@ from app.analysis.modules.risk import RiskAnalyzer
 from app.analysis.modules.solvency import SolvencyAnalyzer
 from app.database import SessionLocal
 from app.services.valuation import get_valuations
+from app.services.major_risk_events import COMPLIANCE_VETO_MESSAGE, detect_major_risk_events
 from app.utils.symbol import SymbolError, is_etf_symbol, normalize_symbol
 
 logger = logging.getLogger(__name__)
@@ -167,11 +168,20 @@ class FundamentalEngine:
             except Exception:
                 return {}
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        def _load_risks() -> dict[str, Any]:
+            try:
+                return detect_major_risk_events(sym)
+            except Exception as e:
+                logger.warning("major risk scan failed for %s: %s", sym, e)
+                return {"fatal": False, "events": [], "event_count": 0, "message": ""}
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
             f_fin = pool.submit(_load_fin)
             f_mkt = pool.submit(_load_quotes)
+            f_risk = pool.submit(_load_risks)
             fin_df, meta = f_fin.result()
             market = f_mkt.result() or {}
+            major_risks = f_risk.result() or {}
 
         meta["symbol"] = sym
 
@@ -195,6 +205,9 @@ class FundamentalEngine:
             "symbol_roe": symbol_roe,
             "industry": meta.get("industry") or "",
             "name": meta.get("name") or market.get("name") or "",
+            "audit_opinion": major_risks.get("audit_opinion_hint") or "标准无保留",
+            "pledge_ratio": major_risks.get("pledge_ratio") or 0,
+            "major_risk_events": major_risks.get("events") or [],
             "industry_avg": industry_averages(meta.get("industry", ""), meta.get("latest_report")),
             **kwargs,
         }
@@ -264,6 +277,36 @@ class FundamentalEngine:
             if CASHFLOW_VETO_MESSAGE not in all_warnings:
                 all_warnings.insert(0, CASHFLOW_VETO_MESSAGE)
 
+        # 公告关键词重大风险：顶部红灯，强制 E，估值陷阱否决，财务分仅作参考
+        compliance_veto = bool(major_risks.get("fatal"))
+        if compliance_veto:
+            letter = "E"
+            composite = min(composite, 25.0)
+            if COMPLIANCE_VETO_MESSAGE not in all_warnings:
+                all_warnings.insert(0, COMPLIANCE_VETO_MESSAGE)
+            for ev in major_risks.get("events") or []:
+                line = f"【{ev.get('label')}】{ev.get('notice_date') or ''} {ev.get('title') or ''}".strip()
+                if line and line not in all_warnings:
+                    all_warnings.insert(1, line)
+            valuation = dict(valuation)
+            if val_score > 28.0:
+                valuation["valuation_score_base"] = round(val_score, 1)
+                valuation["composite_valuation_score"] = 28.0
+                val_score = 28.0
+            valuation["value_trap_veto"] = True
+            valuation["value_trap_message"] = COMPLIANCE_VETO_MESSAGE
+            base_r = valuation.get("valuation_rationale") or ""
+            valuation["valuation_rationale"] = (
+                (base_r + "；" if base_r else "")
+                + "合规/生存风险一票否决，财务与相对估值仅作参考"
+            )
+            pr = major_risks.get("pledge_ratio")
+            if pr is not None and module_results.get("risk") is not None:
+                # 同步质押率到风险模块元数据（展示用）
+                risk_dict = module_results["risk"]
+                risk_dict.metadata["pledge_ratio"] = pr
+                risk_dict.metadata["compliance_veto"] = True
+
         peer_sample_ok = bool(valuation.get("peer_sample_ok"))
         ind = module_results.get("industry")
         if ind is not None and ind.metadata.get("insufficient_sample"):
@@ -281,6 +324,8 @@ class FundamentalEngine:
             "final_rating": letter,
             "final_rating_letter": letter,
             "cashflow_veto": cashflow_veto,
+            "compliance_veto": compliance_veto,
+            "major_risks": _json_safe(major_risks),
             "peer_sample_ok": peer_sample_ok,
             "modules": {k: _module_to_dict(v) for k, v in module_results.items()},
             "valuation": valuation,
@@ -296,7 +341,13 @@ class FundamentalEngine:
             },
             "warnings": all_warnings,
             "summary": self._generate_summary(
-                composite, letter, module_results, all_warnings, val_score, cashflow_veto=cashflow_veto
+                composite,
+                letter,
+                module_results,
+                all_warnings,
+                val_score,
+                cashflow_veto=cashflow_veto,
+                compliance_veto=compliance_veto,
             ),
         }
 
@@ -717,8 +768,11 @@ class FundamentalEngine:
         warnings: list[str],
         val_score: float,
         cashflow_veto: bool = False,
+        compliance_veto: bool = False,
     ) -> str:
         lines = [f"综合评分 {score:.1f} 分，评级 {letter}。"]
+        if compliance_veto:
+            lines.append(f"  ※ {COMPLIANCE_VETO_MESSAGE}")
         if cashflow_veto:
             lines.append(f"  ※ {CASHFLOW_VETO_MESSAGE}")
         for key in ("profitability", "growth", "cashflow", "solvency"):
@@ -744,6 +798,8 @@ def skipped_etf_report(symbol: str) -> dict[str, Any]:
         "final_rating": None,
         "final_rating_letter": None,
         "cashflow_veto": False,
+        "compliance_veto": False,
+        "major_risks": {"fatal": False, "events": [], "event_count": 0},
         "modules": {},
         "valuation": {},
         "market": {
