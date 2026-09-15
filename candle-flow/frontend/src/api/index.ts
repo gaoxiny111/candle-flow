@@ -91,6 +91,11 @@ export interface RiskResult {
   risk_distance: number
   take_profit_1?: number
   take_profit_2?: number
+  rr_source?: 'target' | 'assumed_2r' | string
+  rr_meets_min?: boolean
+  assumed_2r?: number | null
+  raw_shares?: number | null
+  lot_round?: 'up' | 'down' | string
 }
 
 export interface KlineSyncResult {
@@ -280,6 +285,7 @@ export const calculateRisk = (params: {
   capital: number
   risk_per_trade: number
   take_profit?: number
+  lot_round?: 'up' | 'down'
 }) => api.post<ApiResponse<RiskResult>>('/risk/calculate', params)
 
 export const fetchConfig = () =>

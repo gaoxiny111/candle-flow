@@ -292,8 +292,11 @@ watch(symbol, (s) => {
             @dismiss-signal="onDismiss"
           />
           <RiskCalculator
-            :entry-price="finiteNum(selectedSignal?.entry_price ?? kline.latestKline?.close)"
+            :entry-price="finiteNum(kline.latestKline?.close ?? selectedSignal?.entry_price)"
             :stop-loss="finiteNum(selectedSignal?.stop_loss)"
+            :signal-entry="finiteNum(selectedSignal?.entry_price)"
+            :take-profit="finiteNum(selectedSignal?.take_profit_1)"
+            :signal-type="selectedSignal?.signal_type"
             :capital="config.defaultCapital"
           />
         </aside>

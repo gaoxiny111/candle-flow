@@ -75,8 +75,11 @@ async function confirm(action: 'confirm' | 'dismiss') {
         </div>
       </div>
       <RiskCalculator
-        :entry-price="Number(signal.entry_price)"
+        :entry-price="Number(signal.last_price || signal.entry_price)"
         :stop-loss="Number(signal.stop_loss)"
+        :signal-entry="Number(signal.entry_price)"
+        :take-profit="signal.take_profit_1 != null ? Number(signal.take_profit_1) : undefined"
+        :signal-type="signal.signal_type"
         :capital="config.defaultCapital"
       />
     </div>

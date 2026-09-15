@@ -9,6 +9,7 @@ class RiskCalculateRequest(BaseSchema):
     capital: Decimal = Decimal("100000")
     risk_per_trade: Decimal = Decimal("1.0")
     take_profit: Decimal | None = None
+    lot_round: str = "up"
 
 
 class RiskCalculateResponse(BaseSchema):
@@ -18,3 +19,8 @@ class RiskCalculateResponse(BaseSchema):
     risk_distance: Decimal
     take_profit_1: Decimal | None = None
     take_profit_2: Decimal | None = None
+    rr_source: str = "assumed_2r"
+    rr_meets_min: bool = True
+    assumed_2r: Decimal | None = None
+    raw_shares: Decimal | None = None
+    lot_round: str = "up"

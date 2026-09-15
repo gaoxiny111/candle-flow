@@ -25,6 +25,7 @@ export const useConfigStore = defineStore('config', {
     defaultSymbol: '000001.SZ',
     defaultCapital: 100000,
     preferredPeriod: 'daily' as 'daily' | 'weekly',
+    lotRound: 'up' as 'up' | 'down',
     isAuthenticated: false,
     hasPassword: false,
     username: '',
@@ -127,5 +128,5 @@ export const useConfigStore = defineStore('config', {
       if (!v) this.clearSession()
     },
   },
-  persist: { paths: ['theme', 'username', 'token', 'isAuthenticated', 'riskPerTrade', 'defaultSymbol', 'defaultCapital', 'preferredPeriod'] },
+  persist: { paths: ['theme', 'username', 'token', 'isAuthenticated', 'riskPerTrade', 'defaultSymbol', 'defaultCapital', 'preferredPeriod', 'lotRound'] },
 })

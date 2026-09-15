@@ -14,12 +14,14 @@ router = APIRouter()
 def calculate_risk(body: RiskCalculateRequest):
     svc = RiskService()
     try:
+        lot_round = body.lot_round if body.lot_round in ("up", "down") else "up"
         result = svc.calculate(
             entry_price=body.entry_price,
             stop_loss=body.stop_loss,
             capital=body.capital,
             risk_per_trade=body.risk_per_trade,
             take_profit=body.take_profit,
+            lot_round=lot_round,
         )
         return ApiResponse(data=result)
     except ValueError as e:

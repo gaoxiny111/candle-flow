@@ -4,11 +4,21 @@ import type { KlineItem, PatternItem, SignalItem } from '@/api'
 import { patternNameZh, signalLevelZh, signalStatusZh } from '@/utils/labels'
 import { parseConfluence } from '@/utils/confluence'
 
+type RrContext = {
+  signalRr: number | null
+  liveRr: number | null
+  driftPct: number | null
+  chasing: boolean
+  displayLevel: string
+  warning: string
+}
+
 type DisplayItem = {
   key: string
   pattern: PatternItem
   signal?: SignalItem
   pattern_date: string
+  rr?: RrContext
 }
 
 const props = defineProps<{
@@ -87,6 +97,62 @@ function pickSignal(pattern: PatternItem): SignalItem | undefined {
   return candidates[0]
 }
 
+const CHASE_DRIFT = 0.03
+
+function lastClose(): number | null {
+  const bars = props.klineData || []
+  if (!bars.length) return null
+  const c = Number(bars[bars.length - 1].close)
+  return Number.isFinite(c) && c > 0 ? c : null
+}
+
+/** 信号触发价盈亏比 vs 按现价执行的实际盈亏比 */
+function rrContext(s: SignalItem): RrContext {
+  const entry = Number(s.entry_price)
+  const stop = Number(s.stop_loss)
+  const tp1 = Number(s.take_profit_1)
+  const storedRr = Number(s.risk_reward_ratio)
+  const px = lastClose()
+  const entryRisk = Number.isFinite(entry) && Number.isFinite(stop) ? Math.abs(entry - stop) : 0
+  const fromTarget =
+    entryRisk > 0 && Number.isFinite(tp1) && tp1 > 0 ? Math.round((Math.abs(tp1 - entry) / entryRisk) * 100) / 100 : null
+  const signalRr = fromTarget ?? (Number.isFinite(storedRr) ? storedRr : null)
+  const base: RrContext = {
+    signalRr,
+    liveRr: null,
+    driftPct: null,
+    chasing: false,
+    displayLevel: s.signal_level,
+    warning: '',
+  }
+  if (!Number.isFinite(entry) || entry <= 0 || !Number.isFinite(stop)) return base
+  if (signalRr != null && signalRr < 1.5) {
+    if (s.signal_level === 'strong') base.displayLevel = 'medium'
+    else if (s.signal_level === 'medium') base.displayLevel = 'weak'
+    base.warning = `真实盈亏比 ${signalRr.toFixed(2)} 低于 1.5，信号降级`
+  }
+  if (px == null) return base
+  const drift = Math.abs(px - entry) / entry
+  base.driftPct = Math.round(drift * 1000) / 10
+  if (drift < CHASE_DRIFT) return base
+  base.chasing = true
+  const risk = Math.abs(px - stop)
+  if (risk > 0 && Number.isFinite(tp1) && tp1 > 0) {
+    const reward = Math.abs(tp1 - px)
+    const sameSideOk =
+      s.signal_type === 'buy' ? tp1 > px && stop < px : tp1 < px && stop > px
+    base.liveRr = sameSideOk ? Math.round((reward / risk) * 100) / 100 : 0
+  }
+  if (s.signal_level === 'strong') base.displayLevel = 'medium'
+  else if (s.signal_level === 'medium') base.displayLevel = 'weak'
+  if (base.liveRr != null && base.liveRr < 1.5) {
+    base.warning = `现价追高风险：实际盈亏比 ${base.liveRr.toFixed(2)}（信号触发价盈亏比 ${signalRr?.toFixed(2) ?? '—'}）`
+  } else {
+    base.warning = `现价相对信号入场偏离 ${base.driftPct}%：请按现价重算风控，勿沿用触发价盈亏比 ${signalRr?.toFixed(2) ?? '—'}`
+  }
+  return base
+}
+
 const displayItems = computed((): DisplayItem[] => {
   const bars = props.klineData || []
   const recentDates = new Set(bars.slice(-7).map((b) => ymd(b.date)))
@@ -112,6 +178,7 @@ const displayItems = computed((): DisplayItem[] => {
         pattern,
         signal,
         pattern_date,
+        rr: signal ? rrContext(signal) : undefined,
       }
     })
     .sort((a, b) => {
@@ -214,7 +281,12 @@ function isActive(item: DisplayItem) {
             <span :class="['badge', item.signal.signal_type === 'buy' ? 'badge-bullish' : 'badge-bearish']">
               {{ item.signal.signal_type === 'buy' ? (isIndex ? '看多' : '买入') : (isIndex ? '看空' : '卖出') }}
             </span>
-            <span :class="['badge', levelClass(item.signal.signal_level)]">{{ signalLevelZh(item.signal.signal_level) }}</span>
+            <span :class="['badge', levelClass(item.rr?.displayLevel || item.signal.signal_level)]">
+              {{ signalLevelZh(item.rr?.displayLevel || item.signal.signal_level) }}
+              <template v-if="item.rr?.chasing && item.rr.displayLevel !== item.signal.signal_level">
+                （已降级）
+              </template>
+            </span>
             <span class="pattern-name">{{ patternNameZh(item.signal.pattern_name) }}</span>
           </div>
           <div class="signal-dates">
@@ -229,13 +301,20 @@ function isActive(item: DisplayItem) {
             </div>
           </div>
           <div class="signal-detail">
-            <span>{{ isIndex ? '参考点' : '入场' }} {{ item.signal.entry_price }}</span>
+            <span>{{ isIndex ? '参考点' : '信号入场' }} {{ item.signal.entry_price }}</span>
             <span>止损 {{ item.signal.stop_loss }}</span>
             <span>目标1 {{ item.signal.take_profit_1 ?? '-' }}</span>
             <span>目标2 {{ item.signal.take_profit_2 ?? '-' }}</span>
-            <span>盈亏比 {{ item.signal.risk_reward_ratio }}</span>
+            <span>信号盈亏比 {{ item.rr?.signalRr?.toFixed(2) ?? item.signal.risk_reward_ratio }}</span>
+            <span
+              v-if="item.rr?.chasing && item.rr.liveRr != null"
+              :class="['live-rr', { bad: item.rr.liveRr < 1.5 }]"
+            >
+              现价盈亏比 {{ item.rr.liveRr.toFixed(2) }}
+            </span>
             <span v-if="!isIndex">仓位 {{ item.signal.position_size }}</span>
           </div>
+          <p v-if="item.rr?.warning" class="chase-warn">{{ item.rr.warning }}</p>
           <p v-if="item.signal.notes" class="signal-notes">{{ item.signal.notes }}</p>
           <div v-if="item.signal.status === 'pending'" class="signal-actions" @click.stop>
             <button class="btn-primary" @click="emit('confirmSignal', item.signal.id)">确认</button>
@@ -331,6 +410,17 @@ function isActive(item: DisplayItem) {
   line-height: 1.5;
 }
 .signal-detail { display: flex; flex-wrap: wrap; gap: var(--space-sm) var(--space-md); font-size: 13px; color: var(--text-secondary); margin-bottom: var(--space-sm); }
+.live-rr { color: #d48806; font-weight: 600; }
+.live-rr.bad { color: #cf1322; }
+.chase-warn {
+  margin: 0 0 var(--space-sm);
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #ad6800;
+  background: #fff7e6;
+  border-radius: 6px;
+}
 .signal-notes { margin: 0 0 var(--space-sm); font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
 .signal-actions { display: flex; gap: var(--space-sm); }
 .status-tag { font-size: 12px; color: var(--text-secondary); }

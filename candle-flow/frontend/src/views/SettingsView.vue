@@ -246,6 +246,19 @@ function logout() {
       </div>
     </div>
 
+    <div class="card">
+      <h2>风控偏好</h2>
+      <p class="hint">仓位按 A 股 100 股一手取整。向上更贴近风险预算，向下更保守。</p>
+      <div class="form-row">
+        <label>仓位取整
+          <select v-model="config.lotRound">
+            <option value="up">向上取整到百股（299→300）</option>
+            <option value="down">向下取整到百股（299→200）</option>
+          </select>
+        </label>
+      </div>
+    </div>
+
     <div v-if="config.isAuthenticated" class="card">
       <h2>交易偏好</h2>
       <div class="form-row">
