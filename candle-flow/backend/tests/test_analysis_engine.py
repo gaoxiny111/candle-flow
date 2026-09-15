@@ -247,10 +247,22 @@ def test_dcf_shares_from_market_cap_and_reliability():
     iv = dcf["intrinsic_value_per_share"]
     assert iv is not None
     assert 10 < iv < 150  # 相对 48 元现价不爆表
-    assert abs(dcf["assumptions"]["wacc"] - 0.08) < 1e-9  # 低负债动态 WACC
+    assert abs(dcf["assumptions"]["wacc"] - 0.08) < 1e-9  # 负债率25% → WACC 8%
+    assert dcf.get("role") == "pessimistic_reference"
+    assert "保守" in (dcf.get("note") or "") or "悲观" in (dcf.get("note") or "")
 
 
-def test_cashflow_paper_wealth_cuts_fcf_score():
+def test_dcf_blue_chip_lower_wacc():
+    eng = FundamentalEngine()
+    fd = _sample_financials()
+    dcf = eng._build_dcf(
+        fd,
+        {"price": 1400.0, "market_cap": 1400.0 * 12.56e8},
+        {"symbol": "600519.SH", "profit_yoy": 15.0, "debt_ratio": 16.42},
+    )
+    assert abs(dcf["assumptions"]["wacc"] - 0.07) < 1e-9
+    assert abs(dcf["assumptions"]["terminal_growth"] - 0.025) < 1e-9
+
     """连续亏损 + 正自由现金流 → 不给高分，触发纸面富贵预警。"""
     rows = [
         {"revenue": 100e8, "net_profit": -5e8, "equity": 40e8, "operating_cashflow": 8e8,
@@ -314,6 +326,52 @@ def test_ar_moderate_growth_warns_collection():
     assert any("回款极其困难" in w for w in result.warnings)
     assert not any("虚增收入" in w for w in result.warnings)
     assert not any("营运资本占用" in w for w in result.warnings)
+
+
+def test_moutai_like_not_cash_debt_dual_high():
+    """高现金 + 合同负债残差不得触发存贷双高；应定性资金充裕。"""
+    rows = [
+        {
+            "revenue": 1500e8, "net_profit": 700e8, "equity": 2500e8,
+            "operating_cashflow": 800e8, "monetary_funds": 1700e8,
+            "short_term_borrowings": 0, "accounts_receivable": 1e6, "goodwill": 0,
+        },
+        {
+            "revenue": 1600e8, "net_profit": 750e8, "equity": 2600e8,
+            "operating_cashflow": 850e8, "monetary_funds": 1700e8,
+            "short_term_borrowings": 0, "accounts_receivable": 1e6, "goodwill": 0,
+        },
+    ]
+    fd = pd.DataFrame(rows, index=["20241231", "20251231"])
+    result = RiskAnalyzer().analyze(
+        fd,
+        name="贵州茅台",
+        industry="白酒",
+        debt_ratio=16.42,
+        interest_bearing_debt=0,
+        short_term_borrowings=0,
+    )
+    assert not any("存贷双高" in w for w in result.warnings)
+    assert any("资金极度充裕" in w for w in result.warnings)
+    assert any("宏观与政策风险" in w for w in result.warnings)
+
+
+def test_true_cash_debt_dual_high_still_flags():
+    rows = [
+        {
+            "revenue": 100e8, "net_profit": 5e8, "equity": 50e8,
+            "operating_cashflow": 6e8, "monetary_funds": 50e8,
+            "short_term_borrowings": 40e8, "accounts_receivable": 10e8, "goodwill": 0,
+        },
+        {
+            "revenue": 110e8, "net_profit": 6e8, "equity": 55e8,
+            "operating_cashflow": 7e8, "monetary_funds": 55e8,
+            "short_term_borrowings": 45e8, "accounts_receivable": 11e8, "goodwill": 0,
+        },
+    ]
+    fd = pd.DataFrame(rows, index=["20241231", "20251231"])
+    result = RiskAnalyzer().analyze(fd, name="测试股", industry="化工", debt_ratio=55.0)
+    assert any("存贷双高" in w for w in result.warnings)
 
 
 def test_value_trap_caps_valuation_for_st_loss(monkeypatch):
@@ -524,3 +582,139 @@ def test_valuation_rationale_and_cashflow_haircut(monkeypatch):
     yoy = next(i for i in growth["indicators"] if "营收同比" in i["name"])
     assert yoy.get("period")
     assert "中报" in yoy["period"] or "2025" in yoy["period"]
+
+
+def test_shenhua_like_not_cash_debt_dual_high():
+    """高现金 + 少量真实短贷（短债/现金≪40%）≠存贷双高，应定性资金充裕。"""
+    rows = [
+        {
+            "revenue": 3000e8, "net_profit": 600e8, "equity": 5500e8,
+            "operating_cashflow": 800e8, "monetary_funds": 1410e8,
+            "short_term_borrowings": 131e8, "accounts_receivable": 160e8, "goodwill": 0,
+        },
+        {
+            "revenue": 3200e8, "net_profit": 620e8, "equity": 6000e8,
+            "operating_cashflow": 850e8, "monetary_funds": 1410e8,
+            "short_term_borrowings": 131e8, "accounts_receivable": 165e8, "goodwill": 0,
+        },
+    ]
+    fd = pd.DataFrame(rows, index=["20241231", "20251231"])
+    result = RiskAnalyzer().analyze(
+        fd,
+        name="中国神华",
+        industry="煤炭开采",
+        debt_ratio=33.0,
+        interest_bearing_debt=860e8,
+        short_term_borrowings=131e8,
+        dividend_yield=4.5,
+        pe_ttm=18.0,
+    )
+    assert not any("存贷双高" in w for w in result.warnings)
+    assert any("资金极度充裕" in w or "现金奶牛" in w for w in result.warnings)
+
+
+def test_high_dividend_roic_wacc_exemption():
+    """高股息资产：ROIC 用红利 WACC≈4.5%，不标毁灭价值、不触发否决 flag。"""
+    fd = _sample_financials().copy()
+    # 压低经营利润 → ROIC 约 5%~6%：低于成长股 WACC≈10%，但覆盖红利 WACC≈4.5%
+    fd["operating_profit"] = [6e8, 6.5e8, 7e8]
+    result = ProfitabilityAnalyzer().analyze(
+        fd,
+        debt_ratio=33.0,
+        latest_roe=12.0,
+        dividend_yield=6.0,
+        pe_ttm=12.0,
+    )
+    assert result.metadata.get("is_dividend_asset") is True
+    assert result.metadata.get("roic_below_wacc") is False
+    assert abs(float(result.metadata.get("wacc_pct") or 0) - 4.5) < 1e-6
+    roic = next(i for i in result.indicators if i.name == "ROIC(%)")
+    assert float(roic.value) >= 4.5
+    assert "毁灭" not in (roic.comment or "")
+    assert "红利" in (roic.comment or "") or "现金回报" in (roic.comment or "")
+    assert not any("毁灭" in w for w in result.warnings)
+
+
+def test_high_dividend_valuation_skips_peg_and_value_trap(monkeypatch):
+    """红利资产估值不用 PEG 锁分，也不因 ROIC<成长股WACC 触发价值陷阱。"""
+    engine = FundamentalEngine()
+
+    def fake_build(symbol: str, years: int = 5):
+        fd = _sample_financials().copy()
+        fd["operating_profit"] = [4e8, 4.2e8, 4.5e8]
+        fd["monetary_funds"] = [100e8, 120e8, 141e8]
+        fd["short_term_borrowings"] = [10e8, 12e8, 13e8]
+        return fd, {
+            "name": "中国神华",
+            "industry": "煤炭开采",
+            "symbol": "601088.SH",
+            "report_dates": list(fd.index),
+            "annual_dates": list(fd.index),
+            "revenue_yoy": 3.0,
+            "profit_yoy": 1.0,
+            "debt_ratio": 33.0,
+            "latest_report": "20251231",
+            "ocf_per_share": 2.0,
+            "latest_roe": 12.0,
+        }
+
+    monkeypatch.setattr("app.analysis.engine.build_financial_dataframe", fake_build)
+    monkeypatch.setattr("app.analysis.engine.industry_averages", lambda *a, **k: {})
+    monkeypatch.setattr(
+        "app.analysis.engine.get_valuations",
+        lambda *a, **k: [
+            {
+                "symbol": "601088.SH",
+                "name": "中国神华",
+                "price": 47.0,
+                "pe_ttm": 18.8,
+                "pb": 2.2,
+                "pe_percentile": 96.7,
+                "pb_percentile": 80.0,
+                "market_cap": 1e12,
+                "dividend_yield": 6.5,
+                "total_shares": 2e10,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "app.analysis.engine.calculate_comparable_valuation",
+        lambda *a, **k: {
+            "stock_code": "601088.SH",
+            "comparables": [],
+            "avg_pe": None,
+            "avg_pb": None,
+            "valuation_range": {},
+            "peer_count": 0,
+            "insufficient_sample": True,
+        },
+    )
+    monkeypatch.setattr(
+        "app.analysis.engine.detect_major_risk_events",
+        lambda *_a, **_k: {"fatal": False, "events": [], "event_count": 0, "message": ""},
+    )
+
+    report = engine.run_full_analysis("601088.SH", db=None)
+    val = report["valuation"]
+    assert val.get("is_dividend_asset") is True
+    assert val.get("value_trap_veto") is not True
+    assert float(val.get("composite_valuation_score") or 0) > 28
+    rel = val.get("relative") or {}
+    assert "股息国债利差" in rel
+    peg = rel.get("PEG") or {}
+    assert peg.get("skipped_for_dividend_asset") is True or peg.get("signal") in (None, "—", "")
+    assert "红利" in (val.get("valuation_rationale") or "") or "股息" in (val.get("valuation_rationale") or "")
+    prof = report["modules"]["profitability"]
+    assert prof["metadata"].get("roic_below_wacc") is False
+    risk_warnings = report["modules"]["risk"]["warnings"]
+    assert not any("存贷双高" in w for w in risk_warnings)
+
+
+def test_classify_dividend_asset_soft_tier():
+    from app.analysis.dividend_profile import classify_dividend_asset
+
+    # 股息率 4.3% + 估分红率≈80% → soft 红利
+    p = classify_dividend_asset(dividend_yield_pct=4.3, pe_ttm=18.8)
+    assert p["is_dividend_asset"] is True
+    assert p["tier"] == "soft"
+    assert p["wacc_pct"] == 4.5

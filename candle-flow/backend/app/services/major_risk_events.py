@@ -103,6 +103,20 @@ RISK_RULES: list[dict[str, Any]] = [
         ),
     },
     {
+        "id": "macro_policy",
+        "label": "宏观与消费政策风险",
+        "severity": "observe",
+        "keywords": (
+            "消费税",
+            "消费税改革",
+            "禁酒令",
+            "公务接待",
+            "中央八项规定",
+            "限制酒类消费",
+            "高端消费限制",
+        ),
+    },
+    {
         "id": "reduce_hold",
         "label": "实控人/大股东减持",
         "severity": "observe",

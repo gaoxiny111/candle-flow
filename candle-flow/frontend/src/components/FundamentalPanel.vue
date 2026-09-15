@@ -251,6 +251,7 @@ const observeRiskEvents = computed(() => report.value?.major_risks?.observe_even
             <span v-if="v.percentile_5y != null" class="val-sub">分位 {{ v.percentile_5y }}%</span>
             <span v-else-if="v.percentile_na" class="val-sub na">{{ v.percentile_na }}</span>
             <span v-if="v.industry_median != null" class="val-sub">行业 {{ v.industry_median }}</span>
+            <span v-if="v.note" class="val-sub">{{ v.note }}</span>
           </div>
         </div>
       </section>
@@ -319,9 +320,9 @@ const observeRiskEvents = computed(() => report.value?.major_risks?.observe_even
       </section>
 
       <section v-if="report.valuation?.dcf" class="valuation card-inner">
-        <h4>DCF 内在价值</h4>
+        <h4>DCF 内在价值 <span class="muted" style="font-weight:500;font-size:12px">保守参考</span></h4>
         <p v-if="report.valuation.dcf.note" class="muted">{{ report.valuation.dcf.note }}</p>
-        <template v-else>
+        <template v-if="report.valuation.dcf.intrinsic_value_per_share != null">
           <p>
             每股内在价值
             <strong>{{ report.valuation.dcf.intrinsic_value_per_share ?? '—' }}</strong>

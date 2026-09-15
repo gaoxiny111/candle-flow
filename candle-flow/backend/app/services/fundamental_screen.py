@@ -1099,6 +1099,14 @@ def _parse_em_zcfz_row(row: Any) -> dict[str, float]:
     inv = g("INVENTORY", "存货")
     ap = g("ACCOUNTS_PAYABLE", "ACCOUNT_PAYABLE", "应付账款")
     adv = g("ADVANCE_RECEIVABLES", "CONTRACT_LIAB", "预收账款", "合同负债")
+    # 有息负债：只用借款/债券等明示科目，禁止用「总负债−经营负债」残差（会把税费/薪酬/其他应付算成借款）
+    short_loan = g("SHORT_LOAN", "短期借款")
+    long_loan = g("LONG_LOAN", "长期借款")
+    bond = g("BOND_PAYABLE", "应付债券")
+    short_bond = g("SHORT_BOND_PAYABLE", "应付短期债券")
+    tax_pay = g("TAX_PAYABLE", "应交税费")
+    staff_pay = g("STAFF_SALARY_PAYABLE", "应付职工薪酬")
+    other_pay = g("TOTAL_OTHER_PAYABLE", "OTHER_PAYABLE", "其他应付款")
     ratio = g("ASSET_LIAB_RATIO", "资产负债率")
     if ratio is not None and ratio <= 1.5:
         ratio = ratio * 100.0
@@ -1123,6 +1131,22 @@ def _parse_em_zcfz_row(row: Any) -> dict[str, float]:
         item["accounts_payable"] = float(ap)
     if adv is not None:
         item["advance_receipts"] = float(adv)
+    if tax_pay is not None:
+        item["tax_payable"] = float(tax_pay)
+    if staff_pay is not None:
+        item["staff_salary_payable"] = float(staff_pay)
+    if other_pay is not None:
+        item["other_payable"] = float(other_pay)
+
+    # 明示有息：缺省按 0（东财无借款时字段为 null）
+    st_b = float(short_loan or 0)
+    lt_b = float(long_loan or 0)
+    bd = float(bond or 0) + float(short_bond or 0)
+    item["short_term_borrowings"] = st_b
+    item["long_term_borrowings"] = lt_b
+    item["bond_payable"] = bd
+    item["interest_bearing_debt"] = st_b + lt_b + bd
+    item["interest_bearing_explicit"] = 1.0
     return item
 
 

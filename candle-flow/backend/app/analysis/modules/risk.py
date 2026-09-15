@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from app.analysis.base import AnalysisLevel, BaseAnalyzer, ModuleResult, score_to_level
+from app.analysis.dividend_profile import classify_dividend_asset
 
 
 class RiskAnalyzer(BaseAnalyzer):
@@ -51,10 +52,54 @@ class RiskAnalyzer(BaseAnalyzer):
                 risk_score -= 15
 
         cash = float(latest.get("monetary_funds", 0) or 0)
-        short_debt = float(latest.get("short_term_borrowings", 0) or 0)
-        if cash > 1e9 and short_debt > 1e9:
+        short_debt = float(latest.get("short_term_borrowings", 0) or kwargs.get("short_term_borrowings") or 0)
+        ibd = kwargs.get("interest_bearing_debt")
+        if ibd is None:
+            ibd = latest.get("interest_bearing_debt")
+        try:
+            ibd_f = float(ibd) if ibd is not None else short_debt
+        except (TypeError, ValueError):
+            ibd_f = short_debt
+        debt_ratio = kwargs.get("debt_ratio")
+        try:
+            dr_f = float(debt_ratio) if debt_ratio is not None else None
+        except (TypeError, ValueError):
+            dr_f = None
+
+        # 存贷双高：真短债相对现金比例过高才算（神华等短债≪现金≠双高）
+        short_to_cash = (short_debt / cash) if cash > 0 else 0.0
+        div_profile = classify_dividend_asset(
+            dividend_yield_pct=kwargs.get("dividend_yield"),
+            pe_ttm=kwargs.get("pe_ttm"),
+            payout_ratio_pct=kwargs.get("payout_ratio_pct"),
+        )
+        is_div = bool(div_profile.get("is_dividend_asset"))
+
+        if cash > 1e9 and short_debt > 1e9 and short_to_cash >= 0.40:
             warnings.append("存贷双高，需关注资金真实性")
             risk_score -= 20
+        elif cash > 5e9 and short_to_cash < 0.25 and (dr_f is None or dr_f < 45):
+            if short_debt < 1e8 and ibd_f < 1e8:
+                warnings.append(
+                    "资金极度充裕，近乎零有息负债（预收/合同负债等经营性负债≠银行借款）"
+                )
+            elif is_div or ibd_f <= cash * 0.85:
+                # 神华等：现金奶牛 + 低短债占比，负债多为经营性占用
+                warnings.append(
+                    "资金极度充裕，产业链话语权强（经营性负债为主，有息负债可控）"
+                )
+        elif is_div and cash > 5e9 and short_to_cash < 0.35:
+            warnings.append(
+                "高股息现金奶牛：资金充裕、分红能力强，短期借款相对现金可控"
+            )
+
+        # 白酒/高端消费：宏观与政策风险为观察项（轻扣分）
+        industry = str(kwargs.get("industry") or "")
+        if any(k in industry for k in ("白酒", "酿酒", "白酒制造")) or "茅台" in name:
+            warnings.append(
+                "宏观与政策风险（观察）：关注高端消费景气度、消费税改革及禁酒/公务消费政策对估值的影响"
+            )
+            risk_score -= 5
 
         ocf = float(latest.get("operating_cashflow", 0) or 0)
         profit = float(latest.get("net_profit", 0) or 0)
