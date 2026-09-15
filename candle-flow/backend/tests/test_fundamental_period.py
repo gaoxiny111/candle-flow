@@ -21,6 +21,35 @@ def test_report_period_label():
     assert report_period_label("20251231") == "2025A"
 
 
+def test_yjbb_skips_unpublished_dates():
+    from datetime import date as _date
+
+    from app.services.fundamental_screen import _yjbb_should_retry
+
+    assert _yjbb_should_retry("20991231") is False
+    assert _yjbb_should_retry(f"{_date.today().year}1231") is False
+    assert _yjbb_should_retry("20251231") is True
+
+
+def test_parse_em_zcfz_row_debt_ratio():
+    from app.services.fundamental_screen import _parse_em_zcfz_row
+
+    item = _parse_em_zcfz_row(
+        {
+            "TOTAL_ASSETS": 100.0,
+            "TOTAL_LIABILITIES": 40.0,
+            "MONETARYFUNDS": 10.0,
+            "ACCOUNTS_RECE": 5.0,
+            "INVENTORY": 8.0,
+            "ACCOUNTS_PAYABLE": 6.0,
+            "ADVANCE_RECEIVABLES": 2.0,
+        }
+    )
+    assert item["debt_ratio"] == 40.0
+    assert item["monetary_funds"] == 10.0
+    assert item["accounts_payable"] == 6.0
+
+
 def test_cash_ratio_same_period_per_share():
     shenhua = ScreenRow(
         symbol="601088.SH",

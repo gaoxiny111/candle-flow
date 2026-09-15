@@ -185,6 +185,9 @@ const displayWarnings = computed(() => {
         <p v-if="report.valuation.valuation_rationale" class="val-rationale">
           {{ report.valuation.valuation_rationale }}
         </p>
+        <p v-if="report.valuation.value_trap_veto" class="val-trap" role="alert">
+          {{ report.valuation.value_trap_message || '基本面恶化，低估值为陷阱，不适用相对估值' }}
+        </p>
         <div class="val-grid">
           <div v-for="(v, k) in report.valuation.relative" :key="k" class="val-item">
             <span class="val-key">{{ k }}</span>
@@ -378,6 +381,13 @@ const displayWarnings = computed(() => {
 .val-rationale {
   font-size: 12px; color: var(--text-secondary); margin: 0 0 10px; line-height: 1.5;
   padding: 8px 10px; background: var(--bg-secondary, #fafafa); border-radius: 6px;
+}
+.val-trap {
+  font-size: 13px; font-weight: 600; color: #cf1322; margin: 0 0 10px; line-height: 1.5;
+  padding: 8px 10px; background: #fff1f0; border: 1px solid #ffa39e; border-radius: 6px;
+}
+[data-theme='dark'] .val-trap {
+  background: #2a1215; border-color: #a8071a; color: #ff7875;
 }
 .val-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
 .val-item { font-size: 13px; padding: 8px; background: var(--bg-secondary, #fafafa); border-radius: 6px; }

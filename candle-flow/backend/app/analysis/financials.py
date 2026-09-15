@@ -5,7 +5,7 @@ from typing import Any
 import pandas as pd
 
 from app.services.fundamental_screen import (
-    _fetch_zcfz_map,
+    _fetch_symbol_zcfz,
     _fetch_yjbb,
     _num,
     _to_symbol,
@@ -25,10 +25,15 @@ def _pick(row: Any, *keys: str) -> float | None:
 def _extract_row(df: pd.DataFrame, symbol: str) -> dict | None:
     if df is None or df.empty:
         return None
-    for _, row in df.iterrows():
-        if _to_symbol(row.get("股票代码")) == symbol:
-            return dict(row)
-    return None
+    code_col = next((c for c in df.columns if "代码" in str(c)), None)
+    if code_col is None:
+        return None
+    want = str(symbol or "").upper()
+    codes = df[code_col].map(_to_symbol).fillna("").astype(str).str.upper()
+    hit = df.loc[codes == want]
+    if hit.empty:
+        return None
+    return dict(hit.iloc[0])
 
 
 def _estimate_equity(net_profit: float | None, roe: float | None) -> float | None:
@@ -142,17 +147,25 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
             meta["annual_roe"] = float(annual_roe.iloc[-1])
             meta["latest_roe"] = meta["annual_roe"]
 
-    # 资产负债率：必须优先年报；中报负债率季节性偏高（神华中报 40% vs 年报 ~25–33%）
+    # 资产负债率：必须优先年报；用个股资产负债表，避免全市场 zcfz 分页
     debt_ratio = None
     zcfz_row: dict[str, float] | None = None
     zcfz_date: str | None = None
+    by_date = _fetch_symbol_zcfz(symbol)
     for cand in list(reversed(list(fd.index))):
-        zmap = _fetch_zcfz_map(str(cand))
-        if symbol in zmap and zmap[symbol].get("debt_ratio") is not None:
-            zcfz_row = zmap[symbol]
+        item = by_date.get(str(cand))
+        if item and item.get("debt_ratio") is not None:
+            zcfz_row = item
             zcfz_date = str(cand)
             debt_ratio = float(zcfz_row["debt_ratio"])
             break
+    if zcfz_row is None and by_date:
+        annuals = sorted(k for k in by_date if str(k).endswith("1231"))
+        pick = annuals[-1] if annuals else sorted(by_date)[-1]
+        zcfz_row = by_date[pick]
+        zcfz_date = pick
+        if zcfz_row.get("debt_ratio") is not None:
+            debt_ratio = float(zcfz_row["debt_ratio"])
     if debt_ratio is None and not fd.empty:
         last = fd.iloc[-1]
         # 无总资产时用权益粗估（负债率未知则跳过）

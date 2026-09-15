@@ -158,6 +158,38 @@ def test_skip_invalid_and_dedupe(monkeypatch):
     assert [r["symbol"] for r in rows] == ["600519.SH"]
 
 
+def test_get_valuations_skip_history(monkeypatch):
+    valuation_mod.clear_cache()
+    monkeypatch.setattr(
+        valuation_mod,
+        "_fetch_quotes",
+        lambda symbols: {
+            "600519.SH": {
+                "symbol": "600519.SH",
+                "name": "茅台",
+                "price": 10.0,
+                "change_pct": 0.0,
+                "pe_ttm": 12.0,
+                "pe_dynamic": None,
+                "pb": 2.0,
+                "market_cap": 1e10,
+                "dividend_yield": 1.0,
+                "pe_percentile": None,
+                "pb_percentile": None,
+                "percentiles_pending": False,
+            }
+        },
+    )
+
+    def boom(*_a, **_k):
+        raise AssertionError("history should be skipped")
+
+    monkeypatch.setattr(valuation_mod, "_histories_for", boom)
+    rows = get_valuations(["600519.SH"], include_history=False)
+    assert rows[0]["pe_ttm"] == 12.0
+    assert rows[0]["pe_percentile"] is None
+
+
 def _memory_db():
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker

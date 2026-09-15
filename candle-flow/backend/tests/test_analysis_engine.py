@@ -25,6 +25,15 @@ def _sample_financials() -> pd.DataFrame:
     return pd.DataFrame(rows, index=["20211231", "20221231", "20231231"])
 
 
+def test_extract_row_by_symbol():
+    from app.analysis.financials import _extract_row
+
+    df = pd.DataFrame({"股票代码": ["603236", "000001"], "净利润": [11.0, 22.0]})
+    row = _extract_row(df, "603236.SH")
+    assert row is not None
+    assert row["净利润"] == 11.0
+
+
 def test_profitability_analyzer_scores():
     result = ProfitabilityAnalyzer().analyze(_sample_financials())
     assert result.score >= 70
@@ -239,6 +248,114 @@ def test_dcf_shares_from_market_cap_and_reliability():
     assert iv is not None
     assert 10 < iv < 150  # 相对 48 元现价不爆表
     assert abs(dcf["assumptions"]["wacc"] - 0.08) < 1e-9  # 低负债动态 WACC
+
+
+def test_cashflow_paper_wealth_cuts_fcf_score():
+    """连续亏损 + 正自由现金流 → 不给高分，触发纸面富贵预警。"""
+    rows = [
+        {"revenue": 100e8, "net_profit": -5e8, "equity": 40e8, "operating_cashflow": 8e8,
+         "capital_expenditure": 1e8, "operating_profit": -4e8, "total_assets": 120e8,
+         "current_liabilities": 50e8, "accounts_receivable": 30e8},
+        {"revenue": 80e8, "net_profit": -8e8, "equity": 30e8, "operating_cashflow": 12e8,
+         "capital_expenditure": 1e8, "operating_profit": -6e8, "total_assets": 110e8,
+         "current_liabilities": 55e8, "accounts_receivable": 28e8},
+        {"revenue": 40e8, "net_profit": -10e8, "equity": 20e8, "operating_cashflow": 18e8,
+         "capital_expenditure": 4.5e8, "operating_profit": -8e8, "total_assets": 100e8,
+         "current_liabilities": 60e8, "accounts_receivable": 25e8},
+    ]
+    fd = pd.DataFrame(rows, index=["20231231", "20241231", "20251231"])
+    result = CashflowAnalyzer().analyze(fd)
+    assert result.metadata.get("paper_wealth") is True
+    fcf = next(i for i in result.indicators if i.name.startswith("自由现金流"))
+    assert fcf.score <= 35
+    assert any("纸面富贵" in w for w in result.warnings)
+    assert any(i.name == "亏损现金背离" for i in result.indicators)
+
+
+def test_ar_warning_collection_vs_inflation():
+    """营收暴跌而应收降幅更小 → 回款困难，而非虚增收入。"""
+    rows = [
+        {"revenue": 100e8, "net_profit": 5e8, "equity": 40e8, "operating_cashflow": 6e8,
+         "capital_expenditure": 1e8, "accounts_receivable": 40e8},
+        {"revenue": 48e8, "net_profit": -2e8, "equity": 35e8, "operating_cashflow": 3e8,
+         "capital_expenditure": 1e8, "accounts_receivable": 38e8},
+    ]
+    fd = pd.DataFrame(rows, index=["20241231", "20251231"])
+    result = CashflowAnalyzer().analyze(fd)
+    assert any("回款极其困难" in w for w in result.warnings)
+    assert not any("虚增收入" in w for w in result.warnings)
+
+
+def test_value_trap_caps_valuation_for_st_loss(monkeypatch):
+    """ST + 连续亏损时，低 PB 不得把估值分打到高分。"""
+    from app.analysis.base import AnalysisLevel, ModuleResult
+    from app.analysis.engine import FundamentalEngine
+
+    engine = FundamentalEngine()
+
+    def fake_build(symbol: str, years: int = 5):
+        rows = [
+            {"revenue": 100e8, "net_profit": -5e8, "equity": 40e8, "operating_cashflow": 10e8,
+             "capital_expenditure": 2e8, "operating_profit": -4e8, "total_assets": 120e8,
+             "current_liabilities": 50e8, "accounts_receivable": 30e8, "roe": -12.0},
+            {"revenue": 50e8, "net_profit": -8e8, "equity": 25e8, "operating_cashflow": 15e8,
+             "capital_expenditure": 2e8, "operating_profit": -6e8, "total_assets": 100e8,
+             "current_liabilities": 55e8, "accounts_receivable": 28e8, "roe": -20.0},
+            {"revenue": 40e8, "net_profit": -10e8, "equity": 15e8, "operating_cashflow": 18e8,
+             "capital_expenditure": 4e8, "operating_profit": -8e8, "total_assets": 90e8,
+             "current_liabilities": 60e8, "accounts_receivable": 26e8, "roe": -30.0},
+        ]
+        fd = pd.DataFrame(rows, index=["20231231", "20241231", "20251231"])
+        return fd, {
+            "name": "ST龙元",
+            "industry": "房屋建设",
+            "symbol": "600491.SH",
+            "report_dates": list(fd.index),
+            "annual_dates": list(fd.index),
+            "revenue_yoy": -51.0,
+            "profit_yoy": -80.0,
+            "debt_ratio": 75.0,
+            "latest_report": "20251231",
+            "latest_roe": -30.0,
+            "ocf_per_share": 1.2,
+        }
+
+    monkeypatch.setattr("app.analysis.engine.build_financial_dataframe", fake_build)
+    monkeypatch.setattr("app.analysis.engine.industry_averages", lambda *a, **k: {})
+    monkeypatch.setattr(
+        "app.analysis.engine.get_valuations",
+        lambda *a, **k: [
+            {
+                "symbol": "600491.SH",
+                "name": "ST龙元",
+                "price": 2.0,
+                "pe_ttm": None,
+                "pb": 0.42,
+                "pe_percentile": None,
+                "pb_percentile": 5.0,
+                "market_cap": 5e9,
+                "dividend_yield": 0.0,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "app.analysis.engine.calculate_comparable_valuation",
+        lambda *a, **k: {
+            "stock_code": "600491.SH",
+            "comparables": [],
+            "avg_pe": None,
+            "avg_pb": None,
+            "valuation_range": {},
+            "peer_count": 0,
+            "insufficient_sample": True,
+        },
+    )
+
+    report = engine.run_full_analysis("600491.SH", db=None)
+    val = report["valuation"]
+    assert val.get("value_trap_veto") is True
+    assert float(val.get("composite_valuation_score") or 99) <= 28
+    assert "陷阱" in (val.get("value_trap_message") or "")
 
 
 def test_dcf_default_shares_marked_unreliable():

@@ -7,6 +7,7 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import date
+from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
@@ -14,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.models.fundamental import FundamentalCandidate
 from app.services.valuation import get_valuations
-from app.utils.symbol import SymbolError, is_etf_symbol, is_index_symbol, normalize_symbol
+from app.utils.symbol import SymbolError, is_etf_symbol, is_index_symbol, normalize_symbol, parse_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -453,7 +454,9 @@ _YJBB_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
 _YJBB_TTL = 6 * 3600
 _DEBT_CACHE: dict[str, tuple[float, dict[str, float]]] = {}
 _ZCFZ_CACHE: dict[str, tuple[float, dict[str, dict[str, float]]]] = {}
+_SYMBOL_ZCFZ_CACHE: dict[str, tuple[float, dict[str, dict[str, float]]]] = {}
 _DEBT_TTL = 6 * 3600
+_YJBB_DISK_DIR = Path("data") / "cache" / "yjbb"
 
 
 def _num(v: Any) -> float | None:
@@ -930,6 +933,55 @@ def recent_year_ends(n: int = 3, today: date | None = None) -> list[str]:
     return [f"{y}1231" for y in range(start, start - (n + 2), -1)]
 
 
+def _yjbb_disk_path(report_date: str) -> Path:
+    return _YJBB_DISK_DIR / f"{report_date}.pkl"
+
+
+def _yjbb_from_disk(report_date: str) -> pd.DataFrame | None:
+    import time
+
+    path = _yjbb_disk_path(report_date)
+    try:
+        if not path.is_file():
+            return None
+        if time.time() - path.stat().st_mtime > _YJBB_TTL:
+            return None
+        df = pd.read_pickle(path)
+        if df is None or getattr(df, "empty", True):
+            return None
+        return df
+    except Exception as e:
+        logger.debug("yjbb disk cache miss %s: %s", report_date, e)
+        return None
+
+
+def _yjbb_to_disk(report_date: str, df: pd.DataFrame) -> None:
+    if df is None or df.empty:
+        return
+    try:
+        _YJBB_DISK_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_pickle(_yjbb_disk_path(report_date))
+    except Exception as e:
+        logger.debug("yjbb disk cache write failed %s: %s", report_date, e)
+
+
+def _yjbb_should_retry(report_date: str) -> bool:
+    """未到报告期或当年年报尚未进入披露窗口时不重试。"""
+    s = str(report_date).replace("-", "")[:8]
+    if len(s) < 8 or not s.isdigit():
+        return False
+    try:
+        d = date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+    except ValueError:
+        return False
+    today = date.today()
+    if d > today:
+        return False
+    if s.endswith("1231") and int(s[:4]) >= today.year:
+        return False
+    return True
+
+
 def _fetch_yjbb(report_date: str, retries: int = 2) -> pd.DataFrame:
     import time
 
@@ -942,18 +994,30 @@ def _fetch_yjbb(report_date: str, retries: int = 2) -> pd.DataFrame:
         if now - ts < _YJBB_TTL and cached_df is not None and not cached_df.empty:
             return cached_df
 
+    disk = _yjbb_from_disk(report_date)
+    if disk is not None:
+        _YJBB_CACHE[report_date] = (now, disk)
+        return disk
+
+    if not _yjbb_should_retry(str(report_date)):
+        empty = pd.DataFrame()
+        _YJBB_CACHE[report_date] = (now, empty)
+        return empty
+
     last_err: Exception | None = None
-    for attempt in range(1, retries + 1):
+    attempts = max(1, retries)
+    for attempt in range(1, attempts + 1):
         try:
             df = ak.stock_yjbb_em(date=report_date)
             if df is not None and not df.empty:
                 _YJBB_CACHE[report_date] = (now, df)
+                _yjbb_to_disk(report_date, df)
                 return df
             last_err = ValueError("empty")
         except Exception as e:
             last_err = e
             logger.warning("yjbb %s attempt %s failed: %s", report_date, attempt, e)
-        if attempt < retries:
+        if attempt < attempts:
             time.sleep(1.2 * attempt)
     if last_err:
         logger.warning("yjbb %s unavailable: %s", report_date, last_err)
@@ -981,6 +1045,159 @@ def resolve_report_frames(need: int = 3, today: date | None = None) -> tuple[lis
 def resolve_report_dates(need: int = 3, today: date | None = None) -> list[str]:
     dates, _ = resolve_report_frames(need, today=today)
     return dates
+
+
+def _em_security_code(symbol: str) -> str | None:
+    try:
+        code, market = parse_symbol(symbol)
+    except SymbolError:
+        return None
+    if market == "fut":
+        return None
+    return f"{market.upper()}{code}"
+
+
+def _em_report_ymd(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    s = str(raw).replace("-", "").replace("/", "")[:8]
+    if len(s) >= 8 and s[:8].isdigit():
+        return s[:8]
+    return None
+
+
+def _parse_em_zcfz_row(row: Any) -> dict[str, float]:
+    """东财个股资产负债表一行 → 偿债简表字段。"""
+    def g(*keys: str) -> float | None:
+        if hasattr(row, "get"):
+            for k in keys:
+                v = _num(row.get(k))
+                if v is not None:
+                    return v
+        mapping = getattr(row, "index", None)
+        if mapping is not None:
+            for k in keys:
+                if k in mapping:
+                    v = _num(row.get(k))
+                    if v is not None:
+                        return v
+            # 列名包含匹配
+            for col in mapping:
+                cs = str(col).upper()
+                for k in keys:
+                    if k.upper() in cs:
+                        v = _num(row.get(col))
+                        if v is not None:
+                            return v
+        return None
+
+    ta = g("TOTAL_ASSETS", "资产-总资产", "总资产")
+    tl = g("TOTAL_LIABILITIES", "负债-总负债", "总负债")
+    eq = g("TOTAL_EQUITY", "TOTAL_PARENT_EQUITY", "股东权益合计", "股东权益")
+    cash = g("MONETARYFUNDS", "货币资金")
+    ar = g("ACCOUNTS_RECE", "ACCOUNT_RECEIVABLE", "应收账款")
+    inv = g("INVENTORY", "存货")
+    ap = g("ACCOUNTS_PAYABLE", "ACCOUNT_PAYABLE", "应付账款")
+    adv = g("ADVANCE_RECEIVABLES", "CONTRACT_LIAB", "预收账款", "合同负债")
+    ratio = g("ASSET_LIAB_RATIO", "资产负债率")
+    if ratio is not None and ratio <= 1.5:
+        ratio = ratio * 100.0
+    if ratio is None and ta and ta > 0 and tl is not None:
+        ratio = tl / ta * 100.0
+    item: dict[str, float] = {}
+    if ratio is not None:
+        item["debt_ratio"] = round(float(ratio), 2)
+    if ta is not None:
+        item["total_assets"] = float(ta)
+    if tl is not None:
+        item["total_liabilities"] = float(tl)
+    if eq is not None:
+        item["equity"] = float(eq)
+    if cash is not None:
+        item["monetary_funds"] = float(cash)
+    if ar is not None:
+        item["accounts_receivable"] = float(ar)
+    if inv is not None:
+        item["inventory"] = float(inv)
+    if ap is not None:
+        item["accounts_payable"] = float(ap)
+    if adv is not None:
+        item["advance_receipts"] = float(adv)
+    return item
+
+
+def _fetch_symbol_zcfz(symbol: str) -> dict[str, dict[str, float]]:
+    """个股年报资产负债表（最近 1–2 年），避免全市场 zcfz 分页。"""
+    import time
+
+    import requests
+
+    now = time.time()
+    key = str(symbol or "").upper()
+    cached = _SYMBOL_ZCFZ_CACHE.get(key)
+    if cached and now - cached[0] < _DEBT_TTL:
+        return cached[1]
+
+    em_code = _em_security_code(symbol)
+    if not em_code:
+        _SYMBOL_ZCFZ_CACHE[key] = (now, {})
+        return {}
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://emweb.securities.eastmoney.com/",
+    }
+    out: dict[str, dict[str, float]] = {}
+    try:
+        date_url = "https://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/zcfzbDateAjaxNew"
+        data_url = "https://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/zcfzbAjaxNew"
+        dates: list[str] = []
+        company_type = "4"
+        for ctype in ("4", "3", "2", "1"):
+            r = requests.get(
+                date_url,
+                params={"companyType": ctype, "reportDateType": "1", "code": em_code},
+                headers=headers,
+                timeout=12,
+            )
+            payload = r.json() if r.ok else {}
+            rows = (payload or {}).get("data") or []
+            if not rows:
+                continue
+            company_type = ctype
+            for item in rows:
+                ymd = _em_report_ymd((item or {}).get("REPORT_DATE") or (item or {}).get("REPORTDATE"))
+                if ymd and ymd.endswith("1231"):
+                    dates.append(ymd)
+            if dates:
+                break
+        dates = sorted(set(dates), reverse=True)[:2]
+        if dates:
+            r = requests.get(
+                data_url,
+                params={
+                    "companyType": company_type,
+                    "reportDateType": "1",
+                    "reportType": "1",
+                    "dates": ",".join(f"{d[:4]}-{d[4:6]}-{d[6:8]}" for d in dates),
+                    "code": em_code,
+                },
+                headers=headers,
+                timeout=15,
+            )
+            payload = r.json() if r.ok else {}
+            for raw in (payload or {}).get("data") or []:
+                ymd = _em_report_ymd((raw or {}).get("REPORT_DATE"))
+                if not ymd:
+                    continue
+                parsed = _parse_em_zcfz_row(raw)
+                if parsed:
+                    out[ymd] = parsed
+    except Exception as e:
+        logger.warning("symbol zcfz fetch failed %s: %s", symbol, e)
+
+    _SYMBOL_ZCFZ_CACHE[key] = (now, out)
+    return out
 
 
 def _fetch_zcfz_map(report_date: str) -> dict[str, dict[str, float]]:

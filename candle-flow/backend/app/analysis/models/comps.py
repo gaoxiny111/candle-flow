@@ -210,7 +210,12 @@ def _batch_quotes(symbols: list[str], db: Any = None) -> dict[str, dict[str, Any
     for i in range(0, len(symbols), chunk):
         batch = symbols[i : i + chunk]
         try:
-            for row in get_valuations(batch, db=db):
+            for row in get_valuations(
+                batch,
+                db=None,
+                include_history=False,
+                max_symbols=max(len(batch), 1),
+            ):
                 out[str(row.get("symbol") or "").upper()] = row
         except Exception as e:
             logger.warning("comps valuation quotes failed for %s: %s", batch[:3], e)
@@ -235,11 +240,22 @@ def select_comparables(
     if not peers:
         return []
 
-    quotes = _batch_quotes([p["symbol"] for p in peers], db=db)
+    # 先按利润规模接近度缩小名单，再拉行情（避免对 60+ 同行全市场报价）
+    quote_n = max(limit * 2, MIN_PEER_SAMPLE + 4)
 
-    def _rank(max_dist: float) -> list[dict[str, Any]]:
+    def _size_key(p: dict[str, Any]) -> float:
+        np_ = p.get("net_profit")
+        if np_ is None:
+            return 1e18
+        return -abs(float(np_))
+
+    shortlist = sorted(peers, key=_size_key)[:quote_n]
+
+    quotes = _batch_quotes([p["symbol"] for p in shortlist], db=db)
+
+    def _rank(max_dist: float, pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ranked: list[tuple[float, dict[str, Any]]] = []
-        for peer in peers:
+        for peer in pool:
             q = quotes.get(peer["symbol"].upper()) or {}
             pe = q.get("pe_ttm")
             pb = q.get("pb")
@@ -270,13 +286,13 @@ def select_comparables(
         ranked.sort(key=lambda x: x[0])
         return [item for _, item in ranked[: max(1, limit)]]
 
-    selected = _rank(cap_diff_max)
+    selected = _rank(cap_diff_max, shortlist)
     # 样本不足时放宽市值偏离，尽量凑够 MIN_PEER_SAMPLE
     if len(selected) < MIN_PEER_SAMPLE and cap_diff_max < CAP_DIFF_RELAXED:
-        selected = _rank(CAP_DIFF_RELAXED)
+        selected = _rank(CAP_DIFF_RELAXED, shortlist)
     # 龙头相对小同行市值差常 >100%，最后取消市值闸门（仍按接近度排序取 limit）
     if len(selected) < MIN_PEER_SAMPLE:
-        selected = _rank(999.0)
+        selected = _rank(999.0, shortlist)
     return selected
 
 

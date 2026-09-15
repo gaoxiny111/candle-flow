@@ -26,10 +26,38 @@ class CashflowAnalyzer(BaseAnalyzer):
         fcf = ocf - capex
         cash_ratio: float | None = None
 
+        # 连续亏损 + 经营/自由现金流为正 → 「纸面富贵」（常靠拖欠应付挤出现金）
+        profit_clean = fd["net_profit"].dropna()
+        consec_loss = 0
+        for v in reversed(list(profit_clean)):
+            if float(v) < 0:
+                consec_loss += 1
+            else:
+                break
+        ocf_latest = float(ocf.dropna().iloc[-1]) if len(ocf.dropna()) else None
+        fcf_latest = float(fcf.dropna().iloc[-1]) if len(fcf.dropna()) else None
+        paper_wealth = consec_loss >= 2 and (
+            (ocf_latest is not None and ocf_latest > 0) or (fcf_latest is not None and fcf_latest > 0)
+        )
+        # 单期亏损但当期 OCF/FCF 为正，也视为异常背离（稍轻）
+        single_loss_ocf = (
+            not paper_wealth
+            and len(profit_clean)
+            and float(profit_clean.iloc[-1]) < 0
+            and ocf_latest is not None
+            and ocf_latest > 0
+        )
+
         if len(ocf.dropna()) and len(net_profit.dropna()):
             cash_ratio_series = (ocf / net_profit).replace([np.inf, -np.inf], np.nan).dropna()
             cash_ratio = float(cash_ratio_series.iloc[-1]) if len(cash_ratio_series) else 0.0
-            score, level = self._score_by_range(cash_ratio, (1.0, 5.0), (0.7, 1.0), (0.4, 0.7))
+            # 净利为负时 OCF/净利 符号失真，不按「含金量」高分逻辑
+            if float(profit_clean.iloc[-1]) < 0:
+                score, level = 35.0, AnalysisLevel.POOR
+                cr_comment = "净利为负时该比率失真，不按利润含金量解读"
+            else:
+                score, level = self._score_by_range(cash_ratio, (1.0, 5.0), (0.7, 1.0), (0.4, 0.7))
+                cr_comment = ">1 利润含金量高，<0.5 警惕利润注水"
             indicators.append(
                 IndicatorResult(
                     name="经营现金流/净利润",
@@ -38,30 +66,49 @@ class CashflowAnalyzer(BaseAnalyzer):
                     level=level,
                     trend=self._calc_trend(cash_ratio_series),
                     weight=3.0,
-                    comment=">1 利润含金量高，<0.5 警惕利润注水",
+                    comment=cr_comment,
                     period=annual_period,
                 )
             )
 
         if len(fcf.dropna()):
-            fcf_latest = float(fcf.iloc[-1])
+            fcf_val = float(fcf.iloc[-1])
             fcf_positive = int((fcf > 0).sum())
+            if paper_wealth and fcf_val > 0:
+                fcf_score, fcf_level = 28.0, AnalysisLevel.POOR
+                fcf_comment = (
+                    f"连续{consec_loss}年亏损却自由现金流为正，警惕应付账款挤现/"
+                    f"纸面富贵（近{len(fcf)}期中{fcf_positive}期为正）"
+                )
+            elif single_loss_ocf and fcf_val > 0:
+                fcf_score, fcf_level = 40.0, AnalysisLevel.POOR
+                fcf_comment = f"当期亏损但自由现金流为正，需排查营运负债变动（近{len(fcf)}期中{fcf_positive}期为正）"
+            else:
+                fcf_score = 70 if fcf_val > 0 else 30
+                fcf_level = AnalysisLevel.GOOD if fcf_val > 0 else AnalysisLevel.POOR
+                fcf_comment = f"近{len(fcf)}期中有{fcf_positive}期为正"
             indicators.append(
                 IndicatorResult(
                     name="自由现金流(元)",
-                    value=round(fcf_latest, 0),
-                    score=70 if fcf_latest > 0 else 30,
-                    level=AnalysisLevel.GOOD if fcf_latest > 0 else AnalysisLevel.POOR,
+                    value=round(fcf_val, 0),
+                    score=fcf_score,
+                    level=fcf_level,
                     trend=self._calc_trend(fcf),
                     weight=2.5,
-                    comment=f"近{len(fcf)}期中有{fcf_positive}期为正",
+                    comment=fcf_comment,
                     period=annual_period,
                 )
             )
 
         if len(ocf.dropna()) and ocf.iloc[-1] > 0:
             capex_ratio = float(capex.iloc[-1] / ocf.iloc[-1]) if ocf.iloc[-1] else 999.0
-            cs, cl = self._score_by_range(capex_ratio, (0, 0.4), (0.4, 0.7), (0.7, 1.2))
+            if paper_wealth or single_loss_ocf:
+                # 亏损下的低资本开支/高 OCF 不给「优秀」分
+                cs, cl = 40.0, AnalysisLevel.POOR
+                capex_comment = "亏损背景下经营现金多为营运负债驱动，资本开支比不代表造血健康"
+            else:
+                cs, cl = self._score_by_range(capex_ratio, (0, 0.4), (0.4, 0.7), (0.7, 1.2))
+                capex_comment = ""
             indicators.append(
                 IndicatorResult(
                     name="资本支出/经营现金流",
@@ -69,29 +116,54 @@ class CashflowAnalyzer(BaseAnalyzer):
                     score=cs,
                     level=cl,
                     weight=2.0,
+                    comment=capex_comment,
                     period=annual_period,
                 )
             )
 
         ocf_ps = kwargs.get("ocf_per_share")
         if ocf_ps is not None:
+            ps = float(ocf_ps)
+            if paper_wealth and ps > 0:
+                ps_score, ps_level = 35.0, AnalysisLevel.POOR
+            else:
+                ps_score = self._linear_score(ps, 0, 2)
+                ps_level = AnalysisLevel.GOOD if ps > 0.5 else AnalysisLevel.NEUTRAL
             indicators.append(
                 IndicatorResult(
                     name="每股经营现金流(元)",
-                    value=round(float(ocf_ps), 3),
-                    score=self._linear_score(float(ocf_ps), 0, 2),
-                    level=AnalysisLevel.GOOD if float(ocf_ps) > 0.5 else AnalysisLevel.NEUTRAL,
+                    value=round(ps, 3),
+                    score=ps_score,
+                    level=ps_level,
                     weight=1.5,
                     period=latest_period,
                 )
             )
 
+        if paper_wealth:
+            indicators.append(
+                IndicatorResult(
+                    name="亏损现金背离",
+                    value=float(consec_loss),
+                    score=20.0,
+                    level=AnalysisLevel.DANGER,
+                    weight=3.0,
+                    comment="净利润连续为负但经营/自由现金流为正：异常背离，疑似拖欠供应商挤现",
+                    period=annual_period,
+                )
+            )
+            warnings.append(
+                f"纸面富贵风险：连续{consec_loss}年亏损却出现正经营/自由现金流，"
+                f"常见于应付账款等营运负债挤现，不宜按健康造血解读"
+            )
+        elif single_loss_ocf:
+            warnings.append("当期净利为负但经营现金流为正，存在亏损现金背离，请结合应付账款变动核实")
+
         # 利润增速 vs 现金流质量背离
         yoy_profit = kwargs.get("profit_yoy")
-        if yoy_profit is not None and cash_ratio is not None:
+        if yoy_profit is not None and cash_ratio is not None and len(profit_clean) and float(profit_clean.iloc[-1]) > 0:
             yp = float(yoy_profit)
             if yp >= 15 and cash_ratio < 0.5:
-                # 背离度：净利同比（小数）与现金流/净利 之差，越大越差
                 gap = yp / 100.0 - cash_ratio
                 div_score = max(10.0, min(55.0, 55.0 - gap * 35.0))
                 indicators.append(
@@ -115,8 +187,13 @@ class CashflowAnalyzer(BaseAnalyzer):
         if "accounts_receivable" in fd.columns and "revenue" in fd.columns:
             ar = fd["accounts_receivable"].pct_change(fill_method=None).iloc[-1]
             rev = fd["revenue"].pct_change(fill_method=None).iloc[-1]
-            if pd.notna(ar) and pd.notna(rev) and ar > rev * 2 and ar > 0.2:
-                warnings.append("应收账款增速远超营收，可能存在虚增收入风险")
+            if pd.notna(ar) and pd.notna(rev):
+                ar_g, rev_g = float(ar), float(rev)
+                if rev_g < 0 and ar_g > rev_g:
+                    # 营收下滑而应收降幅更小/仍增 → 回款困难，非虚增
+                    warnings.append("应收账款周转恶化，回款极其困难")
+                elif rev_g > 0 and ar_g > rev_g * 2 and ar_g > 0.2:
+                    warnings.append("应收账款增速远超营收，可能存在虚增收入风险")
 
         if len(ocf.dropna()) >= 3 and (ocf.iloc[-3:] < 0).all():
             warnings.append("经营现金流连续3期为负，造血能力严重不足")
@@ -128,4 +205,8 @@ class CashflowAnalyzer(BaseAnalyzer):
             level=score_to_level(module_score),
             indicators=indicators,
             warnings=warnings,
+            metadata={
+                "paper_wealth": bool(paper_wealth),
+                "consecutive_loss_years": int(consec_loss),
+            },
         )

@@ -152,15 +152,28 @@ class FundamentalEngine:
         sym = normalize_symbol(symbol)
         if is_etf_symbol(sym):
             return skipped_etf_report(sym)
-        fin_df, meta = build_financial_dataframe(sym)
-        meta["symbol"] = sym
+
         market: dict[str, Any] = {}
-        try:
-            vals = get_valuations([sym], db=db)
-            if vals:
-                market = vals[0]
-        except Exception:
-            pass
+        fin_df = pd.DataFrame()
+        meta: dict[str, Any] = {}
+
+        def _load_fin() -> tuple[pd.DataFrame, dict[str, Any]]:
+            return build_financial_dataframe(sym)
+
+        def _load_quotes() -> dict[str, Any]:
+            try:
+                vals = get_valuations([sym], db=None, include_history=True)
+                return vals[0] if vals else {}
+            except Exception:
+                return {}
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_fin = pool.submit(_load_fin)
+            f_mkt = pool.submit(_load_quotes)
+            fin_df, meta = f_fin.result()
+            market = f_mkt.result() or {}
+
+        meta["symbol"] = sym
 
         symbol_roe = meta.get("latest_roe")
         if symbol_roe is None and not fin_df.empty and "roe" in fin_df.columns:
@@ -181,6 +194,7 @@ class FundamentalEngine:
             "quick_ratio": meta.get("quick_ratio"),
             "symbol_roe": symbol_roe,
             "industry": meta.get("industry") or "",
+            "name": meta.get("name") or market.get("name") or "",
             "industry_avg": industry_averages(meta.get("industry", ""), meta.get("latest_report")),
             **kwargs,
         }
@@ -201,31 +215,48 @@ class FundamentalEngine:
 
         # 对照报告：盈利/成长/偿债/现金流/估值 加权；效率与行业仅展示。
         # E 档维度按 E_GRADE_PENALTY 打折后再加权。
-        composite = 0.0
-        weight_sum = 0.0
-        for name, w in self.weights.items():
-            if name == "valuation":
-                composite += _penalized_module_score(val_score) * w
+        def _compose(v_score: float) -> float:
+            composite = 0.0
+            weight_sum = 0.0
+            for name, w in self.weights.items():
+                if name == "valuation":
+                    composite += _penalized_module_score(v_score) * w
+                    weight_sum += w
+                    continue
+                result = module_results.get(name)
+                if result is None:
+                    continue
+                composite += _penalized_module_score(result.score) * w
                 weight_sum += w
-                continue
-            result = module_results.get(name)
-            if result is None:
-                continue
-            composite += _penalized_module_score(result.score) * w
-            weight_sum += w
-        if weight_sum > 0:
-            composite /= weight_sum
+            if weight_sum > 0:
+                composite /= weight_sum
+            risk = module_results["risk"]
+            if risk.score < RISK_THRESHOLD:
+                composite *= risk.score / 100.0
+            return round(max(0.0, min(100.0, composite)), 1)
 
-        risk = module_results["risk"]
-        if risk.score < RISK_THRESHOLD:
-            composite *= risk.score / 100.0
+        composite = _compose(val_score)
+        letter = rating_label(composite)
 
-        composite = round(max(0.0, min(100.0, composite)), 1)
+        # 价值陷阱：E 档 / ROIC<WACC / ST·退市·连续亏损 → 估值分锁定 ≤28
+        val_score, valuation, composite, letter = self._apply_value_trap_veto(
+            val_score,
+            valuation,
+            composite,
+            letter,
+            module_results,
+            name=str(meta.get("name") or market.get("name") or ""),
+            compose_fn=_compose,
+        )
+
         all_warnings: list[str] = []
         for r in module_results.values():
             all_warnings.extend(r.warnings)
+        if valuation.get("value_trap_veto") and valuation.get("value_trap_message"):
+            msg = str(valuation["value_trap_message"])
+            if msg not in all_warnings:
+                all_warnings.insert(0, msg)
 
-        letter = rating_label(composite)
         cashflow_veto = False
         if cf is not None and cf.score < CASHFLOW_VETO_THRESHOLD:
             cashflow_veto = True
@@ -459,6 +490,80 @@ class FundamentalEngine:
                 )
 
         return result
+
+    @staticmethod
+    def _apply_value_trap_veto(
+        val_score: float,
+        valuation: dict[str, Any],
+        composite: float,
+        letter: str,
+        modules: dict[str, ModuleResult],
+        *,
+        name: str,
+        compose_fn,
+        cap: float = 28.0,
+    ) -> tuple[float, dict[str, Any], float, str]:
+        """
+        价值陷阱一票否决：综合已是 E、ROIC<WACC、ST/退市/连续亏损时，
+        相对估值（低 PB 等）不得给高分，锁定 ≤cap 并重算综合分。
+        """
+        reasons: list[str] = []
+        prof = modules.get("profitability")
+        risk = modules.get("risk")
+        cf = modules.get("cashflow")
+
+        if letter == "E":
+            reasons.append("综合评级已为 E")
+        if prof is not None and prof.metadata.get("roic_below_wacc"):
+            reasons.append("ROIC低于WACC")
+        if risk is not None and risk.metadata.get("delist_risk"):
+            reasons.append("存在退市/ST风险标识")
+        if risk is not None and int(risk.metadata.get("consecutive_loss_years") or 0) >= 2:
+            reasons.append(f"净利润连续{int(risk.metadata['consecutive_loss_years'])}年亏损")
+        if cf is not None and cf.metadata.get("paper_wealth"):
+            reasons.append("亏损现金背离（纸面富贵）")
+        name_u = (name or "").upper()
+        if "ST" in name_u or "退" in (name or ""):
+            if "存在退市/ST风险标识" not in reasons:
+                reasons.append("证券简称含ST/退")
+
+        if not reasons:
+            return val_score, valuation, composite, letter
+
+        if val_score <= cap:
+            valuation = dict(valuation)
+            valuation["value_trap_veto"] = True
+            valuation["value_trap_message"] = (
+                "基本面恶化，低估值为陷阱，不适用相对估值（"
+                + "；".join(reasons)
+                + "）"
+            )
+            # 仍写清 rationale，即使分数已低
+            base_r = valuation.get("valuation_rationale") or ""
+            valuation["valuation_rationale"] = (
+                (base_r + "；" if base_r else "")
+                + f"价值陷阱锁定 ≤{cap:.0f}："
+                + "、".join(reasons)
+            )
+            return val_score, valuation, composite, letter
+
+        valuation = dict(valuation)
+        valuation["value_trap_veto"] = True
+        valuation["valuation_score_base"] = round(val_score, 1)
+        valuation["valuation_score_haircut"] = round(max(0.0, val_score - cap), 1)
+        valuation["composite_valuation_score"] = cap
+        msg = "基本面恶化，低估值为陷阱，不适用相对估值（" + "；".join(reasons) + "）"
+        valuation["value_trap_message"] = msg
+        base_r = valuation.get("valuation_rationale") or ""
+        valuation["valuation_rationale"] = (
+            (base_r + "；" if base_r else "")
+            + f"价值陷阱一票否决，估值合理性由 {val_score:.0f} 锁定为 {cap:.0f}："
+            + "、".join(reasons)
+        )
+        new_score = float(cap)
+        new_composite = compose_fn(new_score)
+        new_letter = rating_label(new_composite)
+        return new_score, valuation, new_composite, new_letter
 
     @staticmethod
     def _growth_for_peg(fin_df: pd.DataFrame, meta: dict) -> tuple[float | None, str]:

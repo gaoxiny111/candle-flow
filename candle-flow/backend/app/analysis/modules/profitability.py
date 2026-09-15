@@ -66,6 +66,8 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
 
         debt_ratio = kwargs.get("debt_ratio")
         wacc_pct = _estimate_wacc_pct(float(debt_ratio) if debt_ratio is not None else None)
+        roic_below_wacc = False
+        roic_value: float | None = None
 
         if "operating_profit" in fd.columns and "total_assets" in fd.columns:
             invested = (
@@ -76,8 +78,10 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
             nopat = fd["operating_profit"] * 0.75
             roic_series = (nopat / invested * 100).dropna()
             roic = float(roic_series.iloc[-1]) if len(roic_series) else 0.0
+            roic_value = round(roic, 2)
             roic_score, roic_level = self._score_by_range(roic, (12, 100), (8, 12), (4, 8))
             if roic < wacc_pct:
+                roic_below_wacc = True
                 roic_comment = (
                     f"ROIC {roic:.1f}% < WACC≈{wacc_pct:.0f}%：投入资本回报低于资本成本，"
                     f"可能在毁灭股东价值"
@@ -161,5 +165,7 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
                     "equity_multiplier": equity_multiplier,
                 },
                 "wacc_pct": wacc_pct,
+                "roic": roic_value,
+                "roic_below_wacc": roic_below_wacc,
             },
         )

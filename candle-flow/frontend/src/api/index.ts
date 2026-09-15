@@ -919,6 +919,8 @@ export interface FundamentalAnalysisReport {
     valuation_score_breakdown?: Array<{ factor: string; points: number; detail?: string }>
     valuation_score_base?: number
     valuation_score_haircut?: number
+    value_trap_veto?: boolean
+    value_trap_message?: string
     peer_sample_ok?: boolean
   }
   market: {

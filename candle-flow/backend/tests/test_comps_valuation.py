@@ -249,3 +249,47 @@ def test_select_comparables_filters_cap_and_limits(monkeypatch):
     assert all(c["symbol"] != "600007.SH" for c in comps)
     # closest first
     assert comps[0]["symbol"] == "600001.SH"
+
+
+def test_select_comparables_quotes_shortlist_only(monkeypatch):
+    peers = [
+        {
+            "symbol": f"600{i:03d}.SH",
+            "name": f"P{i}",
+            "net_profit": float(i) * 1e8,
+            "net_assets": 5e8,
+            "revenue": 8e8,
+            "eps": 1.0,
+            "roe": 15,
+        }
+        for i in range(1, 31)
+    ]
+    monkeypatch.setattr("app.analysis.models.comps._industry_peer_rows", lambda *a, **k: peers)
+    called: list[list[str]] = []
+
+    def fake_quotes(symbols, db=None):
+        called.append(list(symbols))
+        return {
+            s.upper(): {
+                "symbol": s,
+                "name": s,
+                "pe_ttm": 10.0,
+                "pb": 2.0,
+                "market_cap": 80e8,
+                "price": 10.0,
+            }
+            for s in symbols
+        }
+
+    monkeypatch.setattr("app.analysis.models.comps._batch_quotes", fake_quotes)
+    comps = select_comparables(
+        "600000.SH",
+        industry="测试",
+        report_date="20251231",
+        target_market_cap=80e8,
+        limit=8,
+    )
+    assert called
+    assert len(called[0]) <= 16
+    assert len(called[0]) < 30
+    assert len(comps) >= 5

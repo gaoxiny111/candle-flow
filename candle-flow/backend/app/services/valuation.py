@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 from app.services.watchlist import MAX_WATCHLIST
-from app.utils.symbol import SymbolError, is_b_share, is_etf_symbol, is_future, normalize_symbol, parse_symbol
+from app.utils.symbol import SymbolError, is_b_share, is_etf_symbol, is_future, normalize_symbol, parse_symbol, futures_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -515,9 +515,17 @@ def clear_cache() -> None:
     _inflight.clear()
 
 
-def get_valuations(symbols: list[str], *, now: Optional[float] = None, db: Any = None) -> list[dict[str, Any]]:
+def get_valuations(
+    symbols: list[str],
+    *,
+    now: Optional[float] = None,
+    db: Any = None,
+    include_history: bool = True,
+    max_symbols: Optional[int] = None,
+) -> list[dict[str, Any]]:
     """Quotes first; percentiles from SQLite/memory, history refresh is background."""
     ts = time.time() if now is None else now
+    cap = MAX_WATCHLIST if max_symbols is None else max(1, int(max_symbols))
     ordered: list[str] = []
     seen: set[str] = set()
     for raw in symbols:
@@ -527,12 +535,15 @@ def get_valuations(symbols: list[str], *, now: Optional[float] = None, db: Any =
         try:
             symbol = normalize_symbol(item)
         except SymbolError:
-            continue
+            fut = futures_symbol(item)
+            if not fut:
+                continue
+            symbol = fut
         if symbol in seen:
             continue
         seen.add(symbol)
         ordered.append(symbol)
-        if len(ordered) >= MAX_WATCHLIST:
+        if len(ordered) >= cap:
             break
 
     quotes: dict[str, dict[str, Any]] = {}
@@ -554,16 +565,19 @@ def get_valuations(symbols: list[str], *, now: Optional[float] = None, db: Any =
             _cache[symbol] = (ts, item)
             quotes[symbol] = item
 
-    stocks = [s for s in ordered if not is_future(s)]
-    hists, pending = _histories_for(stocks, ts, db=db) if stocks else ({}, [])
-    pending_set = set(pending)
+    if include_history:
+        stocks = [s for s in ordered if not is_future(s)]
+        hists, pending = _histories_for(stocks, ts, db=db) if stocks else ({}, [])
+        pending_set = set(pending)
+    else:
+        hists, pending_set = {}, set()
 
     rows: list[dict[str, Any]] = []
     for symbol in ordered:
         item = dict(quotes[symbol])
         pe_s, pb_s = hists.get(symbol, ([], []))
-        item["pe_percentile"] = percentile_rank(item.get("pe_ttm"), pe_s)
-        item["pb_percentile"] = percentile_rank(item.get("pb"), pb_s)
+        item["pe_percentile"] = percentile_rank(item.get("pe_ttm"), pe_s) if include_history else None
+        item["pb_percentile"] = percentile_rank(item.get("pb"), pb_s) if include_history else None
         item["percentiles_pending"] = symbol in pending_set
         if is_etf_symbol(symbol):
             item["dividend_yield"] = None
