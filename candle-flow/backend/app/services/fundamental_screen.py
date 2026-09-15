@@ -452,6 +452,7 @@ from app.services.fundamental_tracks import TRACK_LABEL, sector_classify  # noqa
 _YJBB_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
 _YJBB_TTL = 6 * 3600
 _DEBT_CACHE: dict[str, tuple[float, dict[str, float]]] = {}
+_ZCFZ_CACHE: dict[str, tuple[float, dict[str, dict[str, float]]]] = {}
 _DEBT_TTL = 6 * 3600
 
 
@@ -982,39 +983,96 @@ def resolve_report_dates(need: int = 3, today: date | None = None) -> list[str]:
     return dates
 
 
-def _fetch_debt_map(report_date: str) -> dict[str, float]:
-    """资产负债率 from balance-sheet snapshot if available."""
+def _fetch_zcfz_map(report_date: str) -> dict[str, dict[str, float]]:
+    """资产负债表简表：资产负债率 + 货币资金/应收/存货/应付等，供偿债细分。"""
     import time
 
     import akshare as ak
 
     now = time.time()
-    cached = _DEBT_CACHE.get(report_date)
+    cached = _ZCFZ_CACHE.get(report_date)
     if cached and now - cached[0] < _DEBT_TTL:
         return cached[1]
 
-    out: dict[str, float] = {}
+    out: dict[str, dict[str, float]] = {}
     try:
         df = ak.stock_zcfz_em(date=report_date)
     except Exception as e:
         logger.warning("zcfz fetch failed %s: %s", report_date, e)
-        _DEBT_CACHE[report_date] = (now, out)
+        _ZCFZ_CACHE[report_date] = (now, out)
+        _DEBT_CACHE[report_date] = (now, {})
         return out
     if df is None or df.empty:
-        _DEBT_CACHE[report_date] = (now, out)
+        _ZCFZ_CACHE[report_date] = (now, out)
+        _DEBT_CACHE[report_date] = (now, {})
         return out
-    code_col = next((c for c in df.columns if "代码" in str(c)), None)
-    debt_col = next((c for c in df.columns if "资产负债率" in str(c)), None)
-    if not code_col or not debt_col:
-        _DEBT_CACHE[report_date] = (now, out)
+
+    def _col(*keys: str) -> str | None:
+        for k in keys:
+            for c in df.columns:
+                if k in str(c):
+                    return str(c)
+        return None
+
+    code_col = _col("代码")
+    if not code_col:
+        _ZCFZ_CACHE[report_date] = (now, out)
+        _DEBT_CACHE[report_date] = (now, {})
         return out
+
+    debt_col = _col("资产负债率")
+    ta_col = _col("资产-总资产", "总资产")
+    cash_col = _col("资产-货币资金", "货币资金")
+    ar_col = _col("资产-应收账款", "应收账款")
+    inv_col = _col("资产-存货", "存货")
+    ap_col = _col("负债-应付账款", "应付账款")
+    adv_col = _col("负债-预收账款", "预收账款")
+    tl_col = _col("负债-总负债", "总负债")
+    eq_col = _col("股东权益合计", "股东权益")
+
+    debt_only: dict[str, float] = {}
     for _, row in df.iterrows():
         sym = _to_symbol(row[code_col])
-        d = _num(row[debt_col])
-        if sym and d is not None:
-            out[sym] = d
-    _DEBT_CACHE[report_date] = (now, out)
+        if not sym:
+            continue
+        item: dict[str, float] = {}
+        if debt_col:
+            d = _num(row[debt_col])
+            if d is not None:
+                item["debt_ratio"] = d
+                debt_only[sym] = d
+        for key, col in (
+            ("total_assets", ta_col),
+            ("monetary_funds", cash_col),
+            ("accounts_receivable", ar_col),
+            ("inventory", inv_col),
+            ("accounts_payable", ap_col),
+            ("advance_receipts", adv_col),
+            ("total_liabilities", tl_col),
+            ("equity", eq_col),
+        ):
+            if col:
+                v = _num(row[col])
+                if v is not None:
+                    item[key] = v
+        if item:
+            out[sym] = item
+
+    _ZCFZ_CACHE[report_date] = (now, out)
+    _DEBT_CACHE[report_date] = (now, debt_only)
     return out
+
+
+def _fetch_debt_map(report_date: str) -> dict[str, float]:
+    """资产负债率 from balance-sheet snapshot if available."""
+    import time
+
+    now = time.time()
+    cached = _DEBT_CACHE.get(report_date)
+    if cached and now - cached[0] < _DEBT_TTL:
+        return cached[1]
+    z = _fetch_zcfz_map(report_date)
+    return {k: float(v["debt_ratio"]) for k, v in z.items() if v.get("debt_ratio") is not None}
 
 
 def _peg(pe: float | None, profit_yoy: float | None) -> float | None:

@@ -16,6 +16,18 @@ class AnalysisLevel(str, Enum):
     DANGER = "E"
 
 
+def format_report_period(report_date: str | None) -> str:
+    """将 20251231 / 20250630 等格式化为可读报告期标签。"""
+    if not report_date:
+        return ""
+    s = str(report_date).replace("-", "")[:8]
+    if len(s) < 8:
+        return str(report_date)
+    y, md = s[:4], s[4:8]
+    label = {"0331": "一季报", "0630": "中报", "0930": "三季报", "1231": "年报"}.get(md)
+    return f"{y}{label}" if label else s
+
+
 @dataclass
 class IndicatorResult:
     name: str
@@ -27,6 +39,7 @@ class IndicatorResult:
     percentile: Optional[float] = None
     weight: float = 1.0
     comment: str = ""
+    period: str = ""  # 指标对应报告期，如「2025中报」「年报 2022–2024」
 
 
 @dataclass

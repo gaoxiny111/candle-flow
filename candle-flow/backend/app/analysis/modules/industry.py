@@ -4,6 +4,9 @@ import pandas as pd
 
 from app.analysis.base import AnalysisLevel, BaseAnalyzer, IndicatorResult, ModuleResult, score_to_level
 
+# 同业样本不足时行业对比分与 PE 分位均应显示 N/A，避免假精确
+MIN_INDUSTRY_PEERS = 5
+
 
 class IndustryAnalyzer(BaseAnalyzer):
     """与同行业中位数对比（宽松区间，避免误杀周期股）。"""
@@ -11,8 +14,19 @@ class IndustryAnalyzer(BaseAnalyzer):
     def analyze(self, financial_data: pd.DataFrame, **kwargs) -> ModuleResult:
         indicators: list[IndicatorResult] = []
         industry_avg = kwargs.get("industry_avg") or {}
-        if not industry_avg:
-            return ModuleResult("行业对比", 55, AnalysisLevel.NEUTRAL, warnings=["暂无足够同业样本"])
+        peer_count = int(float(industry_avg.get("peer_count") or 0))
+        if not industry_avg or peer_count < MIN_INDUSTRY_PEERS:
+            return ModuleResult(
+                module_name="行业对比",
+                score=0.0,
+                level=AnalysisLevel.NEUTRAL,
+                warnings=["N/A（样本不足）"],
+                metadata={
+                    "insufficient_sample": True,
+                    "peer_count": peer_count,
+                    "display": "N/A（样本不足）",
+                },
+            )
 
         roe = kwargs.get("symbol_roe")
         if roe is not None and "roe" in industry_avg:
@@ -46,10 +60,24 @@ class IndustryAnalyzer(BaseAnalyzer):
                 )
             )
 
-        module_score = self._weighted_score(indicators) if indicators else 55.0
+        if not indicators:
+            return ModuleResult(
+                module_name="行业对比",
+                score=0.0,
+                level=AnalysisLevel.NEUTRAL,
+                warnings=["N/A（样本不足）"],
+                metadata={
+                    "insufficient_sample": True,
+                    "peer_count": peer_count,
+                    "display": "N/A（样本不足）",
+                },
+            )
+
+        module_score = self._weighted_score(indicators)
         return ModuleResult(
             module_name="行业对比",
             score=round(module_score, 1),
             level=score_to_level(module_score),
             indicators=indicators,
+            metadata={"peer_count": peer_count, "insufficient_sample": False},
         )

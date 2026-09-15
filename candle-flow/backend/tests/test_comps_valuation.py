@@ -105,15 +105,62 @@ def test_calculate_comparable_valuation_pe_pb_range(monkeypatch):
         db=None,
     )
     assert result["peer_count"] == 3
-    assert result["avg_pe"] == 10.0  # (10+12+8)/3
-    assert abs(result["avg_pb"] - 2.0) < 1e-9
-    pe_range = result["valuation_range"]["pe_based"]
-    # net_profit 10e8 * avg_pe 10 / shares(80e8/8=10e8) = 10
-    assert pe_range["mid"] == 10.0
-    assert pe_range["low"] == 9.0
-    assert pe_range["high"] == 11.0
-    assert result["signal"] == "低估"  # price 8 < mid*0.9
+    assert result["insufficient_sample"] is True
+    assert result["avg_pe"] is None
+    assert result["avg_pb"] is None
+    assert result["valuation_range"] == {}
+    assert result["signal"] is None
+    assert "样本不足" in (result["warning"] or "")
     assert len(result["comparables"]) == 3
+
+
+def test_calculate_comparable_valuation_enough_peers(monkeypatch):
+    fin = pd.DataFrame(
+        [{"net_profit": 10e8, "equity": 50e8, "revenue": 80e8, "eps": 1.0}],
+        index=["20231231"],
+    )
+    market = {"price": 8.0, "market_cap": 80e8, "pe_ttm": 8.0, "pb": 1.6, "name": "目标"}
+    meta = {
+        "symbol": "600000.SH",
+        "name": "目标",
+        "industry": "测试行业",
+        "latest_report": "20231231",
+        "eps": 1.0,
+    }
+    peers = [
+        {
+            "symbol": f"60000{i}.SH",
+            "name": f"可比{i}",
+            "net_profit": 10e8,
+            "net_assets": 50e8,
+            "revenue": 80e8,
+            "eps": 1.0,
+            "roe": 18.0,
+        }
+        for i in range(1, 6)
+    ]
+    monkeypatch.setattr("app.analysis.models.comps._industry_peer_rows", lambda *a, **k: peers)
+    monkeypatch.setattr(
+        "app.analysis.models.comps._batch_quotes",
+        lambda symbols, db=None: {
+            s.upper(): {
+                "symbol": s,
+                "name": s,
+                "pe_ttm": 10.0,
+                "pb": 2.0,
+                "market_cap": 80e8,
+                "price": 10.0,
+            }
+            for s in symbols
+        },
+    )
+    result = calculate_comparable_valuation(
+        "600000.SH", market=market, meta=meta, fin_df=fin, db=None
+    )
+    assert result["peer_count"] == 5
+    assert result["insufficient_sample"] is False
+    assert result["avg_pe"] == 10.0
+    assert result["signal"] == "低估"
 
 
 def test_select_comparables_filters_cap_and_limits(monkeypatch):

@@ -70,13 +70,23 @@ def _json_safe(obj: Any) -> Any:
 
 
 def _module_to_dict(m: ModuleResult) -> dict:
+    meta = _json_safe(m.metadata) or {}
+    if meta.get("insufficient_sample"):
+        return {
+            "module_name": m.module_name,
+            "score": None,
+            "level": "N/A",
+            "indicators": [],
+            "warnings": m.warnings or ["N/A（样本不足）"],
+            "metadata": meta,
+        }
     return {
         "module_name": m.module_name,
         "score": m.score,
         "level": m.level.value,
         "indicators": [asdict(i) | {"level": i.level.value} for i in m.indicators],
         "warnings": m.warnings,
-        "metadata": _json_safe(m.metadata),
+        "metadata": meta,
     }
 
 
@@ -163,6 +173,12 @@ class FundamentalEngine:
             "profit_yoy": meta.get("profit_yoy"),
             "ocf_per_share": meta.get("ocf_per_share"),
             "latest_roe": meta.get("latest_roe"),
+            "latest_report": meta.get("latest_report"),
+            "annual_dates": meta.get("annual_dates") or meta.get("report_dates") or [],
+            "balance_sheet": meta.get("balance_sheet") or {},
+            "interest_bearing_ratio": meta.get("interest_bearing_ratio"),
+            "current_ratio": meta.get("current_ratio"),
+            "quick_ratio": meta.get("quick_ratio"),
             "symbol_roe": symbol_roe,
             "industry": meta.get("industry") or "",
             "industry_avg": industry_averages(meta.get("industry", ""), meta.get("latest_report")),
@@ -173,7 +189,14 @@ class FundamentalEngine:
         for name, analyzer in self.analyzers.items():
             module_results[name] = analyzer.analyze(fin_df, **ctx)
 
-        valuation = self._run_valuation(fin_df, market, meta, db=db)
+        cf = module_results.get("cashflow")
+        valuation = self._run_valuation(
+            fin_df,
+            market,
+            meta,
+            db=db,
+            cashflow_score=cf.score if cf is not None else None,
+        )
         val_score = float(valuation.get("composite_valuation_score", 50.0))
 
         # 对照报告：盈利/成长/偿债/现金流/估值 加权；效率与行业仅展示。
@@ -204,30 +227,39 @@ class FundamentalEngine:
 
         letter = rating_label(composite)
         cashflow_veto = False
-        cf = module_results.get("cashflow")
         if cf is not None and cf.score < CASHFLOW_VETO_THRESHOLD:
             cashflow_veto = True
             letter = downgrade_rating(letter, 1)
             if CASHFLOW_VETO_MESSAGE not in all_warnings:
                 all_warnings.insert(0, CASHFLOW_VETO_MESSAGE)
 
+        peer_sample_ok = bool(valuation.get("peer_sample_ok"))
+        ind = module_results.get("industry")
+        if ind is not None and ind.metadata.get("insufficient_sample"):
+            peer_sample_ok = False
+        show_pe_pct = market.get("pe_percentile") if peer_sample_ok else None
+        show_pb_pct = market.get("pb_percentile") if peer_sample_ok else None
+
         return {
             "symbol": sym,
             "name": meta.get("name") or market.get("name") or "",
             "industry": meta.get("industry") or "",
             "report_dates": meta.get("report_dates") or [],
+            "latest_report": meta.get("latest_report"),
             "composite_score": composite,
             "final_rating": letter,
             "final_rating_letter": letter,
             "cashflow_veto": cashflow_veto,
+            "peer_sample_ok": peer_sample_ok,
             "modules": {k: _module_to_dict(v) for k, v in module_results.items()},
             "valuation": valuation,
             "market": {
                 "price": market.get("price"),
                 "pe_ttm": market.get("pe_ttm"),
                 "pb": market.get("pb"),
-                "pe_percentile": market.get("pe_percentile"),
-                "pb_percentile": market.get("pb_percentile"),
+                "pe_percentile": show_pe_pct,
+                "pb_percentile": show_pb_pct,
+                "pe_percentile_na": None if peer_sample_ok else "N/A（样本不足）",
                 "market_cap": market.get("market_cap"),
                 "dividend_yield": market.get("dividend_yield"),
             },
@@ -237,7 +269,14 @@ class FundamentalEngine:
             ),
         }
 
-    def _run_valuation(self, fin_df: pd.DataFrame, market: dict, meta: dict, db: Session | None = None) -> dict:
+    def _run_valuation(
+        self,
+        fin_df: pd.DataFrame,
+        market: dict,
+        meta: dict,
+        db: Session | None = None,
+        cashflow_score: float | None = None,
+    ) -> dict:
         result: dict[str, Any] = {}
         pe = market.get("pe_ttm")
         pb = market.get("pb")
@@ -245,11 +284,13 @@ class FundamentalEngine:
         pb_pct = market.get("pb_percentile")
         div = market.get("dividend_yield")
 
+        growth_rate, growth_label = self._growth_for_peg(fin_df, meta)
         current = {
             "PE_TTM": pe,
             "PB": pb,
             "PS": None,
-            "profit_growth_rate": meta.get("profit_yoy"),
+            "profit_growth_rate": growth_rate,
+            "profit_growth_label": growth_label,
         }
 
         comps: dict[str, Any] = {}
@@ -263,8 +304,10 @@ class FundamentalEngine:
                 db=db,
             )
             result["comps"] = comps
-            # 喂给相对估值：行业 PE/PB 中位数（用可比公司均值近似）
-            if comps.get("avg_pe") is not None or comps.get("avg_pb") is not None:
+            # 喂给相对估值：行业 PE/PB 中位数（用可比公司均值近似）；样本不足则不喂
+            if not comps.get("insufficient_sample") and (
+                comps.get("avg_pe") is not None or comps.get("avg_pb") is not None
+            ):
                 row: dict[str, float] = {}
                 if comps.get("avg_pe") is not None:
                     row["PE_TTM"] = float(comps["avg_pe"])
@@ -281,7 +324,12 @@ class FundamentalEngine:
                 "valuation_range": {},
                 "warning": f"可比估值计算失败: {e}",
                 "peer_count": 0,
+                "insufficient_sample": True,
             }
+            comps = result["comps"]
+
+        sample_ok = not bool(comps.get("insufficient_sample")) and int(comps.get("peer_count") or 0) >= 5
+        result["peer_sample_ok"] = sample_ok
 
         rv = RelativeValuation()
         rel = rv.analyze(current, history=None, industry=industry_frame)
@@ -302,17 +350,25 @@ class FundamentalEngine:
                 rel["PB"]["signal"] = "合理"
             elif b > 6:
                 rel["PB"]["signal"] = "高估"
-        if pe_pct is not None and "PE_TTM" in rel:
-            rel["PE_TTM"]["percentile_5y"] = pe_pct
-            # 绝对低估优先于历史分位：煤炭 PE<12 仍偏便宜
-            if pe is not None and 0 < float(pe) <= 12:
-                rel["PE_TTM"]["signal"] = "低估"
-            elif pe_pct is not None and float(pe_pct) >= 75 and pe is not None and float(pe) > 20:
-                rel["PE_TTM"]["signal"] = "高估"
-        if pb_pct is not None and "PB" in rel:
-            rel["PB"]["percentile_5y"] = pb_pct
-            if pb is not None and 0 < float(pb) <= 1.5:
-                rel["PB"]["signal"] = "低估"
+        # 图四：同业样本不足时 PE/PB 分位显示 N/A，不展示假精确分位
+        if sample_ok:
+            if pe_pct is not None and "PE_TTM" in rel:
+                rel["PE_TTM"]["percentile_5y"] = pe_pct
+                if pe is not None and 0 < float(pe) <= 12:
+                    rel["PE_TTM"]["signal"] = "低估"
+                elif pe_pct is not None and float(pe_pct) >= 75 and pe is not None and float(pe) > 20:
+                    rel["PE_TTM"]["signal"] = "高估"
+            if pb_pct is not None and "PB" in rel:
+                rel["PB"]["percentile_5y"] = pb_pct
+                if pb is not None and 0 < float(pb) <= 1.5:
+                    rel["PB"]["signal"] = "低估"
+        else:
+            if "PE_TTM" in rel:
+                rel["PE_TTM"]["percentile_5y"] = None
+                rel["PE_TTM"]["percentile_na"] = "N/A（样本不足）"
+            if "PB" in rel:
+                rel["PB"]["percentile_5y"] = None
+                rel["PB"]["percentile_na"] = "N/A（样本不足）"
         if div is not None:
             dy = float(div)
             rel["股息率"] = {
@@ -320,34 +376,66 @@ class FundamentalEngine:
                 "signal": "低估" if dy >= 5 else ("合理" if dy >= 2 else "高估"),
                 "percentile_5y": None,
             }
-        # 可比公司信号优先补强相对估值
-        comps_signal = (comps or {}).get("signal")
+        # 可比公司信号优先补强相对估值（仅样本充足时）
+        comps_signal = (comps or {}).get("signal") if sample_ok else None
         if comps_signal and pe is not None and "PE_TTM" in rel:
             if rel["PE_TTM"].get("signal") in (None, "—"):
                 rel["PE_TTM"]["signal"] = comps_signal
         result["relative"] = rel
 
         scores: list[float] = []
-        for item in rel.values():
+        breakdown: list[dict[str, Any]] = []
+
+        def _add_points(factor: str, points: float, detail: str) -> None:
+            scores.append(points)
+            breakdown.append({"factor": factor, "points": round(points, 1), "detail": detail})
+
+        for key, item in rel.items():
             sig = item.get("signal")
             if sig == "低估":
-                scores.append(85)
+                _add_points(key, 85, f"信号={sig}")
             elif sig == "合理":
-                scores.append(65)
-            elif sig == "高估":
-                scores.append(35)
+                _add_points(key, 65, f"信号={sig}")
+            elif sig in ("高估", "偏贵"):
+                _add_points(key, 35, f"信号={sig}")
         # 绝对 PE 加分
         if pe is not None and 0 < float(pe) < 10:
-            scores.append(88)
+            _add_points("绝对PE", 88, f"PE={float(pe):.1f}<10")
         elif pe is not None and 0 < float(pe) < 15:
-            scores.append(75)
+            _add_points("绝对PE", 75, f"PE={float(pe):.1f}<15")
         if div is not None and float(div) >= 6:
-            scores.append(90)
+            _add_points("高股息", 90, f"股息率={float(div):.1f}%")
         if comps_signal == "低估":
-            scores.append(82)
+            _add_points("可比公司", 82, "相对可比低估")
         elif comps_signal == "高估":
-            scores.append(40)
-        result["composite_valuation_score"] = sum(scores) / len(scores) if scores else 55.0
+            _add_points("可比公司", 40, "相对可比高估")
+
+        base_score = sum(scores) / len(scores) if scores else 55.0
+        rationale_parts: list[str] = []
+        if breakdown:
+            parts = [f"{b['factor']}{b['points']:.0f}" for b in breakdown]
+            rationale_parts.append("构成：" + "、".join(parts) + f" → 均值 {base_score:.0f}")
+        else:
+            rationale_parts.append("暂无相对估值信号，采用默认中性分")
+
+        haircut = 0.0
+        if cashflow_score is not None and cashflow_score < 45:
+            cheap_looking = any(
+                (rel.get(k) or {}).get("signal") == "低估" for k in ("PE_TTM", "PB", "PEG")
+            ) or base_score >= 70
+            if cheap_looking or base_score >= 60:
+                haircut = min(22.0, max(8.0, (45.0 - float(cashflow_score)) * 0.55))
+                rationale_parts.append(
+                    f"现金流质量仅 {cashflow_score:.0f} 分，估值合理性折减 {haircut:.0f} 分"
+                    f"（账面估值偏便宜但造血不足）"
+                )
+
+        final_score = max(20.0, base_score - haircut)
+        result["composite_valuation_score"] = final_score
+        result["valuation_score_breakdown"] = breakdown
+        result["valuation_score_base"] = round(base_score, 1)
+        result["valuation_score_haircut"] = round(haircut, 1)
+        result["valuation_rationale"] = "；".join(rationale_parts)
 
         if not fin_df.empty:
             result["dcf"] = self._build_dcf(fin_df, market, meta)
@@ -365,9 +453,35 @@ class FundamentalEngine:
                     result["composite_valuation_score"] = 70.0
                 else:
                     result["composite_valuation_score"] = 50.0
+                result["valuation_rationale"] = (
+                    f"无相对估值信号，按 DCF 安全边际 {mos * 100:.0f}% 给分 "
+                    f"{result['composite_valuation_score']:.0f}"
+                )
 
         return result
 
+    @staticmethod
+    def _growth_for_peg(fin_df: pd.DataFrame, meta: dict) -> tuple[float | None, str]:
+        """PEG 优先用 3 年净利 CAGR；不足则回退最新净利同比。"""
+        if fin_df is not None and not fin_df.empty and "net_profit" in fin_df.columns:
+            clean = fin_df["net_profit"].dropna()
+            if len(clean) >= 4:
+                start, end = float(clean.iloc[-4]), float(clean.iloc[-1])
+                if start > 0 and end > 0:
+                    cagr = ((end / start) ** (1 / 3) - 1) * 100
+                    if cagr > 0:
+                        return round(cagr, 2), "3年净利CAGR"
+            if len(clean) >= 2:
+                start, end = float(clean.iloc[0]), float(clean.iloc[-1])
+                span = max(len(clean) - 1, 1)
+                if start > 0 and end > 0:
+                    cagr = ((end / start) ** (1 / span) - 1) * 100
+                    if cagr > 0:
+                        return round(cagr, 2), f"{span}年净利CAGR"
+        yoy = meta.get("profit_yoy")
+        if yoy is not None and float(yoy) > 0:
+            return round(float(yoy), 2), "最新净利同比"
+        return None, "净利增速"
     @staticmethod
     def _growth_rate(meta: dict) -> float:
         raw = meta.get("profit_yoy")

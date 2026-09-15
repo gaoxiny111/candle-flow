@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from app.analysis.base import AnalysisLevel, BaseAnalyzer, IndicatorResult, ModuleResult, score_to_level
+from app.analysis.base import AnalysisLevel, BaseAnalyzer, IndicatorResult, ModuleResult, format_report_period, score_to_level
 
 
 class GrowthAnalyzer(BaseAnalyzer):
@@ -33,6 +33,15 @@ class GrowthAnalyzer(BaseAnalyzer):
 
         revenue = financial_data["revenue"]
         profit = financial_data["net_profit"]
+        annual_dates = [str(x) for x in (kwargs.get("annual_dates") or list(financial_data.index))]
+        cagr_period = ""
+        if len(annual_dates) >= 2:
+            a0 = format_report_period(annual_dates[max(0, len(annual_dates) - 4)]) or annual_dates[0]
+            a1 = format_report_period(annual_dates[-1]) or annual_dates[-1]
+            cagr_period = f"{a0}–{a1}"
+        elif annual_dates:
+            cagr_period = format_report_period(annual_dates[-1])
+        yoy_period = format_report_period(kwargs.get("latest_report")) or "最新报告期"
 
         rev_cagr_3y = self._calc_cagr(revenue, 3)
         # 成熟蓝筹：小幅负 CAGR 仍属稳健，不按成长股标准打地板
@@ -45,6 +54,8 @@ class GrowthAnalyzer(BaseAnalyzer):
                 level=level,
                 trend=self._calc_trend(revenue.pct_change(fill_method=None) * 100),
                 weight=2.0,
+                period=cagr_period,
+                comment="年报序列复合增速",
             )
         )
 
@@ -58,6 +69,8 @@ class GrowthAnalyzer(BaseAnalyzer):
                 level=level2,
                 trend=self._calc_trend(profit.pct_change(fill_method=None) * 100),
                 weight=2.0,
+                period=cagr_period,
+                comment="年报序列复合增速",
             )
         )
 
@@ -75,6 +88,8 @@ class GrowthAnalyzer(BaseAnalyzer):
                     level=yoy_lv,
                     trend="up" if yoy_val > 5 else ("down" if yoy_val < -5 else "flat"),
                     weight=3.0,
+                    period=yoy_period,
+                    comment=f"同比口径：{yoy_period}（非年报CAGR）",
                 )
             )
 
@@ -89,6 +104,8 @@ class GrowthAnalyzer(BaseAnalyzer):
                     level=yp_lv,
                     trend="up" if yp > 5 else ("down" if yp < -5 else "flat"),
                     weight=3.0,
+                    period=yoy_period,
+                    comment=f"同比口径：{yoy_period}（非年报CAGR）",
                 )
             )
 
@@ -110,6 +127,7 @@ class GrowthAnalyzer(BaseAnalyzer):
                     level=AnalysisLevel.GOOD,
                     trend="up",
                     weight=2.5,
+                    period=yoy_period,
                     comment=(
                         "历史复合增速为负但最新同比强劲反弹（V型拐点）"
                         if strong

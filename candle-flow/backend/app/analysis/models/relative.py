@@ -4,7 +4,7 @@ import pandas as pd
 
 
 class RelativeValuation:
-    """PE/PB/PS/EV 历史分位 + 行业对比。"""
+    """PE/PB/PS/EV 历史分位 + 行业对比 + PEG。"""
 
     def analyze(
         self,
@@ -51,11 +51,23 @@ class RelativeValuation:
 
         pe = current.get("PE_TTM")
         growth = current.get("profit_growth_rate")
+        growth_label = current.get("profit_growth_label") or "净利增速"
         if pe and growth and float(growth) > 0:
             peg = float(pe) / float(growth)
+            # 图四：<1 低估，1~2 合理，>2 偏贵
+            if peg < 1:
+                signal = "低估"
+            elif peg <= 2:
+                signal = "合理"
+            else:
+                signal = "偏贵"
             results["PEG"] = {
                 "value": round(peg, 2),
-                "signal": "低估" if peg < 0.8 else ("高估" if peg > 1.5 else "合理"),
+                "current": round(peg, 2),
+                "signal": signal,
+                "growth_rate": round(float(growth), 2),
+                "growth_label": growth_label,
+                "thresholds": "<1 低估 · 1~2 合理 · >2 偏贵",
             }
 
         return results

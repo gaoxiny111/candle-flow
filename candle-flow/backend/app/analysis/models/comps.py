@@ -18,8 +18,21 @@ logger = logging.getLogger(__name__)
 PE_MAX = 300.0
 PB_MAX = 20.0
 CAP_DIFF_MAX = 0.5  # 市值偏离上限 50%
-DEFAULT_LIMIT = 5
+CAP_DIFF_RELAXED = 1.0  # 样本不足时放宽到 100%
+DEFAULT_LIMIT = 8
 BAND = 0.10  # 估值区间上下浮动 10%
+MIN_PEER_SAMPLE = 5  # 少于该数则行业/可比估值显示 N/A
+
+
+def _soft_industry_match(row_ind: str, target: str) -> bool:
+    a, b = (row_ind or "").strip(), (target or "").strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if len(b) >= 2 and (b in a or a in b):
+        return True
+    return False
 
 
 def _pick(row: Any, *keys: str) -> float | None:
@@ -112,9 +125,15 @@ def _industry_peer_rows(
         return []
 
     exclude_key = exclude.upper()
-    out: list[dict[str, Any]] = []
+    exact: list[dict[str, Any]] = []
+    soft: list[dict[str, Any]] = []
     for _, row in df.iterrows():
-        if str(row.get("所处行业") or "") != industry:
+        row_ind = str(row.get("所处行业") or "")
+        if row_ind == industry:
+            bucket = exact
+        elif _soft_industry_match(row_ind, industry):
+            bucket = soft
+        else:
             continue
         sym = _to_symbol(row.get("股票代码"))
         if not sym or sym.upper() == exclude_key:
@@ -131,7 +150,7 @@ def _industry_peer_rows(
         equity = None
         if net_profit is not None and roe is not None and abs(roe) >= 0.01:
             equity = net_profit / (roe / 100.0)
-        out.append(
+        bucket.append(
             {
                 "symbol": sym,
                 "name": name,
@@ -142,8 +161,16 @@ def _industry_peer_rows(
                 "roe": roe,
             }
         )
-    return out
-
+    # 精确同行优先；不足再并入近似行业
+    if len(exact) >= MIN_PEER_SAMPLE:
+        return exact
+    seen = {p["symbol"] for p in exact}
+    merged = list(exact)
+    for p in soft:
+        if p["symbol"] not in seen:
+            merged.append(p)
+            seen.add(p["symbol"])
+    return merged
 
 def _batch_quotes(symbols: list[str], db: Any = None) -> dict[str, dict[str, Any]]:
     if not symbols:
@@ -168,49 +195,56 @@ def select_comparables(
     target_market_cap: float | None,
     db: Any = None,
     limit: int = DEFAULT_LIMIT,
+    cap_diff_max: float = CAP_DIFF_MAX,
 ) -> list[dict[str, Any]]:
     """
     步骤2：筛选可比公司。
-    条件：同行业、非 ST/亏损、市值偏离 ≤50%，按市值接近度取前 limit 家。
+    条件：同行业（可软匹配）、非 ST/亏损、市值偏离限制，按市值接近度取前 limit 家。
     """
     peers = _industry_peer_rows(industry, report_date, exclude=stock_code)
     if not peers:
         return []
 
     quotes = _batch_quotes([p["symbol"] for p in peers], db=db)
-    ranked: list[tuple[float, dict[str, Any]]] = []
-    for peer in peers:
-        q = quotes.get(peer["symbol"].upper()) or {}
-        pe = q.get("pe_ttm")
-        pb = q.get("pb")
-        mcap = q.get("market_cap")
-        price = q.get("price")
-        if pe is None and pb is None:
-            continue
-        dist = 0.0
-        if target_market_cap and target_market_cap > 0 and mcap is not None and float(mcap) > 0:
-            dist = abs(float(mcap) - float(target_market_cap)) / float(target_market_cap)
-            if dist > CAP_DIFF_MAX:
-                continue
-        elif target_market_cap and target_market_cap > 0:
-            # 无线上市值时仍保留，但排到后面
-            dist = 1.0
-        ranked.append(
-            (
-                dist,
-                {
-                    **peer,
-                    "pe": float(pe) if pe is not None else None,
-                    "pb": float(pb) if pb is not None else None,
-                    "market_cap": float(mcap) if mcap is not None else None,
-                    "price": float(price) if price is not None else None,
-                    "name": q.get("name") or peer.get("name") or "",
-                },
-            )
-        )
 
-    ranked.sort(key=lambda x: x[0])
-    return [item for _, item in ranked[: max(1, limit)]]
+    def _rank(max_dist: float) -> list[dict[str, Any]]:
+        ranked: list[tuple[float, dict[str, Any]]] = []
+        for peer in peers:
+            q = quotes.get(peer["symbol"].upper()) or {}
+            pe = q.get("pe_ttm")
+            pb = q.get("pb")
+            mcap = q.get("market_cap")
+            price = q.get("price")
+            if pe is None and pb is None:
+                continue
+            dist = 0.0
+            if target_market_cap and target_market_cap > 0 and mcap is not None and float(mcap) > 0:
+                dist = abs(float(mcap) - float(target_market_cap)) / float(target_market_cap)
+                if dist > max_dist:
+                    continue
+            elif target_market_cap and target_market_cap > 0:
+                dist = 1.0
+            ranked.append(
+                (
+                    dist,
+                    {
+                        **peer,
+                        "pe": float(pe) if pe is not None else None,
+                        "pb": float(pb) if pb is not None else None,
+                        "market_cap": float(mcap) if mcap is not None else None,
+                        "price": float(price) if price is not None else None,
+                        "name": q.get("name") or peer.get("name") or "",
+                    },
+                )
+            )
+        ranked.sort(key=lambda x: x[0])
+        return [item for _, item in ranked[: max(1, limit)]]
+
+    selected = _rank(cap_diff_max)
+    # 样本不足时放宽市值偏离，尽量凑够 MIN_PEER_SAMPLE
+    if len(selected) < MIN_PEER_SAMPLE and cap_diff_max < CAP_DIFF_RELAXED:
+        selected = _rank(CAP_DIFF_RELAXED)
+    return selected
 
 
 def calculate_comparable_valuation(
@@ -235,6 +269,7 @@ def calculate_comparable_valuation(
             "valuation_range": {},
             "warning": "目标公司基本面数据不足，无法套算可比估值",
             "peer_count": 0,
+            "insufficient_sample": True,
         }
 
     industry = target.get("industry") or meta.get("industry") or ""
@@ -273,24 +308,33 @@ def calculate_comparable_valuation(
         }
 
     warning = None
-    if len(comparables) < 3:
-        warning = "可比公司不足 3 家，估值结果可能不准确"
+    peer_n = len(comparables)
+    insufficient = peer_n < MIN_PEER_SAMPLE
+    if insufficient:
+        warning = f"N/A（样本不足）：可比公司仅 {peer_n} 家，需至少 {MIN_PEER_SAMPLE} 家"
+        # 样本不足时不输出有误导性的均 PE/PB、信号与套算区间
+        avg_pe = None
+        avg_pb = None
+        valuation_range = {}
+        signal = None
+    else:
+        price = target.get("price") or market.get("price")
+        signal = None
+        mid_candidates = [
+            valuation_range[k]["mid"]
+            for k in ("pe_based", "pb_based")
+            if k in valuation_range and valuation_range[k].get("mid") is not None
+        ]
+        if price and mid_candidates:
+            mid = float(np.mean(mid_candidates))
+            if float(price) < mid * 0.9:
+                signal = "低估"
+            elif float(price) > mid * 1.1:
+                signal = "高估"
+            else:
+                signal = "合理"
 
     price = target.get("price") or market.get("price")
-    signal = None
-    mid_candidates = [
-        valuation_range[k]["mid"]
-        for k in ("pe_based", "pb_based")
-        if k in valuation_range and valuation_range[k].get("mid") is not None
-    ]
-    if price and mid_candidates:
-        mid = float(np.mean(mid_candidates))
-        if float(price) < mid * 0.9:
-            signal = "低估"
-        elif float(price) > mid * 1.1:
-            signal = "高估"
-        else:
-            signal = "合理"
 
     return {
         "stock_code": stock_code,
@@ -317,5 +361,6 @@ def calculate_comparable_valuation(
         },
         "signal": signal,
         "warning": warning,
-        "peer_count": len(comparables),
+        "peer_count": peer_n,
+        "insufficient_sample": insufficient,
     }

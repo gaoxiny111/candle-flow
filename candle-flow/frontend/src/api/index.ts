@@ -829,11 +829,13 @@ export interface AnalysisIndicator {
   industry_avg?: number | null
   weight?: number
   comment?: string
+  /** 指标对应报告期，如「2025中报」 */
+  period?: string
 }
 
 export interface AnalysisModule {
   module_name: string
-  score: number
+  score: number | null
   level: string
   indicators: AnalysisIndicator[]
   warnings: string[]
@@ -874,6 +876,7 @@ export interface ComparableValuation {
   signal?: string | null
   warning?: string | null
   peer_count?: number
+  insufficient_sample?: boolean
 }
 
 export interface FundamentalAnalysisReport {
@@ -881,13 +884,29 @@ export interface FundamentalAnalysisReport {
   name: string
   industry: string
   report_dates: string[]
+  /** 同比等「最新报告期」口径（可能为中报） */
+  latest_report?: string | null
   composite_score: number | null
   final_rating: string | null
   /** 现金流得分过低时的一票否决标记 */
   cashflow_veto?: boolean
+  peer_sample_ok?: boolean
   modules: Record<string, AnalysisModule>
   valuation: {
-    relative?: Record<string, { current?: number; percentile_5y?: number | null; signal?: string; value?: number; industry_median?: number | null }>
+    relative?: Record<
+      string,
+      {
+        current?: number
+        percentile_5y?: number | null
+        percentile_na?: string | null
+        signal?: string
+        value?: number
+        industry_median?: number | null
+        growth_rate?: number
+        growth_label?: string
+        thresholds?: string
+      }
+    >
     dcf?: {
       intrinsic_value_per_share?: number | null
       margin_of_safety_pct?: number
@@ -896,6 +915,11 @@ export interface FundamentalAnalysisReport {
     }
     comps?: ComparableValuation
     composite_valuation_score?: number
+    valuation_rationale?: string
+    valuation_score_breakdown?: Array<{ factor: string; points: number; detail?: string }>
+    valuation_score_base?: number
+    valuation_score_haircut?: number
+    peer_sample_ok?: boolean
   }
   market: {
     price?: number | null
@@ -903,6 +927,7 @@ export interface FundamentalAnalysisReport {
     pb?: number | null
     pe_percentile?: number | null
     pb_percentile?: number | null
+    pe_percentile_na?: string | null
     market_cap?: number | null
     dividend_yield?: number | null
   }

@@ -5,7 +5,7 @@ from typing import Any
 import pandas as pd
 
 from app.services.fundamental_screen import (
-    _fetch_debt_map,
+    _fetch_zcfz_map,
     _fetch_yjbb,
     _num,
     _to_symbol,
@@ -144,10 +144,14 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
 
     # 资产负债率：必须优先年报；中报负债率季节性偏高（神华中报 40% vs 年报 ~25–33%）
     debt_ratio = None
+    zcfz_row: dict[str, float] | None = None
+    zcfz_date: str | None = None
     for cand in list(reversed(list(fd.index))):
-        debt_map = _fetch_debt_map(str(cand))
-        if symbol in debt_map:
-            debt_ratio = debt_map[symbol]
+        zmap = _fetch_zcfz_map(str(cand))
+        if symbol in zmap and zmap[symbol].get("debt_ratio") is not None:
+            zcfz_row = zmap[symbol]
+            zcfz_date = str(cand)
+            debt_ratio = float(zcfz_row["debt_ratio"])
             break
     if debt_ratio is None and not fd.empty:
         last = fd.iloc[-1]
@@ -160,15 +164,63 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
                 meta["debt_ratio_estimated"] = True
     meta["debt_ratio"] = debt_ratio
 
+    # 简表字段：区分经营性负债 vs 近似有息负债，并粗估流动/速动比
+    if zcfz_row and zcfz_date:
+        ta = zcfz_row.get("total_assets")
+        tl = zcfz_row.get("total_liabilities")
+        ap = float(zcfz_row.get("accounts_payable") or 0)
+        adv = float(zcfz_row.get("advance_receipts") or 0)
+        cash = float(zcfz_row.get("monetary_funds") or 0)
+        ar = float(zcfz_row.get("accounts_receivable") or 0)
+        inv = float(zcfz_row.get("inventory") or 0)
+        op_liab = ap + adv
+        ibd = max(0.0, float(tl) - op_liab) if tl is not None else None
+        ibd_ratio = round(ibd / float(ta) * 100, 2) if ibd is not None and ta and float(ta) > 0 else None
+        ca = cash + ar + inv
+        # 流动负债粗估：经营性流动负债 + 有息负债的 70%（视为短期）
+        cl_est = op_liab + (ibd * 0.7 if ibd is not None else 0.0)
+        current_ratio = round(ca / cl_est, 2) if cl_est > 0 else None
+        quick_ratio = round((cash + ar) / cl_est, 2) if cl_est > 0 else None
+        meta["balance_sheet"] = {
+            "report_date": zcfz_date,
+            "total_assets": ta,
+            "total_liabilities": tl,
+            "operating_liabilities": round(op_liab, 2) if op_liab else 0.0,
+            "interest_bearing_debt": round(ibd, 2) if ibd is not None else None,
+            "interest_bearing_ratio": ibd_ratio,
+            "current_ratio": current_ratio,
+            "quick_ratio": quick_ratio,
+            "estimated": True,
+        }
+        meta["interest_bearing_ratio"] = ibd_ratio
+        meta["current_ratio"] = current_ratio
+        meta["quick_ratio"] = quick_ratio
+
     # 有负债率后回填总资产，供周转/杜邦展示（非伪造毛利）
     if debt_ratio is not None and debt_ratio < 100 and "equity" in fd.columns:
         for idx in fd.index:
             eq = fd.at[idx, "equity"]
             if pd.isna(eq) or eq <= 0:
                 continue
-            ta = float(eq) / max(1e-6, 1 - float(debt_ratio) / 100.0)
+            if zcfz_row and zcfz_row.get("total_assets") and str(idx) == zcfz_date:
+                ta = float(zcfz_row["total_assets"])
+            else:
+                ta = float(eq) / max(1e-6, 1 - float(debt_ratio) / 100.0)
             fd.at[idx, "total_assets"] = ta
-            fd.at[idx, "current_liabilities"] = ta * (float(debt_ratio) / 100.0) * 0.5
+            if zcfz_row and str(idx) == zcfz_date and meta.get("balance_sheet"):
+                ibd = meta["balance_sheet"].get("interest_bearing_debt") or 0
+                op = meta["balance_sheet"].get("operating_liabilities") or 0
+                fd.at[idx, "current_liabilities"] = float(op) + float(ibd) * 0.7
+                if zcfz_row.get("monetary_funds") is not None:
+                    fd.at[idx, "monetary_funds"] = float(zcfz_row["monetary_funds"])
+                if zcfz_row.get("accounts_receivable") is not None:
+                    fd.at[idx, "accounts_receivable"] = float(zcfz_row["accounts_receivable"])
+                if zcfz_row.get("inventory") is not None:
+                    fd.at[idx, "inventory"] = float(zcfz_row["inventory"])
+                if ibd is not None:
+                    fd.at[idx, "short_term_borrowings"] = float(ibd) * 0.7
+            else:
+                fd.at[idx, "current_liabilities"] = ta * (float(debt_ratio) / 100.0) * 0.5
 
     return fd, meta
 
@@ -185,8 +237,15 @@ def industry_averages(industry: str, report_date: str | None) -> dict[str, float
     if df is None or df.empty:
         return {}
     sub = df[df["所处行业"].astype(str) == industry]
-    if sub.empty or len(sub) < 3:
-        return {}
+    # 精确行业样本不足时，放宽为「行业名互相包含」的近似同业
+    if sub.empty or len(sub) < 5:
+        soft = df[
+            df["所处行业"].astype(str).map(lambda x: _soft_industry_match(str(x), industry))
+        ]
+        if len(soft) > len(sub):
+            sub = soft
+    if sub.empty or len(sub) < 5:
+        return {"peer_count": float(len(sub)) if not sub.empty else 0.0}
     roe_vals = sorted(v for v in (_num(r) for r in sub["净资产收益率"]) if v is not None)
     rev_vals = sorted(v for v in (_num(r) for r in sub["营业总收入-同比增长"]) if v is not None)
     out: dict[str, float] = {}
@@ -196,3 +255,14 @@ def industry_averages(industry: str, report_date: str | None) -> dict[str, float
         out["revenue_yoy"] = rev_vals[len(rev_vals) // 2]
     out["peer_count"] = float(len(sub))
     return out
+
+
+def _soft_industry_match(row_ind: str, target: str) -> bool:
+    a, b = (row_ind or "").strip(), (target or "").strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if len(b) >= 2 and (b in a or a in b):
+        return True
+    return False

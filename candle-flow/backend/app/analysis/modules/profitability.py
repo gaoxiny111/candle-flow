@@ -2,7 +2,19 @@ from __future__ import annotations
 
 import pandas as pd
 
-from app.analysis.base import AnalysisLevel, BaseAnalyzer, IndicatorResult, ModuleResult, score_to_level
+from app.analysis.base import AnalysisLevel, BaseAnalyzer, IndicatorResult, ModuleResult, format_report_period, score_to_level
+
+
+def _estimate_wacc_pct(debt_ratio: float | None) -> float:
+    """与引擎 DCF 动态 WACC 对齐（百分比）。"""
+    if debt_ratio is None:
+        return 10.0
+    dr = float(debt_ratio)
+    if dr < 30:
+        return 8.0
+    if dr > 60:
+        return 12.0
+    return 10.0
 
 
 class ProfitabilityAnalyzer(BaseAnalyzer):
@@ -15,6 +27,12 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
             return ModuleResult("盈利能力", 0, AnalysisLevel.DANGER, warnings=["暂无财务数据"])
 
         fd = financial_data.copy()
+        annual_dates = kwargs.get("annual_dates") or list(fd.index)
+        annual_period = ""
+        if annual_dates:
+            last = format_report_period(str(annual_dates[-1]))
+            annual_period = last or str(annual_dates[-1])
+
         equity = fd["equity"].replace(0, pd.NA)
         revenue = fd["revenue"].replace(0, pd.NA)
         # 评分用年报 ROE（kwargs.latest_roe 已由 financials 设为年报末值）
@@ -42,8 +60,12 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
                 trend=self._calc_trend(roe_series),
                 weight=3.0,
                 comment=f"杜邦: 净利率{net_margin:.1%} × 周转{asset_turnover:.2f} × 权益乘数{equity_multiplier:.2f}",
+                period=annual_period,
             )
         )
+
+        debt_ratio = kwargs.get("debt_ratio")
+        wacc_pct = _estimate_wacc_pct(float(debt_ratio) if debt_ratio is not None else None)
 
         if "operating_profit" in fd.columns and "total_assets" in fd.columns:
             invested = (
@@ -55,6 +77,23 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
             roic_series = (nopat / invested * 100).dropna()
             roic = float(roic_series.iloc[-1]) if len(roic_series) else 0.0
             roic_score, roic_level = self._score_by_range(roic, (12, 100), (8, 12), (4, 8))
+            if roic < wacc_pct:
+                roic_comment = (
+                    f"ROIC {roic:.1f}% < WACC≈{wacc_pct:.0f}%：投入资本回报低于资本成本，"
+                    f"可能在毁灭股东价值"
+                )
+                if debt_ratio is not None and float(debt_ratio) >= 55:
+                    roic_comment += "；叠加较高杠杆，风险更大"
+                    warnings.append(
+                        f"ROIC({roic:.1f}%)低于WACC(≈{wacc_pct:.0f}%)且资产负债率偏高，价值创造存疑"
+                    )
+                else:
+                    warnings.append(f"ROIC({roic:.1f}%)低于估计WACC(≈{wacc_pct:.0f}%)，经济利润偏弱")
+                # 略降分以体现价值毁灭风险
+                roic_score = max(15.0, roic_score - 10)
+                roic_level = score_to_level(roic_score)
+            else:
+                roic_comment = f"ROIC {roic:.1f}% ≥ WACC≈{wacc_pct:.0f}%：创造经济利润"
             indicators.append(
                 IndicatorResult(
                     name="ROIC(%)",
@@ -63,6 +102,8 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
                     level=roic_level,
                     trend=self._calc_trend(roic_series),
                     weight=2.5,
+                    comment=roic_comment,
+                    period=annual_period,
                 )
             )
 
@@ -80,6 +121,7 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
                         level=gm_level,
                         trend=self._calc_trend(gm_series),
                         weight=2.0,
+                        period=annual_period,
                     )
                 )
 
@@ -94,6 +136,7 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
                 level=nm_level,
                 trend=self._calc_trend((fd["net_profit"] / revenue * 100).dropna()),
                 weight=2.0,
+                period=annual_period,
             )
         )
 
@@ -116,6 +159,7 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
                     "net_margin": net_margin,
                     "asset_turnover": asset_turnover,
                     "equity_multiplier": equity_multiplier,
-                }
+                },
+                "wacc_pct": wacc_pct,
             },
         )

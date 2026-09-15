@@ -3,11 +3,11 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from app.analysis.base import AnalysisLevel, BaseAnalyzer, IndicatorResult, ModuleResult, score_to_level
+from app.analysis.base import AnalysisLevel, BaseAnalyzer, IndicatorResult, ModuleResult, format_report_period, score_to_level
 
 
 class CashflowAnalyzer(BaseAnalyzer):
-    """经营现金流含金量、自由现金流、资本开支压力。"""
+    """经营现金流含金量、自由现金流、资本开支压力、增长质量背离。"""
 
     def analyze(self, financial_data: pd.DataFrame, **kwargs) -> ModuleResult:
         indicators: list[IndicatorResult] = []
@@ -16,10 +16,15 @@ class CashflowAnalyzer(BaseAnalyzer):
             return ModuleResult("现金流质量", 0, AnalysisLevel.DANGER, warnings=["暂无现金流数据"])
 
         fd = financial_data
+        annual_dates = kwargs.get("annual_dates") or list(fd.index)
+        annual_period = format_report_period(str(annual_dates[-1])) if annual_dates else ""
+        latest_period = format_report_period(kwargs.get("latest_report")) or annual_period
+
         ocf = fd.get("operating_cashflow", pd.Series(dtype=float))
         net_profit = fd["net_profit"].replace(0, pd.NA)
         capex = fd.get("capital_expenditure", pd.Series(0, index=fd.index))
         fcf = ocf - capex
+        cash_ratio: float | None = None
 
         if len(ocf.dropna()) and len(net_profit.dropna()):
             cash_ratio_series = (ocf / net_profit).replace([np.inf, -np.inf], np.nan).dropna()
@@ -34,6 +39,7 @@ class CashflowAnalyzer(BaseAnalyzer):
                     trend=self._calc_trend(cash_ratio_series),
                     weight=3.0,
                     comment=">1 利润含金量高，<0.5 警惕利润注水",
+                    period=annual_period,
                 )
             )
 
@@ -49,6 +55,7 @@ class CashflowAnalyzer(BaseAnalyzer):
                     trend=self._calc_trend(fcf),
                     weight=2.5,
                     comment=f"近{len(fcf)}期中有{fcf_positive}期为正",
+                    period=annual_period,
                 )
             )
 
@@ -62,6 +69,7 @@ class CashflowAnalyzer(BaseAnalyzer):
                     score=cs,
                     level=cl,
                     weight=2.0,
+                    period=annual_period,
                 )
             )
 
@@ -74,8 +82,35 @@ class CashflowAnalyzer(BaseAnalyzer):
                     score=self._linear_score(float(ocf_ps), 0, 2),
                     level=AnalysisLevel.GOOD if float(ocf_ps) > 0.5 else AnalysisLevel.NEUTRAL,
                     weight=1.5,
+                    period=latest_period,
                 )
             )
+
+        # 利润增速 vs 现金流质量背离
+        yoy_profit = kwargs.get("profit_yoy")
+        if yoy_profit is not None and cash_ratio is not None:
+            yp = float(yoy_profit)
+            if yp >= 15 and cash_ratio < 0.5:
+                # 背离度：净利同比（小数）与现金流/净利 之差，越大越差
+                gap = yp / 100.0 - cash_ratio
+                div_score = max(10.0, min(55.0, 55.0 - gap * 35.0))
+                indicators.append(
+                    IndicatorResult(
+                        name="增长质量背离度",
+                        value=round(gap, 2),
+                        score=round(div_score, 1),
+                        level=score_to_level(div_score),
+                        weight=2.5,
+                        comment=(
+                            f"净利同比+{yp:.1f}% 但经营现金流/净利={cash_ratio:.2f}，"
+                            f"警惕赊销或存货堆积驱动的账面增长"
+                        ),
+                        period=latest_period,
+                    )
+                )
+                warnings.append(
+                    f"增长质量背离：净利高增(+{yp:.1f}%)与现金流含金量({cash_ratio:.2f})明显背离"
+                )
 
         if "accounts_receivable" in fd.columns and "revenue" in fd.columns:
             ar = fd["accounts_receivable"].pct_change(fill_method=None).iloc[-1]

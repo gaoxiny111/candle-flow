@@ -249,3 +249,127 @@ def test_dcf_default_shares_marked_unreliable():
     dcf = eng._build_dcf(fd, {"price": 10.0}, {"symbol": "TEST.SH", "profit_yoy": 5.0})
     assert dcf["shares_source"] == "default_1e9"
     assert dcf.get("is_reliable") is False
+
+
+def test_format_report_period():
+    from app.analysis.base import format_report_period
+
+    assert format_report_period("20251231") == "2025年报"
+    assert format_report_period("20250630") == "2025中报"
+    assert format_report_period(None) == ""
+
+
+def test_growth_quality_divergence_warning():
+    """净利高增 + 现金流/净利很差 → 增长质量背离指标。"""
+    rows = [
+        {"revenue": 80e8, "net_profit": 8e8, "equity": 40e8, "operating_cashflow": 9e8,
+         "capital_expenditure": 1e8, "operating_profit": 10e8, "total_assets": 100e8,
+         "current_liabilities": 30e8},
+        {"revenue": 100e8, "net_profit": 12e8, "equity": 50e8, "operating_cashflow": -8e8,
+         "capital_expenditure": 1e8, "operating_profit": 14e8, "total_assets": 120e8,
+         "current_liabilities": 35e8},
+    ]
+    fd = pd.DataFrame(rows, index=["20241231", "20251231"])
+    result = CashflowAnalyzer().analyze(fd, profit_yoy=27.84, latest_report="20250630")
+    names = [i.name for i in result.indicators]
+    assert "增长质量背离度" in names
+    div = next(i for i in result.indicators if i.name == "增长质量背离度")
+    assert div.score < 55
+    assert any("增长质量背离" in w for w in result.warnings)
+
+
+def test_roic_vs_wacc_comment():
+    fd = _sample_financials()
+    # 压低 operating_profit 使 ROIC 偏低
+    fd = fd.copy()
+    fd["operating_profit"] = [2e8, 2.2e8, 2.5e8]
+    result = ProfitabilityAnalyzer().analyze(fd, debt_ratio=60.0, latest_roe=8.0)
+    roic = next(i for i in result.indicators if i.name == "ROIC(%)")
+    assert "WACC" in (roic.comment or "")
+    assert any("WACC" in w for w in result.warnings)
+
+
+def test_solvency_interest_bearing_and_liquidity():
+    from app.analysis.modules.solvency import SolvencyAnalyzer
+
+    result = SolvencyAnalyzer().analyze(
+        pd.DataFrame(),
+        debt_ratio=59.66,
+        industry="电子元件",
+        interest_bearing_ratio=28.0,
+        current_ratio=1.4,
+        quick_ratio=1.0,
+        balance_sheet={"report_date": "20251231"},
+    )
+    names = [i.name for i in result.indicators]
+    assert "资产负债率(%)" in names
+    assert "有息负债率(%)" in names
+    assert "流动比率" in names
+    assert "速动比率" in names
+    debt = next(i for i in result.indicators if i.name == "资产负债率(%)")
+    assert debt.period == "2025年报"
+    assert any("偏高" in w for w in result.warnings)
+
+
+def test_valuation_rationale_and_cashflow_haircut(monkeypatch):
+    engine = FundamentalEngine()
+
+    def fake_build(symbol: str, years: int = 5):
+        fd = _sample_financials().copy()
+        # 差现金流：经营现金流远低于利润
+        fd["operating_cashflow"] = [-2e8, -1e8, -3e8]
+        return fd, {
+            "name": "测试股",
+            "industry": "电子",
+            "symbol": "000001.SZ",
+            "report_dates": list(fd.index),
+            "annual_dates": list(fd.index),
+            "revenue_yoy": 20.0,
+            "profit_yoy": 28.0,
+            "debt_ratio": 50.0,
+            "latest_report": "20250630",
+            "ocf_per_share": -0.5,
+            "latest_roe": 15.0,
+        }
+
+    monkeypatch.setattr("app.analysis.engine.build_financial_dataframe", fake_build)
+    monkeypatch.setattr("app.analysis.engine.industry_averages", lambda *a, **k: {})
+    monkeypatch.setattr(
+        "app.analysis.engine.get_valuations",
+        lambda *a, **k: [
+            {
+                "symbol": "000001.SZ",
+                "name": "测试股",
+                "price": 10.0,
+                "pe_ttm": 8.0,
+                "pb": 1.2,
+                "pe_percentile": 11.0,
+                "pb_percentile": 23.0,
+                "market_cap": 1e10,
+                "dividend_yield": 1.0,
+                "total_shares": 1e9,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "app.analysis.engine.calculate_comparable_valuation",
+        lambda *a, **k: {
+            "stock_code": "000001.SZ",
+            "comparables": [],
+            "avg_pe": None,
+            "avg_pb": None,
+            "valuation_range": {},
+            "peer_count": 0,
+            "insufficient_sample": True,
+        },
+    )
+
+    report = engine.run_full_analysis("000001.SZ", db=None)
+    val = report["valuation"]
+    assert val.get("valuation_rationale")
+    assert "valuation_score_breakdown" in val
+    assert report.get("latest_report") == "20250630"
+    growth = report["modules"]["growth"]
+    yoy = next(i for i in growth["indicators"] if "营收同比" in i["name"])
+    assert yoy.get("period")
+    assert "中报" in yoy["period"] or "2025" in yoy["period"]

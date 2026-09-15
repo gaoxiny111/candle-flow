@@ -71,8 +71,11 @@ watch(() => props.symbol, load, { immediate: true })
 
 const displayWarnings = computed(() => {
   const list = report.value?.warnings ?? []
-  if (!report.value?.cashflow_veto) return list
-  return list.filter((w) => w !== '现金流不合格，暂不具备价值投资条件')
+  const skip = new Set<string>()
+  if (report.value?.cashflow_veto) skip.add('现金流不合格，暂不具备价值投资条件')
+  // 行业 N/A 已在模块头展示，避免风险提示重复刷屏
+  skip.add('N/A（样本不足）')
+  return list.filter((w) => !skip.has(w))
 })
 </script>
 
@@ -99,7 +102,12 @@ const displayWarnings = computed(() => {
           <div class="title">{{ report.name || report.symbol }}</div>
           <div class="sub">
             <span v-if="report.industry">{{ report.industry }}</span>
-            <span v-if="report.report_dates?.length"> · 报告期 {{ report.report_dates.slice(-1)[0] }}</span>
+            <span v-if="report.report_dates?.length">
+              · 年报序列截至 {{ report.report_dates.slice(-1)[0] }}
+            </span>
+            <span v-if="report.latest_report">
+              · 同比口径 {{ report.latest_report }}
+            </span>
           </div>
           <div class="rating">
             评级
@@ -111,6 +119,9 @@ const displayWarnings = computed(() => {
             <span v-if="report.market.pe_ttm"> · PE {{ report.market.pe_ttm?.toFixed(1) }}</span>
             <span v-if="report.market.pe_percentile != null">
               · PE分位 {{ report.market.pe_percentile?.toFixed(0) }}%
+            </span>
+            <span v-else-if="report.market.pe_percentile_na" class="na">
+              · PE分位 {{ report.market.pe_percentile_na }}
             </span>
           </div>
         </div>
@@ -136,13 +147,22 @@ const displayWarnings = computed(() => {
         >
           <div class="module-head">
             <span>{{ report.modules[key].module_name }}</span>
-            <span class="module-score" :class="scoreTone(report.modules[key].score)">
+            <span
+              v-if="report.modules[key].metadata?.insufficient_sample || report.modules[key].level === 'N/A'"
+              class="module-score na"
+            >
+              N/A（样本不足）
+            </span>
+            <span v-else class="module-score" :class="scoreTone(report.modules[key].score)">
               {{ report.modules[key].score }} · {{ report.modules[key].level }}
             </span>
           </div>
           <ul v-if="report.modules[key].indicators?.length" class="indicators">
             <li v-for="ind in report.modules[key].indicators" :key="ind.name">
-              <span class="ind-name">{{ ind.name }}</span>
+              <span class="ind-name">
+                {{ ind.name }}
+                <span v-if="ind.period" class="ind-period">{{ ind.period }}</span>
+              </span>
               <span class="ind-val">{{ ind.value }}</span>
               <span class="ind-score" :class="scoreTone(ind.score)">{{ ind.score.toFixed(0) }}</span>
               <span v-if="ind.comment" class="ind-comment">{{ ind.comment }}</span>
@@ -152,15 +172,41 @@ const displayWarnings = computed(() => {
       </div>
 
       <section v-if="report.valuation?.relative" class="valuation card-inner">
-        <h4>相对估值</h4>
+        <h4>
+          相对估值
+          <span
+            v-if="report.valuation.composite_valuation_score != null"
+            class="val-score"
+            :class="scoreTone(report.valuation.composite_valuation_score)"
+          >
+            合理性 {{ report.valuation.composite_valuation_score.toFixed(0) }} 分
+          </span>
+        </h4>
+        <p v-if="report.valuation.valuation_rationale" class="val-rationale">
+          {{ report.valuation.valuation_rationale }}
+        </p>
         <div class="val-grid">
           <div v-for="(v, k) in report.valuation.relative" :key="k" class="val-item">
             <span class="val-key">{{ k }}</span>
-            <span class="val-signal" :class="v.signal === '低估' ? 'good' : v.signal === '高估' ? 'bad' : 'mid'">
+            <span
+              class="val-signal"
+              :class="
+                v.signal === '低估' ? 'good' : v.signal === '高估' || v.signal === '偏贵' ? 'bad' : 'mid'
+              "
+            >
               {{ v.signal || '—' }}
             </span>
-            <span v-if="v.current != null" class="val-num">{{ v.current }}</span>
+            <span v-if="k === 'PEG' && (v.value != null || v.current != null)" class="val-num">
+              {{ v.value ?? v.current }}
+            </span>
+            <span v-else-if="v.current != null && k !== 'PEG'" class="val-num">{{ v.current }}</span>
+            <span v-if="k === 'PEG' && v.growth_label" class="val-sub">
+              基于{{ v.growth_label }}
+              <template v-if="v.growth_rate != null"> {{ v.growth_rate }}%</template>
+            </span>
+            <span v-if="k === 'PEG' && v.thresholds" class="val-sub">{{ v.thresholds }}</span>
             <span v-if="v.percentile_5y != null" class="val-sub">分位 {{ v.percentile_5y }}%</span>
+            <span v-else-if="v.percentile_na" class="val-sub na">{{ v.percentile_na }}</span>
             <span v-if="v.industry_median != null" class="val-sub">行业 {{ v.industry_median }}</span>
           </div>
         </div>
@@ -309,12 +355,14 @@ const displayWarnings = computed(() => {
 .module-score.good { color: #389e0d; }
 .module-score.mid { color: #d48806; }
 .module-score.bad { color: #cf1322; }
+.module-score.na, .na { color: #8c8c8c; font-weight: 600; }
 .indicators { list-style: none; margin: 0; padding: 0; font-size: 13px; }
 .indicators li {
   display: grid; grid-template-columns: 1fr auto auto; gap: 8px;
   padding: 4px 0; border-top: 1px dashed var(--border-color);
 }
-.ind-name { color: var(--text-secondary); }
+.ind-name { color: var(--text-secondary); display: flex; flex-direction: column; gap: 2px; }
+.ind-period { font-size: 11px; color: var(--text-secondary); opacity: 0.85; font-weight: 400; }
 .ind-val { font-variant-numeric: tabular-nums; }
 .ind-score { font-weight: 600; min-width: 28px; text-align: right; }
 .ind-score.good { color: #389e0d; }
@@ -322,7 +370,15 @@ const displayWarnings = computed(() => {
 .ind-score.bad { color: #cf1322; }
 .ind-comment { grid-column: 1 / -1; font-size: 12px; color: var(--text-secondary); }
 .valuation { margin-top: 10px; padding: 10px 0; border-top: 1px solid var(--border-color); }
-.valuation h4 { margin: 0 0 8px; font-size: 14px; }
+.valuation h4 { margin: 0 0 8px; font-size: 14px; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.val-score { font-size: 13px; font-weight: 600; }
+.val-score.good { color: #389e0d; }
+.val-score.mid { color: #d48806; }
+.val-score.bad { color: #cf1322; }
+.val-rationale {
+  font-size: 12px; color: var(--text-secondary); margin: 0 0 10px; line-height: 1.5;
+  padding: 8px 10px; background: var(--bg-secondary, #fafafa); border-radius: 6px;
+}
 .val-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
 .val-item { font-size: 13px; padding: 8px; background: var(--bg-secondary, #fafafa); border-radius: 6px; }
 .val-key { display: block; font-weight: 600; }
