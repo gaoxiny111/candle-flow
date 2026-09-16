@@ -76,6 +76,19 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
             last = format_report_period(str(annual_dates[-1]))
             annual_period = last or str(annual_dates[-1])
 
+        # ── 周期/资源股识别：调整评分权重 ─────────────────────────
+        _cycle_prof_kw = ("化工", "有色", "煤炭", "钢铁", "化肥", "磷", "矿", "农化", "航运", "开采")
+        _industry_str = str(kwargs.get("industry") or "")
+        _name_str = str(kwargs.get("name") or "")
+        _is_cyclical_prof = any(k in _industry_str for k in _cycle_prof_kw) or any(
+            k in _name_str for k in ("神华", "云天化", "中煤", "兖矿")
+        )
+        # 权重：周期股 ROIC/ROE 主导，毛利率权重下调
+        _w_roe = 3.0 if not _is_cyclical_prof else 3.0
+        _w_roic = 2.5 if not _is_cyclical_prof else 4.0
+        _w_nm = 2.0 if not _is_cyclical_prof else 2.0
+        _w_gm = 2.0 if not _is_cyclical_prof else 1.0
+
         equity = fd["equity"].replace(0, pd.NA)
         revenue = fd["revenue"].replace(0, pd.NA)
         # 评分用年报 ROE（kwargs.latest_roe 已由 financials 设为年报末值）
@@ -114,7 +127,7 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
                 score=roe_score,
                 level=roe_level,
                 trend=self._calc_trend(roe_series),
-                weight=3.0,
+                weight=_w_roe,
                 comment=f"杜邦: 净利率{net_margin:.1%} × 周转{asset_turnover:.2f} × 权益乘数{equity_multiplier:.2f}{roe_comment_suffix}",
                 period=annual_period,
             )
@@ -134,7 +147,7 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
                         score=gm_score,
                         level=gm_level,
                         trend=self._calc_trend(gm_series),
-                        weight=2.0,
+                        weight=_w_gm,
                         period=annual_period,
                     )
                 )
@@ -149,10 +162,37 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
                     score=gm_score,
                     level=gm_level,
                     trend=self._calc_trend(gm_series),
-                    weight=2.0,
+                    weight=_w_gm,
                     period=annual_period,
                 )
             )
+        # ── 成本管控能力修正：周期股原燃料涨价但毛利率逆势提升 ──
+        if _is_cyclical_prof and gross_margin_val is not None:
+            # 检测毛利率趋势
+            _gm_trend_col = "gross_margin" if "gross_margin" in fd.columns else None
+            if _gm_trend_col is None and "cogs" in fd.columns:
+                _gm_trend_col = "_calc_gm"
+                _rev_s = fd["revenue"].replace(0, pd.NA)
+                fd["_calc_gm"] = ((fd["revenue"] - fd["cogs"]) / _rev_s * 100)
+            if _gm_trend_col and fd[_gm_trend_col].dropna().notna().sum() >= 2:
+                _gm_trend = self._calc_trend(fd[_gm_trend_col].dropna())
+                if _gm_trend == "up" and gross_margin_val >= 15:
+                    # 周期股毛利率逆势向上 → 成本管控能力强
+                    indicators.append(
+                        IndicatorResult(
+                            name="成本管控能力",
+                            value=round(gross_margin_val, 2),
+                            score=82.0,
+                            level=AnalysisLevel.EXCELLENT,
+                            trend="up",
+                            weight=1.5,
+                            period=annual_period,
+                            comment=(
+                                f"周期股毛利率{gross_margin_val:.1f}%逆势向上，"
+                                f"体现原材料成本管控/战略采购能力"
+                            ),
+                        )
+                    )
 
         profile_gm = kwargs.get("latest_gross_margin")
         if profile_gm is None:
@@ -297,15 +337,18 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
                     score=roic_score,
                     level=roic_level,
                     trend=self._calc_trend(roic_series),
-                    weight=2.5,
+                    weight=_w_roic,
                     comment=roic_comment,
                     period=annual_period,
                 )
             )
 
         nm_pct = net_margin * 100
-        # 煤炭等净利率 15%+ 已属优秀
-        nm_score, nm_level = self._score_by_range(nm_pct, (15, 100), (8, 15), (3, 8))
+        # 周期股净利率门槛略降：10%+ 已属中上
+        if _is_cyclical_prof:
+            nm_score, nm_level = self._score_by_range(nm_pct, (12, 100), (7, 12), (3, 7))
+        else:
+            nm_score, nm_level = self._score_by_range(nm_pct, (15, 100), (8, 15), (3, 8))
         indicators.append(
             IndicatorResult(
                 name="净利率(%)",
@@ -313,7 +356,7 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
                 score=nm_score,
                 level=nm_level,
                 trend=self._calc_trend((fd["net_profit"] / revenue * 100).dropna()),
-                weight=2.0,
+                weight=_w_nm,
                 period=annual_period,
             )
         )

@@ -352,7 +352,9 @@ def test_moutai_like_not_cash_debt_dual_high():
         short_term_borrowings=0,
     )
     assert not any("存贷双高" in w for w in result.warnings)
-    assert any("资金极度充裕" in w for w in result.warnings)
+    # "资金极度充裕"是优势，已移至 highlights（metadata）而非 warnings
+    highlights = result.metadata.get("highlights") or []
+    assert any("资金极度充裕" in h for h in highlights)
     assert any("宏观与政策风险" in w for w in result.warnings)
 
 
@@ -610,7 +612,9 @@ def test_shenhua_like_not_cash_debt_dual_high():
         pe_ttm=18.0,
     )
     assert not any("存贷双高" in w for w in result.warnings)
-    assert any("资金极度充裕" in w or "现金奶牛" in w for w in result.warnings)
+    # "资金极度充裕/现金奶牛"是优势，已移至 highlights（metadata）
+    highlights = result.metadata.get("highlights") or []
+    assert any("资金极度充裕" in h or "现金奶牛" in h for h in highlights)
 
 
 def test_high_dividend_roic_wacc_exemption():

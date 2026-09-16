@@ -12,6 +12,7 @@ class RiskAnalyzer(BaseAnalyzer):
 
     def analyze(self, financial_data: pd.DataFrame, **kwargs) -> ModuleResult:
         warnings: list[str] = []
+        highlights: list[str] = []  # 优势/亮点，不参与风险扣分
         risk_score = 100.0
         if financial_data.empty:
             return ModuleResult("风险预警", 50, AnalysisLevel.NEUTRAL, warnings=["数据不足，风险评分中性"])
@@ -70,6 +71,8 @@ class RiskAnalyzer(BaseAnalyzer):
                 risk_score -= deduct
 
         # 应收账款周转天数量化（新浪审计口径，神华等周期股轻扣分）
+        # ── 先检查是否已有应收周转警告（来自 ar 列分析），避免重复 ──
+        ar_already_warned = any("应收" in w and ("周转" in w or "回款" in w) for w in warnings)
         ar_metrics = kwargs.get("ar_metrics")
         if ar_metrics:
             days_latest = ar_metrics.get("days_latest")
@@ -87,7 +90,7 @@ class RiskAnalyzer(BaseAnalyzer):
                     )
                 elif delta_f < -2:
                     # 天数下降 ≥2天：是改善，不应扣分
-                    parts.append(
+                    highlights.append(
                         f"应收账款周转天数从{float(days_5y):.1f}天降至{float(days_latest):.1f}天"
                         f"（五年{delta_f:.1f}天，回款效率改善）"
                     )
@@ -108,7 +111,18 @@ class RiskAnalyzer(BaseAnalyzer):
                     risk_score -= 3
                 elif ar_is_warning:
                     risk_score -= 6
-                warnings.append("，".join(parts))
+                # ── 合并应收周转警告：若已有来自 ar 列分析的同类警告，合并为一条 ──
+                if ar_already_warned:
+                    # 找到已有警告并追加周转天数信息
+                    for i, w in enumerate(warnings):
+                        if "应收" in w and ("周转" in w or "回款" in w):
+                            # 将天数信息追加到已有警告
+                            days_info = parts[0] if parts else ""
+                            if days_info and days_info not in w:
+                                warnings[i] = w.rstrip("。") + f"；{days_info}"
+                            break
+                else:
+                    warnings.append("，".join(parts))
 
         cash = float(latest.get("monetary_funds", 0) or 0)
         short_debt = float(latest.get("short_term_borrowings", 0) or kwargs.get("short_term_borrowings") or 0)
@@ -143,16 +157,16 @@ class RiskAnalyzer(BaseAnalyzer):
                 risk_score -= 20
         elif cash > 5e9 and short_to_cash < 0.25 and (dr_f is None or dr_f < 45):
             if short_debt < 1e8 and ibd_f < 1e8:
-                warnings.append(
+                highlights.append(
                     "资金极度充裕，近乎零有息负债（预收/合同负债等经营性负债≠银行借款）"
                 )
             elif is_div or ibd_f <= cash * 0.85:
                 # 神华等：现金奶牛 + 低短债占比，负债多为经营性占用
-                warnings.append(
+                highlights.append(
                     "资金极度充裕，产业链话语权强（经营性负债为主，有息负债可控）"
                 )
         elif is_div and cash > 5e9 and short_to_cash < 0.35:
-            warnings.append(
+            highlights.append(
                 "高股息现金奶牛：资金充裕、分红能力强，短期借款相对现金可控"
             )
 
@@ -178,6 +192,75 @@ class RiskAnalyzer(BaseAnalyzer):
                     "注入资产2026-2028业绩承诺净利29.6/45.5/66.4亿；"
                     "关注商誉减值风险及整合协同效应"
                 )
+
+        # ── 光模块/光通信行业特有风险 ─────────────────────────────
+        _optical_kw = ("光模块", "光通信", "光电子", "光芯片", "光子")
+        is_optical = (
+            any(k in industry for k in _optical_kw)
+            or any(k in name for k in ("中际旭创", "新易盛", "天孚通信", "光迅科技"))
+            or "300308" in str(kwargs.get("symbol") or "")
+        )
+        if is_optical:
+            # CPO技术替代风险
+            warnings.append(
+                "CPO技术替代风险：若共封装光学(CPO)提前规模商用，"
+                "可能压缩可插拔光模块需求窗口，关注技术路线切换节奏"
+            )
+            risk_score -= 4
+            # 供应链依赖风险
+            warnings.append(
+                "供应链集中风险：DSP芯片依赖博通/Marvell（全球份额>90%），"
+                "EML激光器依赖Lumentum等，地缘政治或供应瓶颈可能影响交付"
+            )
+            risk_score -= 3
+            # 客户集中风险
+            warnings.append(
+                "客户集中风险：前五大客户贡献超70%营收，"
+                "北美云厂商资本开支波动直接影响业绩确定性"
+            )
+            risk_score -= 3
+            # 毛利率下行风险
+            gm_val = kwargs.get("latest_gross_margin")
+            if gm_val is not None and float(gm_val) >= 40:
+                warnings.append(
+                    f"毛利率下行风险：当前毛利率{float(gm_val):.0f}%处于高位，"
+                    "竞争加剧后可能向制造业正常水平(15-20%)回落，"
+                    "关注产品降价节奏与成本控制能力"
+                )
+                risk_score -= 3
+
+        # ── 磷化工/化肥行业特有风险 ─────────────────────────────
+        _phosphate_kw = ("磷", "化肥", "硫化工")
+        _is_phosphate = (
+            any(k in industry for k in _phosphate_kw)
+            or "云天化" in name
+            or "600096" in str(kwargs.get("symbol") or "")
+        )
+        if _is_phosphate:
+            # 磷酸铁锂产能过剩风险
+            warnings.append(
+                "磷酸铁锂产能过剩风险：行业低端产能过剩、高端紧俏，"
+                "需关注公司高端产线客户导入进度及产品差异化竞争力"
+            )
+            risk_score -= 3
+            # 硫磺价格波动风险
+            warnings.append(
+                "硫磺价格波动风险：硫磺为磷肥核心原料，"
+                "采购价虽低于市场价但持续高位仍压缩磷肥毛利"
+            )
+            risk_score -= 3
+            # 镇雄磷矿注入进度风险
+            if "云天化" in name or "600096" in str(kwargs.get("symbol") or ""):
+                warnings.append(
+                    "镇雄磷矿注入进度风险：碗厂磷矿(24.38亿吨)2026年12月开工，"
+                    "建设期约5年，取得采矿证后3年内注入，时点存在不确定性"
+                )
+                risk_score -= 2
+            # 出口政策变动风险
+            warnings.append(
+                "出口政策变动风险：化肥出口法检政策调整可能影响出口量及盈利"
+            )
+            risk_score -= 2
 
         ocf = ocf_early
         profit = profit_early
@@ -248,5 +331,6 @@ class RiskAnalyzer(BaseAnalyzer):
                 "consecutive_loss_years": int(consec_loss),
                 "major_risk_count": len(major_events),
                 "observe_risk_count": len(observe_events),
+                "highlights": highlights,
             },
         )

@@ -393,4 +393,6 @@ def test_observe_pledge_does_not_force_e(monkeypatch):
     cf = report["modules"]["cashflow"]
     cr = next(i for i in cf["indicators"] if i["name"] == "经营现金流/净利润")
     assert cr["value"] == 0.13 or abs(cr["value"] - 0.132) < 0.01
-    assert any("当期现金流恶化" in w for w in report["warnings"])
+    # 年报修正锚：上年年报OCF/NP健康(>0.7) + 利润高增(+80%) → 阶段性占用，非结构性恶化
+    # 新文案应包含"偏低"和"健康"关键词，而非旧的"当期现金流恶化"
+    assert any("偏低" in w and "健康" in w for w in report["warnings"])

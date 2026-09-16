@@ -833,7 +833,7 @@ class FundamentalEngine:
                 _add_points("可比公司", 82, "相对可比低估")
             elif comps_signal == "高估":
                 _add_points("可比公司", 40, "相对可比高估")
-            # ── 成长股估值框架补充 ───────────────────────────────────────
+            # ── 成长股估值框架补充 ─────────────────────────────────────────
             if is_growth:
                 # 毛利率溢价（技术壁垒代理）
                 gm = meta.get("latest_gross_margin")
@@ -843,6 +843,8 @@ class FundamentalEngine:
                         _add_points("毛利率溢价", 88, f"毛利率{gm:.0f}% 技术壁垒强")
                     elif gm >= 40:
                         _add_points("毛利率溢价", 76, f"毛利率{gm:.0f}% 有技术壁垒")
+                    elif gm >= 30:
+                        _add_points("毛利率溢价", 65, f"毛利率{gm:.0f}% 有一定壁垒")
                 # 营收增速（赛道景气度代理）
                 ry = meta.get("revenue_yoy")
                 if ry is not None:
@@ -856,6 +858,45 @@ class FundamentalEngine:
                 # 周期底部反转加分
                 if gs_ctx.get("tier") == "turnaround":
                     _add_points("周期反转溢价", 72, "CAGR负但拐点确认，底部区域")
+                # ── 动态PE（基于利润增速估算前瞻PE） ───────────────────────
+                # 成长股核心：静态PE失真，前瞻PE更有参考价值
+                if pe is not None and float(pe) > 0:
+                    peg_growth = None
+                    for b in breakdown:
+                        if "PEG" in b.get("factor", ""):
+                            # 从 PEG breakdown 取 growth_rate
+                            break
+                    # 回退：用 profit_yoy 或 CAGR 估算前瞻PE
+                    profit_yoy_val = meta.get("profit_yoy")
+                    if profit_yoy_val is not None and float(profit_yoy_val) > 10:
+                        fwd_growth = float(profit_yoy_val) / 100.0
+                        fwd_pe = float(pe) / (1.0 + fwd_growth)
+                        if fwd_pe < 20:
+                            _add_points("动态PE(1Y)", 82, f"前瞻PE={fwd_pe:.1f}x（基于净利同比+{float(profit_yoy_val):.0f}%）")
+                        elif fwd_pe < 30:
+                            _add_points("动态PE(1Y)", 72, f"前瞻PE={fwd_pe:.1f}x（基于净利同比+{float(profit_yoy_val):.0f}%）")
+                        elif fwd_pe < 45:
+                            _add_points("动态PE(1Y)", 60, f"前瞻PE={fwd_pe:.1f}x（基于净利同比+{float(profit_yoy_val):.0f}%）")
+                    # PEG<1 成长股核心定价锚：额外强调
+                    peg_val = rel.get("PEG", {}).get("value")
+                    if peg_val is not None and float(peg_val) > 0 and float(peg_val) < 1:
+                        if float(peg_val) < 0.5:
+                            _add_points("PEG核心锚", 90, f"PEG={float(peg_val):.2f}<<1，成长股核心低估信号")
+                        else:
+                            _add_points("PEG核心锚", 80, f"PEG={float(peg_val):.2f}<1，成长股低估信号")
+                # ── 成长股静态PE/PB软化：PEG<1时降低PE/PB“高估”惩罚 ──────
+                peg_val = rel.get("PEG", {}).get("value")
+                if peg_val is not None and float(peg_val) < 1:
+                    for i, b in enumerate(breakdown):
+                        if b["factor"] == "PE_TTM" and b["points"] <= 35:
+                            # PE_TTM 判“高估”但 PEG<1 →  soften 到 55
+                            scores[i] = 55.0
+                            breakdown[i]["points"] = 55.0
+                            breakdown[i]["detail"] += "；PEG<1软化（静态PE失真）"
+                        elif b["factor"] == "PB" and b["points"] <= 35:
+                            scores[i] = 55.0
+                            breakdown[i]["points"] = 55.0
+                            breakdown[i]["detail"] += "；成长股PB软化"
             base_score = sum(scores) / len(scores) if scores else 55.0
         rationale_parts: list[str] = []
         if is_div:

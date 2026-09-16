@@ -83,16 +83,36 @@ class CashflowAnalyzer(BaseAnalyzer):
                 score, level = self._score_by_range(cash_ratio, (1.0, 5.0), (0.7, 1.0), (0.4, 0.7))
                 cr_comment = ">1 利润含金量高，<0.5 警惕利润注水"
                 if use_latest and cash_ratio < 0.4:
-                    score = min(score, 25.0)
-                    level = AnalysisLevel.DANGER
-                    cr_comment = (
-                        f"当期({period_for_cr})经营现金流/净利仅 {cash_ratio:.1%}，"
-                        f"显著弱于健康阈值；勿被上年年报高含金量掩盖"
-                    )
-                    warnings.append(
-                        f"当期现金流恶化：经营现金流/净利润={cash_ratio:.1%}（{period_for_cr}），"
-                        f"利润含金量偏低"
-                    )
+                    # ── 年报修正锚：上年年报健康时，中报/季报低比值可能是阶段性现象 ──
+                    # 战略备货（存货↑）+ 订单饱满（应收↑）导致现金流占用，≠利润注水
+                    annual_ok = annual_cash_ratio is not None and float(annual_cash_ratio) >= 0.7
+                    yoy_p_v = kwargs.get("profit_yoy")
+                    profit_growing = yoy_p_v is not None and float(yoy_p_v) >= 15
+                    if annual_ok and profit_growing:
+                        # 年报健康 + 利润高增 → 阶段性现金流占用，非结构性恶化
+                        score = 50.0
+                        level = AnalysisLevel.NEUTRAL
+                        cr_comment = (
+                            f"当期({period_for_cr})经营现金流/净利仅 {cash_ratio:.1%}，"
+                            f"但上年年报为 {float(annual_cash_ratio):.2f}（健康）；"
+                            f"利润高增(+{float(yoy_p_v):.0f}%)背景下，"
+                            f"现金流占用多为战略备货/订单扩张所致，非利润注水"
+                        )
+                        warnings.append(
+                            f"当期现金流/净利 {cash_ratio:.1%} 偏低（年报 {float(annual_cash_ratio):.2f} 健康），"
+                            f"关注存货/应收占用是否为战略备货型（订单饱满）而非赊销堆积型"
+                        )
+                    else:
+                        score = min(score, 25.0)
+                        level = AnalysisLevel.DANGER
+                        cr_comment = (
+                            f"当期({period_for_cr})经营现金流/净利仅 {cash_ratio:.1%}，"
+                            f"显著弱于健康阈值；勿被上年年报高含金量掩盖"
+                        )
+                        warnings.append(
+                            f"当期现金流恶化：经营现金流/净利润={cash_ratio:.1%}（{period_for_cr}），"
+                            f"利润含金量偏低"
+                        )
             indicators.append(
                 IndicatorResult(
                     name="经营现金流/净利润",
@@ -191,24 +211,38 @@ class CashflowAnalyzer(BaseAnalyzer):
                 cash_reserve = 0.0
             cash_reserve_yi = cash_reserve / 1e8 if cash_reserve > 1e6 else 0.0
             if gap < 0 and fcf_amt is not None and cash_div is not None:
+                # ── 综合货币资金覆盖倍数 + 经营现金流强度 ──
+                # 而非单纯看 FCF/分红比值，避免对现金奶牛+高利润含金量的误判
+                ocf_np_ratio = kwargs.get("latest_cash_ratio")
+                if ocf_np_ratio is None and annual_cash_ratio is not None:
+                    ocf_np_ratio = annual_cash_ratio
+                ocf_strong = (
+                    ocf_np_ratio is not None
+                    and float(ocf_np_ratio) >= 1.5
+                )
+                cash_multi = (
+                    cash_reserve_yi / max(gap_yi, 1)
+                    if cash_reserve_yi > 0 and gap_yi > 0
+                    else 0.0
+                )
                 if cash_reserve_yi > 0 and cash_reserve_yi >= gap_yi * 2:
-                    # 货币资金≥2倍缺口 → 短期可持续性无虞，降为观察项
+                    # 货币资金≥2倍缺口 → 短期可持续性无虞
                     cover_score = 75.0
                     cover_comment = (
                         f"自由现金流 {fcf_yi:.0f}亿低于现金分红 {cash_yi:.0f}亿，"
                         f"缺口约{gap_yi:.0f}亿；但账面货币资金 {cash_reserve_yi:.0f}亿 "
-                        f"覆盖缺口{cash_reserve_yi / max(gap_yi, 1):.1f}倍，短期可持续性无虞（观察项）"
+                        f"覆盖缺口{cash_multi:.1f}倍，短期可持续性无虞"
                     )
                 elif cash_reserve_yi > 0 and cash_reserve_yi >= gap_yi:
-                    # 货币资金可覆盖缺口但缓冲有限 → 中性观察
+                    # 货币资金可覆盖缺口但缓冲有限
                     cover_score = 70.0
                     cover_comment = (
                         f"自由现金流 {fcf_yi:.0f}亿低于现金分红 {cash_yi:.0f}亿，"
                         f"缺口约{gap_yi:.0f}亿；账面货币资金 {cash_reserve_yi:.0f}亿 "
-                        f"可覆盖但缓冲有限，跟踪经营现金流修复（观察项）"
+                        f"可覆盖但缓冲有限，跟踪经营现金流修复"
                     )
                 else:
-                    # 货币资金不足以覆盖缺口 → 维持核心风险
+                    # 货币资金不足以覆盖缺口
                     cover_score = 60.0
                     cover_comment = (
                         f"自由现金流 {fcf_yi:.0f}亿低于现金分红 {cash_yi:.0f}亿，"
@@ -216,6 +250,23 @@ class CashflowAnalyzer(BaseAnalyzer):
                         f"覆盖不足，高分红可持续性核心风险点"
                     )
                     warnings.append(cover_comment)
+                # ── OCF强度高 + 货币资金充裕 → 综合加分 ──
+                # 经营现金流/净利≥1.5（利润含金量高）+ 货币资金≥3倍缺口
+                # → 分红可持续性远超FCF/分红比值所反映的
+                if ocf_strong and cash_multi >= 3.0:
+                    boost = 8.0
+                    cover_score = min(95.0, cover_score + boost)
+                    cover_comment += (
+                        f"；经营现金流/净利{float(ocf_np_ratio):.2f}（利润含金量高）"
+                        f"+货币资金覆盖{cash_multi:.1f}倍，综合加分+{boost:.0f}"
+                    )
+                elif ocf_strong and cash_multi >= 2.0:
+                    boost = 5.0
+                    cover_score = min(95.0, cover_score + boost)
+                    cover_comment += (
+                        f"；经营现金流/净利{float(ocf_np_ratio):.2f}（利润含金量高）"
+                        f"+货币资金覆盖{cash_multi:.1f}倍，综合加分+{boost:.0f}"
+                    )
             elif gap >= 0 and fcf_amt is not None and cash_div is not None:
                 cover_score = 85.0
                 cover_comment = f"自由现金流 {fcf_yi:.0f}亿覆盖现金分红 {cash_yi:.0f}亿有余"
@@ -299,24 +350,40 @@ class CashflowAnalyzer(BaseAnalyzer):
             yp = float(yoy_profit)
             if yp >= 15 and cash_ratio < 0.5:
                 gap = yp / 100.0 - cash_ratio
-                div_score = max(10.0, min(55.0, 55.0 - gap * 35.0))
+                # ── 年报修正锚：上年年报健康时，背离多为阶段性，降低惩罚 ──
+                annual_healthy = (
+                    use_latest and annual_cash_ratio is not None
+                    and float(annual_cash_ratio) >= 0.7
+                )
+                if annual_healthy:
+                    # 年报健康 + 当期低 = 阶段性占用，背离度打折
+                    div_score = max(40.0, min(65.0, 65.0 - gap * 20.0))
+                    div_comment = (
+                        f"净利同比+{yp:.1f}% 但当期经营现金流/净利={cash_ratio:.2f}，"
+                        f"上年年报 {float(annual_cash_ratio):.2f} 健康；"
+                        f"背离多为战略备货/订单扩张所致，非结构性恶化"
+                    )
+                else:
+                    div_score = max(10.0, min(55.0, 55.0 - gap * 35.0))
+                    div_comment = (
+                        f"净利同比+{yp:.1f}% 但经营现金流/净利={cash_ratio:.2f}，"
+                        f"警惕赊销或存货堆积驱动的账面增长"
+                    )
                 indicators.append(
                     IndicatorResult(
                         name="增长质量背离度",
                         value=round(gap, 2),
                         score=round(div_score, 1),
                         level=score_to_level(div_score),
-                        weight=2.5,
-                        comment=(
-                            f"净利同比+{yp:.1f}% 但经营现金流/净利={cash_ratio:.2f}，"
-                            f"警惕赊销或存货堆积驱动的账面增长"
-                        ),
+                        weight=2.5 if not annual_healthy else 1.5,
+                        comment=div_comment,
                         period=latest_period,
                     )
                 )
-                warnings.append(
-                    f"增长质量背离：净利高增(+{yp:.1f}%)与现金流含金量({cash_ratio:.2f})明显背离"
-                )
+                if not annual_healthy:
+                    warnings.append(
+                        f"增长质量背离：净利高增(+{yp:.1f}%)与现金流含金量({cash_ratio:.2f})明显背离"
+                    )
 
         if "accounts_receivable" in fd.columns and "revenue" in fd.columns:
             ar = fd["accounts_receivable"].pct_change(fill_method=None).iloc[-1]
