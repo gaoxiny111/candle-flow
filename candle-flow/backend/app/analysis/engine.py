@@ -1120,6 +1120,12 @@ class FundamentalEngine:
                 "戈登模型 V=D0(1+g)/(r−g)；"
                 "保守 g2%/r8%、中性 g3%/r7%、乐观 g3%/r6.5%"
             ),
+            "forward_dividend_yield_pct": None,  # 前瞻口径需结合机构EPS预测，仅文字说明
+            "forward_note": (
+                "前瞻口径：2026中期已派0.98元（分红比例74%），若全年维持75%+分红率，"
+                "结合机构2026年EPS中枢2.86-3.15元测算，全年分红约2.15-2.36元，"
+                "按当前股价前瞻股息率约5.5%-6%，高于TTM 4.3%"
+            ),
         }
 
     def _build_dcf(self, fin_df: pd.DataFrame, market: dict, meta: dict) -> dict[str, Any]:

@@ -296,6 +296,23 @@ class GrowthAnalyzer(BaseAnalyzer):
                 "外延式增长观察：资产注入带来煤炭产量+56.6%/可采储量+97.7%规模跃升，"
                 "2026-2028业绩承诺净利29.6/45.5/66.4亿，需跟踪兑现进度及商誉减值风险"
             )
+            # 并表后规模增速：经营目标全面上调，用历史CAGR评估并表后神华会系统性低估
+            indicators.append(
+                IndicatorResult(
+                    name="并表后规模增速",
+                    value=28.6,
+                    score=84.0,
+                    level=AnalysisLevel.GOOD,
+                    trend="up",
+                    weight=1.8,
+                    period="2026经营目标",
+                    comment=(
+                        "资产注入后2026年经营目标全面上调：商品煤产量5.134亿吨(+55.5%)、"
+                        "发电量2881亿千瓦时(+28.8%)、营收目标3600亿(+28.6%)；"
+                        "历史3年CAGR为负但并表后规模跃升，纯CAGR口径会系统性低估"
+                    ),
+                )
+            )
 
         # 业务结构转型 / 成长包容度：高毛利 + 利润高增 → 新品类放量窗口加分
         from app.analysis.growth_quality import classify_high_growth_quality

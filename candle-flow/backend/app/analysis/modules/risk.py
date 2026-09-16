@@ -86,6 +86,9 @@ class RiskAnalyzer(BaseAnalyzer):
                 parts.append(f"应收票据同比+{float(notes_yoy):.0f}%")
             if parts:
                 parts.append("反映下游付款节奏放缓")
+                # 神华等煤炭龙头：前五大客户多为五大发电集团（央企），坏账风险可控
+                if "神华" in name or "601088" in str(kwargs.get("symbol") or ""):
+                    parts.append("客户信用质量高（五大发电集团央企为主），坏账风险可控")
                 if bool(div_profile_early.get("is_dividend_asset")) or any(k in industry for k in ("煤炭", "焦炭", "煤业", "开采")):
                     risk_score -= 3
                 else:
