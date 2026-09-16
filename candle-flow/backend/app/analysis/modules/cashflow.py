@@ -173,7 +173,7 @@ class CashflowAnalyzer(BaseAnalyzer):
                 )
             )
 
-        # FCF 覆盖分红：红利资产核心风险点
+        # FCF 覆盖分红：动态判断 - 货币资金充裕时降为「观察项」而非核心风险
         div_info = kwargs.get("dividend_info") or {}
         if div_info and div_info.get("fcf_dividend_gap") is not None:
             gap = float(div_info["fcf_dividend_gap"])
@@ -183,14 +183,39 @@ class CashflowAnalyzer(BaseAnalyzer):
             fcf_yi = float(fcf_amt) / 1e8 if fcf_amt and float(fcf_amt) > 1e6 else float(fcf_amt or 0)
             cash_yi = float(cash_div) / 1e8 if cash_div and float(cash_div) > 1e6 else float(cash_div or 0)
             gap_yi = abs(gap) / 1e8 if abs(gap) > 1e6 else abs(gap)
+            # 从 fd 年报序列取货币资金（用于动态判断短期分红可持续性）
+            if "monetary_funds" in fd.columns:
+                mf_series = fd["monetary_funds"].dropna()
+                cash_reserve = float(mf_series.iloc[-1]) if len(mf_series) else 0.0
+            else:
+                cash_reserve = 0.0
+            cash_reserve_yi = cash_reserve / 1e8 if cash_reserve > 1e6 else 0.0
             if gap < 0 and fcf_amt is not None and cash_div is not None:
-                cover_score = 65.0
-                cover_comment = (
-                    f"自由现金流 {fcf_yi:.0f}亿低于现金分红 {cash_yi:.0f}亿，"
-                    f"缺口约{gap_yi:.0f}亿，需消耗存量货币资金，"
-                    f"高分红可持续性核心风险点"
-                )
-                warnings.append(cover_comment)
+                if cash_reserve_yi > 0 and cash_reserve_yi >= gap_yi * 2:
+                    # 货币资金≥2倍缺口 → 短期可持续性无虞，降为观察项
+                    cover_score = 75.0
+                    cover_comment = (
+                        f"自由现金流 {fcf_yi:.0f}亿低于现金分红 {cash_yi:.0f}亿，"
+                        f"缺口约{gap_yi:.0f}亿；但账面货币资金 {cash_reserve_yi:.0f}亿 "
+                        f"覆盖缺口{cash_reserve_yi / max(gap_yi, 1):.1f}倍，短期可持续性无虞（观察项）"
+                    )
+                elif cash_reserve_yi > 0 and cash_reserve_yi >= gap_yi:
+                    # 货币资金可覆盖缺口但缓冲有限 → 中性观察
+                    cover_score = 70.0
+                    cover_comment = (
+                        f"自由现金流 {fcf_yi:.0f}亿低于现金分红 {cash_yi:.0f}亿，"
+                        f"缺口约{gap_yi:.0f}亿；账面货币资金 {cash_reserve_yi:.0f}亿 "
+                        f"可覆盖但缓冲有限，跟踪经营现金流修复（观察项）"
+                    )
+                else:
+                    # 货币资金不足以覆盖缺口 → 维持核心风险
+                    cover_score = 60.0
+                    cover_comment = (
+                        f"自由现金流 {fcf_yi:.0f}亿低于现金分红 {cash_yi:.0f}亿，"
+                        f"缺口约{gap_yi:.0f}亿，账面货币资金 {cash_reserve_yi:.0f}亿 "
+                        f"覆盖不足，高分红可持续性核心风险点"
+                    )
+                    warnings.append(cover_comment)
             elif gap >= 0 and fcf_amt is not None and cash_div is not None:
                 cover_score = 85.0
                 cover_comment = f"自由现金流 {fcf_yi:.0f}亿覆盖现金分红 {cash_yi:.0f}亿有余"
