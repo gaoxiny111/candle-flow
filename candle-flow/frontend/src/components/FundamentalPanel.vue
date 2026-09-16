@@ -320,9 +320,19 @@ const observeRiskEvents = computed(() => report.value?.major_risks?.observe_even
       </section>
 
       <section v-if="report.valuation?.dcf" class="valuation card-inner">
-        <h4>DCF 内在价值 <span class="muted" style="font-weight:500;font-size:12px">保守参考</span></h4>
+        <h4>
+          DCF 内在价值
+          <span class="muted" style="font-weight:500;font-size:12px">
+            {{ report.valuation.dcf.suppressed || report.valuation.dcf.role === 'not_applicable_dividend' ? '红利资产不适用' : '保守参考' }}
+          </span>
+        </h4>
         <p v-if="report.valuation.dcf.note" class="muted">{{ report.valuation.dcf.note }}</p>
-        <template v-if="report.valuation.dcf.intrinsic_value_per_share != null">
+        <template
+          v-if="
+            report.valuation.dcf.intrinsic_value_per_share != null &&
+            !report.valuation.dcf.suppressed
+          "
+        >
           <p>
             每股内在价值
             <strong>{{ report.valuation.dcf.intrinsic_value_per_share ?? '—' }}</strong>

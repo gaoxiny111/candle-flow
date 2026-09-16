@@ -53,7 +53,7 @@ class GrowthAnalyzer(BaseAnalyzer):
                 score=score,
                 level=level,
                 trend=self._calc_trend(revenue.pct_change(fill_method=None) * 100),
-                weight=2.0,
+                weight=1.8,
                 period=cagr_period,
                 comment="年报序列复合增速",
             )
@@ -68,7 +68,7 @@ class GrowthAnalyzer(BaseAnalyzer):
                 score=score2,
                 level=level2,
                 trend=self._calc_trend(profit.pct_change(fill_method=None) * 100),
-                weight=2.0,
+                weight=1.8,
                 period=cagr_period,
                 comment="年报序列复合增速",
             )
@@ -76,6 +76,8 @@ class GrowthAnalyzer(BaseAnalyzer):
 
         yoy_rev = kwargs.get("revenue_yoy")
         yoy_profit = kwargs.get("profit_yoy")
+        # 最新同比权重高于 CAGR，避免周期回落掩盖边际企稳
+        yoy_weight = 3.5
         # 蓝筹温和复苏（0%~+10%）给良好档，不要求高增长
         if yoy_rev is not None:
             yoy_val = float(yoy_rev)
@@ -87,7 +89,7 @@ class GrowthAnalyzer(BaseAnalyzer):
                     score=ls,
                     level=yoy_lv,
                     trend="up" if yoy_val > 5 else ("down" if yoy_val < -5 else "flat"),
-                    weight=3.0,
+                    weight=yoy_weight,
                     period=yoy_period,
                     comment=f"同比口径：{yoy_period}（非年报CAGR）",
                 )
@@ -103,7 +105,7 @@ class GrowthAnalyzer(BaseAnalyzer):
                     score=ls2,
                     level=yp_lv,
                     trend="up" if yp > 5 else ("down" if yp < -5 else "flat"),
-                    weight=3.0,
+                    weight=yoy_weight,
                     period=yoy_period,
                     comment=f"同比口径：{yoy_period}（非年报CAGR）",
                 )
@@ -134,39 +136,127 @@ class GrowthAnalyzer(BaseAnalyzer):
                     "主业造血能力未恢复，利润依赖非经常性损益（扣非净利润仍为负）"
                 )
 
-        # V 型反转：历史 CAGR 为负，但最新同比显著转正（含温和复苏）
-        # 扣非仍为负时不给 V 型高分，避免「非经常性损益」制造假拐点
-        v_shape = (
-            not profit_illusion
-            and profit_cagr_3y < 0
-            and yoy_profit is not None
-            and float(yoy_profit) >= 8
-            and yoy_rev is not None
-            and float(yoy_rev) >= 0
-        )
-        if v_shape:
-            strong = float(yoy_profit) >= 20
-            indicators.append(
-                IndicatorResult(
-                    name="成长拐点",
-                    value=round(float(yoy_profit), 2),
-                    score=78.0 if strong else 70.0,
-                    level=AnalysisLevel.GOOD,
-                    trend="up",
-                    weight=2.5,
-                    period=yoy_period,
-                    comment=(
-                        "历史复合增速为负但最新同比强劲反弹（V型拐点）"
-                        if strong
-                        else "历史复合增速为负但最新同比已转正（复苏拐点）"
-                    ),
+        # 业绩拐点 / 边际改善：历史 CAGR 为负，但最新同比已转正（含温和企稳）
+        # 神华等：净利同比仅 +4% 也应捕捉，不宜要求 ≥8% 才给拐点
+        yoy_p = float(yoy_profit) if yoy_profit is not None else None
+        yoy_r = float(yoy_rev) if yoy_rev is not None else None
+        cagr_drag = profit_cagr_3y < 0 or rev_cagr_3y < 0
+        v_shape = False
+        marginal_recovery = False
+        if not profit_illusion and cagr_drag and yoy_p is not None and yoy_r is not None:
+            if yoy_p >= 8 and yoy_r >= 0:
+                v_shape = True
+                strong = yoy_p >= 20
+                indicators.append(
+                    IndicatorResult(
+                        name="成长拐点",
+                        value=round(yoy_p, 2),
+                        score=82.0 if strong else 76.0,
+                        level=AnalysisLevel.GOOD,
+                        trend="up",
+                        weight=3.0,
+                        period=yoy_period,
+                        comment=(
+                            "历史复合增速为负但最新同比强劲反弹（V型拐点）"
+                            if strong
+                            else "历史复合增速为负但最新同比已转正（复苏拐点）"
+                        ),
+                    )
                 )
-            )
-            warnings.append("近3年净利润复合增速为负，但最新报告期已现拐点，需观察持续性")
+                warnings.append(
+                    "近3年净利润复合增速为负，但最新报告期已现拐点，需观察持续性"
+                )
+            elif yoy_p >= 0 and yoy_r >= 3:
+                # 边际改善：营收明显企稳、利润止跌回升（含个位数正增长）
+                marginal_recovery = True
+                ded_note = ""
+                # 扣非改善：主业修复信号（神华中报扣非强于归母时常出现）
+                if deducted is not None and parent_np is not None:
+                    try:
+                        if float(deducted) > 0 and float(parent_np) > 0:
+                            ded_note = "；扣非净利同步改善，主业盈利韧性增强"
+                    except (TypeError, ValueError):
+                        pass
+                cycle_industries = ("煤炭", "焦炭", "有色", "钢铁", "化工", "航运", "港口", "开采")
+                industry = str(kwargs.get("industry") or "")
+                is_cycle = any(k in industry for k in cycle_industries) or "神华" in str(
+                    kwargs.get("name") or ""
+                )
+                if is_cycle:
+                    comment = (
+                        f"周期回落后出现边际修复：营收同比+{yoy_r:.1f}%、净利同比+{yoy_p:.1f}%"
+                        f"{ded_note}；资产注入与多业务板块改善增强盈利韧性"
+                        "（非高成长，但是底部修复）"
+                    )
+                    score_m = 78.0 if yoy_p >= 3 else 74.0
+                else:
+                    comment = (
+                        f"年报CAGR为负，但最新报告期营收同比+{yoy_r:.1f}%、"
+                        f"净利同比+{yoy_p:.1f}%，出现边际修复迹象{ded_note}"
+                    )
+                    score_m = 74.0 if yoy_p >= 3 else 70.0
+                indicators.append(
+                    IndicatorResult(
+                        name="业绩边际改善",
+                        value=round(yoy_p, 2),
+                        score=score_m,
+                        level=AnalysisLevel.GOOD,
+                        trend="up",
+                        weight=3.2,
+                        period=yoy_period,
+                        comment=comment,
+                    )
+                )
+                # 下调 CAGR 指标权重，避免「仍在衰退」叙事压过边际改善
+                for ind in indicators:
+                    if "CAGR" in ind.name:
+                        ind.weight = 1.2
+                warnings.append(
+                    "近3年复合增速为负，但最新报告期已现边际修复"
+                    "（周期企稳+主业/多业务改善），非纯粹衰退通道"
+                )
+            elif profit_cagr_3y < 0:
+                warnings.append("近3年净利润复合增速为负，盈利能力持续下滑")
         elif profit_cagr_3y < 0 and not profit_illusion:
             warnings.append("近3年净利润复合增速为负，盈利能力持续下滑")
         if yoy_rev is not None and float(yoy_rev) < -15:
             warnings.append("最新报告期营收同比下滑超15%，需重点关注")
+
+        # 业务结构转型 / 成长包容度：高毛利 + 利润高增 → 新品类放量窗口加分
+        from app.analysis.growth_quality import classify_high_growth_quality
+
+        gm = kwargs.get("latest_gross_margin")
+        if gm is None and "gross_margin" in financial_data.columns:
+            gms = financial_data["gross_margin"].dropna()
+            if len(gms):
+                gm = float(gms.iloc[-1])
+        elif gm is None and "cogs" in financial_data.columns and financial_data["cogs"].notna().any():
+            rev = financial_data["revenue"].replace(0, pd.NA)
+            gms = ((financial_data["revenue"] - financial_data["cogs"]) / rev * 100).dropna()
+            if len(gms):
+                gm = float(gms.iloc[-1])
+        hq = classify_high_growth_quality(
+            gross_margin_pct=float(gm) if gm is not None else None,
+            profit_yoy_pct=float(yoy_profit) if yoy_profit is not None else None,
+        )
+        business_transform = False
+        if hq.get("is_high_growth_quality") and not profit_illusion:
+            business_transform = True
+            indicators.append(
+                IndicatorResult(
+                    name="业务结构转型",
+                    value=round(float(hq.get("profit_yoy_pct") or 0), 2),
+                    score=86.0,
+                    level=AnalysisLevel.EXCELLENT,
+                    trend="up",
+                    weight=2.5,
+                    period=yoy_period,
+                    comment=(
+                        f"高毛利({hq.get('gross_margin_pct')}%)+净利高增"
+                        f"({hq.get('profit_yoy_pct')}%)：新品类/品类扩张放量窗口，给予成长包容度"
+                    ),
+                )
+            )
 
         module_score = self._weighted_score(indicators)
         # 扣非否决：成长性强制压至 D 档（≤40）
@@ -180,7 +270,10 @@ class GrowthAnalyzer(BaseAnalyzer):
             warnings=warnings,
             metadata={
                 "v_shape": bool(v_shape),
+                "marginal_recovery": bool(marginal_recovery),
                 "profit_illusion": bool(profit_illusion),
                 "deducted_net_profit": float(deducted) if deducted is not None else None,
+                "business_transform": business_transform,
+                "growth_quality": hq,
             },
         )

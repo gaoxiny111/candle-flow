@@ -23,7 +23,9 @@ from app.analysis.dividend_profile import (
     DIVIDEND_ASSET_WACC_PCT,
     classify_dividend_asset,
     dividend_spread_signal,
+    dividend_valuation_note,
 )
+from app.analysis.growth_quality import HIGH_GROWTH_WACC_PCT, classify_high_growth_quality
 from app.analysis.financials import build_financial_dataframe, industry_averages
 from app.analysis.models.dcf import DCFModel
 from app.analysis.models.relative import RelativeValuation
@@ -223,6 +225,7 @@ class FundamentalEngine:
             "parent_net_profit": meta.get("parent_net_profit"),
             "dividend_yield": market.get("dividend_yield"),
             "pe_ttm": market.get("pe_ttm"),
+            "latest_gross_margin": meta.get("latest_gross_margin"),
             "industry_avg": industry_averages(meta.get("industry", ""), meta.get("latest_report")),
             **kwargs,
         }
@@ -280,6 +283,14 @@ class FundamentalEngine:
         all_warnings: list[str] = []
         for r in module_results.values():
             all_warnings.extend(r.warnings)
+        # 模块间可能重复同一提示（如应收恶化），按原文去重保序
+        _seen_w: set[str] = set()
+        deduped: list[str] = []
+        for w in all_warnings:
+            if w and w not in _seen_w:
+                _seen_w.add(w)
+                deduped.append(w)
+        all_warnings = deduped
         if valuation.get("value_trap_veto") and valuation.get("value_trap_message"):
             msg = str(valuation["value_trap_message"])
             if msg not in all_warnings:
@@ -503,10 +514,20 @@ class FundamentalEngine:
                 rel["PEG"]["signal"] = "—"
                 rel["PEG"]["skipped_for_dividend_asset"] = True
                 rel["PEG"]["note"] = "高股息/红利资产不适用 PEG 成长估值"
-            # PE 历史分位偏高 ≠ 泡沫，多为确定性/防御溢价
-            if "PE_TTM" in rel and rel["PE_TTM"].get("signal") == "高估":
-                rel["PE_TTM"]["signal"] = "合理"
-                rel["PE_TTM"]["note"] = "红利资产防御溢价，高 PE 分位不等于估值泡沫"
+            # 历史分位偏高 ≠ 泡沫：降级为「合理偏高」说明，不参与「高估」扣分
+            for _mk in ("PE_TTM", "PB"):
+                if _mk in rel:
+                    pct = rel[_mk].get("percentile_5y")
+                    if rel[_mk].get("signal") == "高估" or (
+                        pct is not None and float(pct) >= 75
+                    ):
+                        rel[_mk]["signal"] = "合理"
+                        rel[_mk]["dividend_percentile_softened"] = True
+                        rel[_mk]["note"] = dividend_valuation_note(
+                            dividend_yield_pct=div_profile.get("dividend_yield_pct"),
+                            payout_ratio_pct=div_profile.get("payout_ratio_pct"),
+                            pe_percentile=float(pct) if pct is not None else pe_pct,
+                        )
             spread = div_profile.get("div_bond_spread_pct")
             spread_sig, _spread_pts = dividend_spread_signal(
                 float(spread) if spread is not None else None
@@ -519,6 +540,21 @@ class FundamentalEngine:
                 "percentile_5y": None,
                 "note": "股息率 − 十年期国债收益率；资产荒/降息周期下的红利定价锚",
             }
+            po = div_profile.get("payout_ratio_pct")
+            if po is not None:
+                if float(po) >= 65:
+                    po_sig, po_pts = "低估", 86.0
+                elif float(po) >= 50:
+                    po_sig, po_pts = "合理", 74.0
+                else:
+                    po_sig, po_pts = "偏贵", 45.0
+                rel["分红比例"] = {
+                    "current": round(float(po), 1),
+                    "signal": po_sig,
+                    "score_hint": po_pts,
+                    "percentile_5y": None,
+                    "note": "估分红率=股息率×PE；≥65% 体现股东回报确定性",
+                }
 
         # 可比公司信号优先补强相对估值（仅样本充足时）
         comps_signal = (comps or {}).get("signal") if sample_ok else None
@@ -526,8 +562,13 @@ class FundamentalEngine:
             if rel["PE_TTM"].get("signal") in (None, "—"):
                 rel["PE_TTM"]["signal"] = comps_signal
             # 红利资产：不让可比「高估」再锁死分数
-            elif is_div and comps_signal == "高估" and rel["PE_TTM"].get("signal") == "高估":
+            elif is_div and comps_signal == "高估":
                 rel["PE_TTM"]["signal"] = "合理"
+                rel["PE_TTM"]["note"] = dividend_valuation_note(
+                    dividend_yield_pct=div_profile.get("dividend_yield_pct"),
+                    payout_ratio_pct=div_profile.get("payout_ratio_pct"),
+                    pe_percentile=pe_pct,
+                )
         result["relative"] = rel
 
         scores: list[float] = []
@@ -537,16 +578,18 @@ class FundamentalEngine:
             scores.append(points)
             breakdown.append({"factor": factor, "points": round(points, 1), "detail": detail})
 
+        # 红利资产：PE/PB/PEG 历史分位不进入均值（避免高分位把估值打到 50 分）
+        _div_skip_keys = {"PEG", "PE_TTM", "PB"} if is_div else set()
+
         for key, item in rel.items():
-            if is_div and key == "PEG":
+            if key in _div_skip_keys:
                 continue
             sig = item.get("signal")
             if sig == "低估":
-                # 股息国债利差对红利资产加权更高
-                pts = 92.0 if (is_div and key == "股息国债利差") else 85.0
+                pts = 92.0 if (is_div and key in ("股息国债利差", "分红比例", "股息率")) else 85.0
                 _add_points(key, pts, f"信号={sig}")
             elif sig == "合理":
-                pts = 78.0 if (is_div and key == "股息国债利差") else 65.0
+                pts = 78.0 if (is_div and key in ("股息国债利差", "分红比例", "股息率")) else 65.0
                 _add_points(key, pts, f"信号={sig}")
             elif sig in ("高估", "偏贵"):
                 _add_points(key, 35, f"信号={sig}")
@@ -558,8 +601,25 @@ class FundamentalEngine:
                 _add_points("绝对PE", 75, f"PE={float(pe):.1f}<15")
         if div is not None and float(div) >= 6:
             _add_points("高股息", 90, f"股息率={float(div):.1f}%")
-        elif is_div and div is not None and float(div) >= 4:
-            _add_points("高股息", 82, f"股息率={float(div):.1f}%（红利资产）")
+        elif is_div and div is not None and float(div) >= 3.8:
+            _add_points("高股息", 84, f"股息率={float(div):.1f}%（红利资产）")
+        # 红利主锚 + 分红确定性 + 现金流覆盖
+        if is_div:
+            spread_item = rel.get("股息国债利差") or {}
+            if spread_item.get("signal") == "低估":
+                _add_points("红利定价锚", 90, "股息−国债利差充足")
+            elif spread_item.get("signal") == "合理" and float(div or 0) >= 3.8:
+                _add_points("红利定价锚", 78, "股息−国债利差尚可，以分红回报定价")
+            po = div_profile.get("payout_ratio_pct")
+            if po is not None and float(po) >= 65:
+                _add_points("分红确定性", 88, f"估分红率{float(po):.0f}%≥65%")
+            elif po is not None and float(po) >= 50:
+                _add_points("分红确定性", 75, f"估分红率{float(po):.0f}%")
+            if cashflow_score is not None and float(cashflow_score) >= 70:
+                _add_points("分红现金流覆盖", 86, f"现金流质量{float(cashflow_score):.0f}分，覆盖分红能力强")
+            # 历史分位仅作旁注分，轻权重
+            if pe_pct is not None and float(pe_pct) >= 75:
+                _add_points("历史分位旁注", 58, f"PE分位{float(pe_pct):.0f}%偏高但红利框架下不作主锚")
         if comps_signal == "低估":
             _add_points("可比公司", 82, "相对可比低估")
         elif comps_signal == "高估" and not is_div:
@@ -569,7 +629,14 @@ class FundamentalEngine:
         rationale_parts: list[str] = []
         if is_div:
             rationale_parts.append(
-                "红利/高股息口径：以股息率相对国债利差为主，不采用 PEG 成长估值"
+                dividend_valuation_note(
+                    dividend_yield_pct=div_profile.get("dividend_yield_pct"),
+                    payout_ratio_pct=div_profile.get("payout_ratio_pct"),
+                    pe_percentile=pe_pct,
+                )
+            )
+            rationale_parts.append(
+                "红利/高股息口径：以股息率、分红比例、国债利差与现金流覆盖为主，弱化 PE/PB/PEG 历史分位"
             )
         if breakdown:
             parts = [f"{b['factor']}{b['points']:.0f}" for b in breakdown]
@@ -655,8 +722,10 @@ class FundamentalEngine:
             if "存在退市/ST风险标识" not in reasons:
                 reasons.append("证券简称含ST/退")
 
-        # 高股息/红利资产：ROIC<WACC 不得作为价值陷阱理由（已在盈利模块豁免 flag）
-        if prof is not None and prof.metadata.get("is_dividend_asset"):
+        # 高股息/高成长赛道：ROIC<WACC 不得作为价值陷阱理由
+        if prof is not None and (
+            prof.metadata.get("is_dividend_asset") or prof.metadata.get("is_high_growth_quality")
+        ):
             reasons = [r for r in reasons if r != "ROIC低于WACC"]
 
         if not reasons:
@@ -724,25 +793,43 @@ class FundamentalEngine:
         raw = meta.get("profit_yoy")
         if raw is None:
             return 0.05
-        growth = float(raw) / 100.0
-        if growth >= 1:  # 已是小数却被当成百分数
-            return 0.05
+        raw_f = float(raw)
+        # 兼容误传小数（0.25=25%）与正常百分数（25 / 91）
+        if 0 < abs(raw_f) < 1.5:
+            growth = raw_f
+        else:
+            growth = raw_f / 100.0
         # 低负债现金奶牛允许略高长期增速上限，避免过度悲观
         dr = meta.get("debt_ratio")
         cap = 0.14 if dr is not None and float(dr) < 30 else 0.12
+        # 高毛利高成长：DCF 仍保守，但给更高扩张期增速上限（仍远低于市场叙事）
+        gm = meta.get("latest_gross_margin")
+        hq = classify_high_growth_quality(
+            gross_margin_pct=float(gm) if gm is not None else None,
+            profit_yoy_pct=raw_f if abs(raw_f) >= 1.5 else raw_f * 100.0,
+        )
+        if hq.get("is_high_growth_quality"):
+            cap = 0.18
         return max(0.02, min(cap, growth))
 
     @staticmethod
-    def _dynamic_wacc(debt_ratio: float | None, *, is_dividend_asset: bool = False) -> float:
-        """低负债现金奶牛略降 WACC；高杠杆抬升；红利资产用 4%~5% 口径。"""
+    def _dynamic_wacc(
+        debt_ratio: float | None,
+        *,
+        is_dividend_asset: bool = False,
+        is_high_growth_quality: bool = False,
+    ) -> float:
+        """低负债现金奶牛略降 WACC；高杠杆抬升；红利/高成长赛道用更低口径。"""
         if is_dividend_asset:
             return DIVIDEND_ASSET_WACC_PCT / 100.0
+        if is_high_growth_quality:
+            return HIGH_GROWTH_WACC_PCT / 100.0
         if debt_ratio is None:
             return 0.10
         dr = float(debt_ratio)
         if dr < 20:
             return 0.07
-        if dr < 30:
+        if dr <= 30:
             return 0.08
         if dr > 60:
             return 0.12
@@ -820,12 +907,51 @@ class FundamentalEngine:
             dividend_yield_pct=market.get("dividend_yield"),
             pe_ttm=market.get("pe_ttm"),
         )
+        gm = meta.get("latest_gross_margin")
+        if gm is None and not fin_df.empty and "gross_margin" in fin_df.columns:
+            gms = fin_df["gross_margin"].dropna()
+            if len(gms):
+                gm = float(gms.iloc[-1])
+        hq = classify_high_growth_quality(
+            gross_margin_pct=float(gm) if gm is not None else None,
+            profit_yoy_pct=meta.get("profit_yoy"),
+        )
+        is_hgq = bool(hq.get("is_high_growth_quality"))
+        is_div = bool(div_profile.get("is_dividend_asset"))
+
+        # 红利资产：不以 DCF 作定价锚，避免低 WACC 撑出夸张内在价值与相对估值打架
+        if is_div:
+            return _json_safe(
+                {
+                    "intrinsic_value_per_share": None,
+                    "margin_of_safety_pct": None,
+                    "role": "not_applicable_dividend",
+                    "suppressed": True,
+                    "is_reliable": False,
+                    "fcf_source": fcf_src,
+                    "shares_source": shares_src,
+                    "dividend_asset": True,
+                    "high_growth_quality": is_hgq,
+                    "note": (
+                        "红利/高股息资产不以 DCF 为核心定价依据（已隐藏内在价值与安全边际），"
+                        "请以股息率相对十年国债利差及分红稳定性为主锚；"
+                        f"资本成本口径 WACC≈{DIVIDEND_ASSET_WACC_PCT:.1f}%"
+                    ),
+                }
+            )
+
         wacc = self._dynamic_wacc(
             debt_ratio,
-            is_dividend_asset=bool(div_profile.get("is_dividend_asset")),
+            is_dividend_asset=False,
+            is_high_growth_quality=is_hgq,
         )
-        # 低负债优质公司永续增速略抬，避免极端悲观；整体仍作保守参考
-        terminal = 0.025 if debt_ratio is not None and float(debt_ratio) < 30 else 0.02
+        # 低负债/高成长永续增速略抬，避免极端悲观；整体仍作保守参考
+        if is_hgq:
+            terminal = 0.03
+        elif debt_ratio is not None and float(debt_ratio) <= 30:
+            terminal = 0.025
+        else:
+            terminal = 0.02
         dcf = DCFModel(wacc=wacc, terminal_growth=terminal).value(
             base_fcf=base_fcf,
             high_growth_rate=growth,
@@ -835,20 +961,25 @@ class FundamentalEngine:
         dcf["fcf_source"] = fcf_src
         dcf["shares_source"] = shares_src
         dcf["role"] = "pessimistic_reference"
-        base_note = "DCF 为保守/极端悲观情景参考，不宜单独作为核心定价依据；请结合相对估值与机构共识"
-        if div_profile.get("is_dividend_asset"):
+        base_note = (
+            "DCF 为极端悲观情景参考，非核心定价依据；"
+            "高成长科技股请优先参考相对估值、机构共识与品类扩张叙事"
+        )
+        if is_hgq:
             base_note += (
-                f"；红利资产已用 WACC≈{DIVIDEND_ASSET_WACC_PCT:.1f}% 口径，"
-                "定价请优先参考股息率相对国债利差"
+                f"；高毛利高成长赛道已用 WACC≈{HIGH_GROWTH_WACC_PCT:.1f}% / "
+                f"扩张期增速上限，结果仍可能显著低于市场定价"
             )
         dcf["note"] = base_note
-        dcf["dividend_asset"] = bool(div_profile.get("is_dividend_asset"))
+        dcf["dividend_asset"] = False
+        dcf["high_growth_quality"] = is_hgq
+        dcf["suppressed"] = False
 
         price = market.get("price")
         iv = dcf.get("intrinsic_value_per_share")
         if price and iv and float(price) > 0:
             dcf["margin_of_safety_pct"] = round((float(iv) - float(price)) / float(price) * 100, 1)
-            # 偏离现价 3 倍以上视为不可信（常见原因：股本默认 10 亿）
+            # 偏离现价 3 倍以上视为不可信（常见原因：股本默认 10 亿 / 高成长叙事未计入）
             if float(iv) > float(price) * 3 or float(iv) < float(price) / 3:
                 logger.warning(
                     "[%s] DCF估值异常！计算值: %.2f, 现价: %s, 股本来源: %s, FCF来源: %s",
@@ -859,9 +990,16 @@ class FundamentalEngine:
                     fcf_src,
                 )
                 dcf["is_reliable"] = False
-                dcf["note"] = base_note + "；估值偏离现价过大，已标记不可信"
+                dcf["note"] = base_note + "；估值偏离现价过大，已标记不可信（勿作核心定价）"
             else:
                 dcf["is_reliable"] = bool(shares_src != "default_1e9")
+            # 高成长且安全边际极差：强制不可信，避免 36 元 vs 220 元误导
+            if is_hgq and float(dcf.get("margin_of_safety_pct") or 0) < -50:
+                dcf["is_reliable"] = False
+                dcf["note"] = (
+                    base_note
+                    + "；相对现价安全边际极差，仅作极端悲观压力测试，请勿作为核心定价"
+                )
         else:
             # 无现价对照时：默认股本一律不可信
             dcf["is_reliable"] = bool(iv) and shares_src != "default_1e9"

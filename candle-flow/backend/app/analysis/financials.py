@@ -105,6 +105,77 @@ def fetch_deducted_parent_netprofit(symbol: str, report_date: str | None = None)
     return None
 
 
+def _income_code(symbol: str) -> str:
+    from app.utils.symbol import SymbolError, normalize_symbol, parse_symbol
+
+    try:
+        code, _ = parse_symbol(normalize_symbol(symbol))
+        return code
+    except SymbolError:
+        digits = "".join(ch for ch in str(symbol) if ch.isdigit())
+        return digits[-6:] if len(digits) >= 6 else ""
+
+
+def fetch_income_by_period(symbol: str, limit: int = 16) -> dict[str, dict[str, float]]:
+    """
+    东财利润表：按报告期 YYYYMMDD → 营业利润 / 营收 / 成本 / 毛利率。
+    用于修正 ROIC（勿用净利×1.15）与真实毛利率。
+    """
+    import requests
+
+    code = _income_code(symbol)
+    if not code:
+        return {}
+    try:
+        r = requests.get(
+            "https://datacenter-web.eastmoney.com/api/data/v1/get",
+            params={
+                "reportName": "RPT_DMSK_FN_INCOME",
+                "columns": (
+                    "SECURITY_CODE,REPORT_DATE,TOTAL_OPERATE_INCOME,OPERATE_INCOME,"
+                    "OPERATE_COST,OPERATE_PROFIT,PARENT_NETPROFIT"
+                ),
+                "filter": f'(SECURITY_CODE="{code}")',
+                "pageNumber": "1",
+                "pageSize": str(limit),
+                "sortColumns": "REPORT_DATE",
+                "sortTypes": "-1",
+                "source": "WEB",
+                "client": "WEB",
+            },
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://data.eastmoney.com/"},
+            timeout=12,
+        )
+        if not r.ok:
+            return {}
+        rows = ((r.json() or {}).get("result") or {}).get("data") or []
+    except Exception:
+        return {}
+
+    out: dict[str, dict[str, float]] = {}
+    for row in rows:
+        rd = str(row.get("REPORT_DATE") or "")[:10].replace("-", "")
+        if len(rd) != 8:
+            continue
+        rev = row.get("TOTAL_OPERATE_INCOME")
+        if rev is None:
+            rev = row.get("OPERATE_INCOME")
+        cost = row.get("OPERATE_COST")
+        op = row.get("OPERATE_PROFIT")
+        item: dict[str, float] = {}
+        if rev is not None:
+            item["revenue"] = float(rev)
+        if cost is not None:
+            item["cogs"] = float(cost)
+        if op is not None:
+            item["operating_profit"] = float(op)
+        if rev is not None and cost is not None and float(rev) > 0:
+            item["gross_margin"] = round((float(rev) - float(cost)) / float(rev) * 100, 2)
+        if item:
+            out[rd] = item
+    return out
+
+
 def _debt_ratio_fallback(symbol: str, equity: float | None, total_assets: float | None) -> float | None:
     """从权益乘数粗估资产负债率；并尝试相邻年报的 zcfz。"""
     if equity and total_assets and total_assets > 0 and equity > 0:
@@ -153,6 +224,7 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
                 "operating_cashflow": ocf_total,
                 "capital_expenditure": (ocf_total or 0) * 0.25 if ocf_total else None,
                 "operating_profit": net_profit * 1.15 if net_profit else None,
+                "operating_profit_estimated": 1.0 if net_profit else None,
                 # 不伪造毛利率：无真实成本时不填 cogs
                 "total_assets": None,
                 "current_liabilities": None,
@@ -217,6 +289,32 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
         if len(annual_roe):
             meta["annual_roe"] = float(annual_roe.iloc[-1])
             meta["latest_roe"] = meta["annual_roe"]
+
+    # 利润表补全：真实营业利润 / 营业成本 / 毛利率（修正 ROIC=净利×1.15 偏差）
+    income_by = fetch_income_by_period(symbol)
+    latest_gm: float | None = None
+    if income_by:
+        for idx in fd.index:
+            key = str(idx)
+            inc = income_by.get(key)
+            if not inc:
+                continue
+            if inc.get("operating_profit") is not None:
+                fd.at[idx, "operating_profit"] = float(inc["operating_profit"])
+                fd.at[idx, "operating_profit_estimated"] = 0.0
+            if inc.get("cogs") is not None:
+                fd.at[idx, "cogs"] = float(inc["cogs"])
+            if inc.get("gross_margin") is not None:
+                fd.at[idx, "gross_margin"] = float(inc["gross_margin"])
+                latest_gm = float(inc["gross_margin"])
+        # 最新报告期（可中报）毛利率优先用于高成长画像
+        snap_key = str(meta.get("latest_report") or "")
+        if snap_key and snap_key in income_by and income_by[snap_key].get("gross_margin") is not None:
+            latest_gm = float(income_by[snap_key]["gross_margin"])
+            meta["latest_gross_margin"] = latest_gm
+        elif latest_gm is not None:
+            meta["latest_gross_margin"] = latest_gm
+        meta["income_enriched"] = True
 
     # 资产负债率：必须优先年报；用个股资产负债表，避免全市场 zcfz 分页
     debt_ratio = None
@@ -298,15 +396,44 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
             eq = fd.at[idx, "equity"]
             if pd.isna(eq) or eq <= 0:
                 continue
-            if zcfz_row and zcfz_row.get("total_assets") and str(idx) == zcfz_date:
+            z_item = by_date.get(str(idx)) if by_date else None
+            if z_item and z_item.get("total_assets"):
+                ta = float(z_item["total_assets"])
+            elif zcfz_row and zcfz_row.get("total_assets") and str(idx) == zcfz_date:
                 ta = float(zcfz_row["total_assets"])
             else:
                 ta = float(eq) / max(1e-6, 1 - float(debt_ratio) / 100.0)
             fd.at[idx, "total_assets"] = ta
-            if zcfz_row and str(idx) == zcfz_date and meta.get("balance_sheet"):
+            if z_item:
+                if z_item.get("interest_bearing_explicit"):
+                    ibd_y = float(z_item.get("interest_bearing_debt") or 0)
+                    short_b = float(z_item.get("short_term_borrowings") or 0)
+                else:
+                    ibd_y = float(z_item.get("interest_bearing_debt") or 0)
+                    short_b = ibd_y * 0.7
+                op = (
+                    float(z_item.get("accounts_payable") or 0)
+                    + float(z_item.get("advance_receipts") or 0)
+                    + float(z_item.get("tax_payable") or 0)
+                    + float(z_item.get("staff_salary_payable") or 0)
+                    + float(z_item.get("other_payable") or 0)
+                )
+                fd.at[idx, "current_liabilities"] = op + short_b
+                fd.at[idx, "interest_bearing_debt"] = ibd_y
+                if z_item.get("monetary_funds") is not None:
+                    fd.at[idx, "monetary_funds"] = float(z_item["monetary_funds"])
+                if z_item.get("accounts_receivable") is not None:
+                    fd.at[idx, "accounts_receivable"] = float(z_item["accounts_receivable"])
+                if z_item.get("inventory") is not None:
+                    fd.at[idx, "inventory"] = float(z_item["inventory"])
+                fd.at[idx, "short_term_borrowings"] = short_b
+            elif zcfz_row and str(idx) == zcfz_date and meta.get("balance_sheet"):
                 short_b = float(meta["balance_sheet"].get("short_term_borrowings") or 0)
                 op = float(meta["balance_sheet"].get("operating_liabilities") or 0)
                 fd.at[idx, "current_liabilities"] = op + short_b
+                fd.at[idx, "interest_bearing_debt"] = float(
+                    meta["balance_sheet"].get("interest_bearing_debt") or 0
+                )
                 if zcfz_row.get("monetary_funds") is not None:
                     fd.at[idx, "monetary_funds"] = float(zcfz_row["monetary_funds"])
                 if zcfz_row.get("accounts_receivable") is not None:

@@ -238,17 +238,37 @@ class CashflowAnalyzer(BaseAnalyzer):
             ar = fd["accounts_receivable"].pct_change(fill_method=None).iloc[-1]
             rev = fd["revenue"].pct_change(fill_method=None).iloc[-1]
             if pd.notna(ar) and pd.notna(rev):
+                from app.analysis.dividend_profile import classify_dividend_asset
+                from app.analysis.receivable_quality import (
+                    ar_turnover_warning,
+                    is_quality_receivable_context,
+                )
+
                 ar_g, rev_g = float(ar), float(rev)
+                last_ocf = float(ocf.iloc[-1]) if len(ocf) and pd.notna(ocf.iloc[-1]) else None
+                last_np = float(fd["net_profit"].iloc[-1]) if pd.notna(fd["net_profit"].iloc[-1]) else None
+                div_p = classify_dividend_asset(
+                    dividend_yield_pct=kwargs.get("dividend_yield"),
+                    pe_ttm=kwargs.get("pe_ttm"),
+                )
+                quality_ar = is_quality_receivable_context(
+                    name=str(kwargs.get("name") or ""),
+                    industry=str(kwargs.get("industry") or ""),
+                    ocf=last_ocf,
+                    net_profit=last_np,
+                    is_dividend_asset=bool(div_p.get("is_dividend_asset")),
+                    cash_ratio=kwargs.get("latest_cash_ratio") or cash_ratio,
+                )
                 # 营收高增且应收增速≥营收2倍 → 营运资本占用（非财务造假指控）
                 if rev_g >= 0.20 and ar_g > rev_g * 2 and ar_g > 0.2:
-                    warnings.append(
-                        "应收账款与存货激增，营运资本占用严重，需警惕下游需求放缓带来的坏账与减值风险"
-                    )
-                # 营收下滑或温和增长下应收相对恶化 → 回款困难（如文旅等长账期）
+                    msg, _ = ar_turnover_warning(quality_context=quality_ar, severe_wc_spike=True)
+                    warnings.append(msg)
                 elif rev_g < 0 and ar_g > rev_g:
-                    warnings.append("应收账款周转恶化，回款极其困难")
+                    msg, _ = ar_turnover_warning(quality_context=quality_ar)
+                    warnings.append(msg)
                 elif rev_g >= 0 and ar_g > rev_g + 0.10:
-                    warnings.append("应收账款周转恶化，回款极其困难")
+                    msg, _ = ar_turnover_warning(quality_context=quality_ar)
+                    warnings.append(msg)
 
         if len(ocf.dropna()) >= 3 and (ocf.iloc[-3:] < 0).all():
             warnings.append("经营现金流连续3期为负，造血能力严重不足")

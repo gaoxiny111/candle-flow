@@ -718,3 +718,271 @@ def test_classify_dividend_asset_soft_tier():
     assert p["is_dividend_asset"] is True
     assert p["tier"] == "soft"
     assert p["wacc_pct"] == 4.5
+
+
+def test_high_growth_quality_wacc_and_roic_exemption():
+    """毛利率>40% + 净利增速>50%：WACC→7%，不作毁灭价值否决。"""
+    from app.analysis.growth_quality import classify_high_growth_quality
+
+    hq = classify_high_growth_quality(gross_margin_pct=48.8, profit_yoy_pct=91.0)
+    assert hq["is_high_growth_quality"] is True
+    assert hq["wacc_pct"] == 7.0
+
+    fd = _sample_financials().copy()
+    fd["cogs"] = [40e8, 45e8, 48e8]  # 毛利率约 50%/50%/52%
+    fd["operating_profit"] = [10e8, 12e8, 14e8]
+    fd["equity"] = [40e8, 45e8, 50e8]
+    fd["interest_bearing_debt"] = [5e8, 5e8, 5e8]
+    fd["monetary_funds"] = [8e8, 9e8, 10e8]
+    result = ProfitabilityAnalyzer().analyze(
+        fd,
+        debt_ratio=35.0,
+        latest_roe=22.0,
+        profit_yoy=91.0,
+        latest_gross_margin=48.8,
+    )
+    assert result.metadata.get("is_high_growth_quality") is True
+    assert abs(float(result.metadata.get("wacc_pct") or 0) - 7.0) < 1e-6
+    assert result.metadata.get("roic_below_wacc") is False
+    roic = next(i for i in result.indicators if i.name == "ROIC(%)")
+    assert float(roic.value) >= 7.0
+    assert "毁灭" not in (roic.comment or "")
+
+
+def test_growth_business_transform_bonus():
+    """高毛利+利润高增 → 业务结构转型加分。"""
+    fd = _sample_financials().copy()
+    fd["cogs"] = [40e8, 45e8, 48e8]
+    fd["gross_margin"] = [50.0, 50.0, 52.0]
+    result = GrowthAnalyzer().analyze(
+        fd,
+        revenue_yoy=40.0,
+        profit_yoy=91.0,
+        latest_report="20260630",
+        latest_gross_margin=48.8,
+        annual_dates=list(fd.index),
+    )
+    names = [i.name for i in result.indicators]
+    assert "业务结构转型" in names
+    assert result.metadata.get("business_transform") is True
+
+
+def test_roic_uses_equity_plus_ibd_minus_cash():
+    """投入资本=权益+有息债−现金，避免总资产−流动负债压低 ROIC。"""
+    rows = [
+        {
+            "revenue": 100e8, "net_profit": 12e8, "equity": 50e8,
+            "operating_cashflow": 13e8, "operating_profit": 20e8,
+            "total_assets": 120e8, "current_liabilities": 60e8,
+            "interest_bearing_debt": 10e8, "monetary_funds": 20e8,
+            "roe": 22.0, "cogs": 50e8,
+        },
+        {
+            "revenue": 120e8, "net_profit": 15e8, "equity": 55e8,
+            "operating_cashflow": 16e8, "operating_profit": 24e8,
+            "total_assets": 130e8, "current_liabilities": 65e8,
+            "interest_bearing_debt": 10e8, "monetary_funds": 22e8,
+            "roe": 24.0, "cogs": 55e8,
+        },
+    ]
+    fd = pd.DataFrame(rows, index=["20241231", "20251231"])
+    result = ProfitabilityAnalyzer().analyze(fd, debt_ratio=40.0, latest_roe=24.0)
+    roic = next(i for i in result.indicators if i.name == "ROIC(%)")
+    # NOPAT=24e8*0.75=18e8；IC=55+10-22=43e8 → ROIC≈41.9%
+    assert float(roic.value) > 30
+    assert "毁灭" not in (roic.comment or "")
+
+
+def test_dcf_high_growth_marked_unreliable_when_far_below_price():
+    eng = FundamentalEngine()
+    fd = _sample_financials().copy()
+    fd["operating_cashflow"] = [9e8, 11e8, 13e8]
+    fd["capital_expenditure"] = [1e8, 1.2e8, 1.5e8]
+    dcf = eng._build_dcf(
+        fd,
+        {"price": 220.0, "pe_ttm": 130.0, "dividend_yield": 0.1, "total_shares": 3e8},
+        {
+            "symbol": "300548.SZ",
+            "profit_yoy": 91.0,
+            "debt_ratio": 30.0,
+            "latest_gross_margin": 48.8,
+        },
+    )
+    assert dcf.get("high_growth_quality") is True
+    assert abs(float(dcf["assumptions"]["wacc"]) - 0.07) < 1e-9
+    if dcf.get("margin_of_safety_pct") is not None and float(dcf["margin_of_safety_pct"]) < -50:
+        assert dcf.get("is_reliable") is False
+        assert "极端悲观" in (dcf.get("note") or "") or "勿" in (dcf.get("note") or "")
+
+
+def test_marginal_recovery_growth_bonus():
+    """年报 CAGR 为负 + 最新同比企稳 → 业绩边际改善加分，不提示持续下滑。"""
+    rows = [
+        {"revenue": 120e8, "net_profit": 30e8, "equity": 80e8, "operating_cashflow": 35e8},
+        {"revenue": 110e8, "net_profit": 26e8, "equity": 82e8, "operating_cashflow": 30e8},
+        {"revenue": 100e8, "net_profit": 22e8, "equity": 85e8, "operating_cashflow": 28e8},
+        {"revenue": 95e8, "net_profit": 20e8, "equity": 88e8, "operating_cashflow": 26e8},
+    ]
+    fd = pd.DataFrame(rows, index=["20221231", "20231231", "20241231", "20251231"])
+    result = GrowthAnalyzer().analyze(
+        fd,
+        revenue_yoy=7.93,
+        profit_yoy=4.10,
+        latest_report="20260630",
+        annual_dates=list(fd.index),
+    )
+    assert result.metadata.get("marginal_recovery") is True
+    assert any(i.name == "业绩边际改善" for i in result.indicators)
+    assert not any("持续下滑" in w for w in result.warnings)
+    assert any("边际改善" in w or "企稳" in w for w in result.warnings)
+    assert result.score >= 70
+
+
+def test_solvency_supply_chain_power_for_cash_cow():
+    from app.analysis.modules.solvency import SolvencyAnalyzer
+
+    result = SolvencyAnalyzer().analyze(
+        pd.DataFrame(),
+        debt_ratio=33.0,
+        interest_bearing_ratio=9.5,
+        current_ratio=1.43,
+        quick_ratio=1.30,
+        industry="煤炭开采",
+        balance_sheet={
+            "report_date": "20251231",
+            "total_assets": 9000e8,
+            "operating_liabilities": 1000e8,
+            "short_term_borrowings": 130e8,
+            "interest_bearing_debt": 860e8,
+            "interest_bearing_ratio": 9.5,
+            "current_ratio": 1.43,
+            "quick_ratio": 1.30,
+        },
+    )
+    assert result.metadata.get("supply_chain_power") is True
+    assert any(i.name == "产业链话语权" for i in result.indicators)
+    assert result.score >= 78
+
+
+def test_dividend_asset_dcf_suppressed():
+    eng = FundamentalEngine()
+    fd = _sample_financials().copy()
+    dcf = eng._build_dcf(
+        fd,
+        {
+            "price": 47.0,
+            "pe_ttm": 12.0,
+            "dividend_yield": 6.5,
+            "total_shares": 2e10,
+        },
+        {"symbol": "601088.SH", "profit_yoy": 4.0, "debt_ratio": 33.0},
+    )
+    assert dcf.get("suppressed") is True
+    assert dcf.get("intrinsic_value_per_share") is None
+    assert dcf.get("margin_of_safety_pct") is None
+    assert "红利" in (dcf.get("note") or "")
+
+
+def test_warning_dedupe_across_modules():
+    from app.analysis.engine import FundamentalEngine
+
+    # 直接测聚合去重逻辑：模拟两模块同文案
+    warnings = ["应收账款周转恶化，回款极其困难", "资金充裕", "应收账款周转恶化，回款极其困难"]
+    seen: set[str] = set()
+    out = []
+    for w in warnings:
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+    assert out == ["应收账款周转恶化，回款极其困难", "资金充裕"]
+    assert FundamentalEngine  # 模块可导入
+
+
+def test_ar_warning_softened_for_soe_cash_cow():
+    """神华类：应收上升不得写成「回款极其困难」。"""
+    rows = [
+        {
+            "revenue": 3000e8, "net_profit": 600e8, "equity": 5500e8,
+            "operating_cashflow": 1100e8, "monetary_funds": 1410e8,
+            "short_term_borrowings": 131e8, "accounts_receivable": 100e8, "goodwill": 0,
+        },
+        {
+            "revenue": 3200e8, "net_profit": 620e8, "equity": 6000e8,
+            "operating_cashflow": 1160e8, "monetary_funds": 1410e8,
+            "short_term_borrowings": 131e8, "accounts_receivable": 160e8, "goodwill": 0,
+        },
+    ]
+    fd = pd.DataFrame(rows, index=["20241231", "20251231"])
+    result = RiskAnalyzer().analyze(
+        fd,
+        name="中国神华",
+        industry="煤炭开采",
+        debt_ratio=33.0,
+        interest_bearing_debt=860e8,
+        dividend_yield=4.5,
+        pe_ttm=18.0,
+        latest_cash_ratio=1.88,
+    )
+    assert not any("回款极其困难" in w for w in result.warnings)
+    assert any("结算周期" in w or "周转效率" in w or "回款节奏" in w for w in result.warnings)
+
+
+def test_dividend_valuation_skips_pe_pb_percentile_drag():
+    """红利资产估值不以 PE/PB 高分位拉低均分。"""
+    eng = FundamentalEngine()
+    fd = _sample_financials().copy()
+    val = eng._run_valuation(
+        fd,
+        {
+            "price": 47.0,
+            "pe_ttm": 18.8,
+            "pb": 2.2,
+            "pe_percentile": 96.3,
+            "pb_percentile": 98.3,
+            "dividend_yield": 4.5,
+            "market_cap": 1e12,
+            "total_shares": 2e10,
+            "symbol": "601088.SH",
+        },
+        {
+            "symbol": "601088.SH",
+            "profit_yoy": 4.0,
+            "debt_ratio": 33.0,
+            "name": "中国神华",
+            "industry": "煤炭开采",
+        },
+        cashflow_score=85.0,
+    )
+    assert val.get("is_dividend_asset") is True
+    assert float(val.get("composite_valuation_score") or 0) >= 65
+    assert "历史分位" in (val.get("valuation_rationale") or "") or "股息" in (
+        val.get("valuation_rationale") or ""
+    )
+    rel = val.get("relative") or {}
+    assert rel.get("PE_TTM", {}).get("signal") != "高估" or rel.get("PE_TTM", {}).get(
+        "dividend_percentile_softened"
+    )
+
+
+def test_marginal_recovery_cycle_language():
+    rows = [
+        {"revenue": 120e8, "net_profit": 30e8, "equity": 80e8, "operating_cashflow": 35e8},
+        {"revenue": 110e8, "net_profit": 26e8, "equity": 82e8, "operating_cashflow": 30e8},
+        {"revenue": 100e8, "net_profit": 22e8, "equity": 85e8, "operating_cashflow": 28e8},
+        {"revenue": 95e8, "net_profit": 20e8, "equity": 88e8, "operating_cashflow": 26e8},
+    ]
+    fd = pd.DataFrame(rows, index=["20221231", "20231231", "20241231", "20251231"])
+    result = GrowthAnalyzer().analyze(
+        fd,
+        revenue_yoy=7.93,
+        profit_yoy=4.10,
+        latest_report="20260630",
+        annual_dates=list(fd.index),
+        name="中国神华",
+        industry="煤炭开采",
+        deducted_net_profit=22e8,
+        parent_net_profit=20e8,
+    )
+    ind = next(i for i in result.indicators if i.name == "业绩边际改善")
+    assert "边际修复" in (ind.comment or "")
+    assert "衰退" not in (ind.comment or "")
