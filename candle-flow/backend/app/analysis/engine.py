@@ -659,6 +659,9 @@ class FundamentalEngine:
         is_growth = bool(gs_ctx.get("is_growth_stock"))
         result["growth_stock_profile"] = gs_ctx
         result["is_growth_stock"] = is_growth
+        # 周期/资源股识别（全局，供估值模块复用）
+        _cycle_kw = ("化工", "农化", "农化制品", "化肥", "磷", "矿", "煤炭", "有色", "钢铁", "石油", "天然气", "农药")
+        is_cycle_val = any(k in str(meta.get("industry") or "") for k in _cycle_kw)
 
         # ── 成长股：PE/PB 极端值（周期底部/高增长）不直接判高估 ─────
         if is_growth and not is_div:
@@ -791,6 +794,26 @@ class FundamentalEngine:
                 n: {"score": it["score"], "weight": weights[n], "detail": it.get("detail")}
                 for n, it in div_factors.items()
             }
+            # ── 周期/资源股在红利框架上的溢价因子 ─────────────────────
+            if is_cycle_val:
+                ind_cycle = str(meta.get("industry") or "")
+                # 资源壁垒溢价：仅 PE<12 的深度资源垄断才加（避免对高PE周期股过度加分）
+                pe_v = float(pe) if pe is not None else 99
+                premium_boost = 0.0
+                if pe_v < 12 and ("矿" in ind_cycle or "磷" in ind_cycle or "农化" in ind_cycle):
+                    premium_boost += 4.0
+                    _add_points("资源壁垒溢价", 88, f"PE {pe_v:.1f}x<12 + {ind_cycle}资源垄断")
+                # 红利定价锚：仅利差>2.8%才加（严格阈值避免普遍加分）
+                spread_val = div_profile.get("div_bond_spread_pct")
+                if spread_val is not None and float(spread_val) >= 2.8:
+                    premium_boost += 2.0
+                    _add_points(
+                        "红利定价锚", 85,
+                        f"股息率利差{float(spread_val):.1f}%>2.8%，降息周期红利资产重定价"
+                    )
+                # 溢价因子直接加在加权 base_score 上（上限+6分）
+                if premium_boost > 0:
+                    base_score = min(95.0, base_score + premium_boost)
         else:
             for key, item in rel.items():
                 sig = item.get("signal")
@@ -853,7 +876,7 @@ class FundamentalEngine:
             )
         if breakdown:
             parts = [f"{b['factor']}{b['points']:.0f}" for b in breakdown]
-            verb = "加权" if is_div else "均值"
+            verb = "加权" if is_div and not is_cycle_val else "均值"
             rationale_parts.append("构成：" + "、".join(parts) + f" → {verb} {base_score:.0f}")
         else:
             rationale_parts.append("暂无相对估值信号，采用默认中性分")
@@ -1155,13 +1178,25 @@ class FundamentalEngine:
             det_parts.append(f"分红率{float(payout):.1f}%≥65%")
         elif payout is not None and float(payout) >= 50:
             det_score += 15
-            det_parts.append(f"分红率{float(payout):.1f}%")
+            det_parts.append(f"分红率{float(payout):.1f}%≥50%")
+        elif payout is not None and float(payout) >= 40:
+            det_score += 8
+            det_parts.append(f"分红率{float(payout):.1f}%≥40%")
         if consec and int(consec) >= 10:
             det_score += 12
             det_parts.append(f"连续分红{int(consec)}年")
         elif consec and int(consec) >= 5:
             det_score += 8
             det_parts.append(f"连续分红{int(consec)}年")
+        elif consec and int(consec) >= 3:
+            det_score += 4
+            det_parts.append(f"连续分红{int(consec)}年")
+        # 周期股分红承诺（≥45%）额外加分
+        ind = str(meta.get("industry") or "")
+        cycle_kw = ("化工", "农化", "化肥", "磷", "矿", "煤炭", "有色", "钢铁", "石油", "天然气")
+        if any(k in ind for k in cycle_kw) and payout is not None and float(payout) >= 45:
+            det_score += 5
+            det_parts.append("周期股分红承诺≥45%")
         # 分红率≥70% 且连续≥15年 → 分红承诺极强
         if payout is not None and float(payout) >= 70 and consec and int(consec) >= 15:
             det_score += 5

@@ -240,9 +240,9 @@ function bullBearTone(view: string | undefined) {
             <!-- 数据多边形 -->
             <polygon
               :points="radarPolygonPoints"
-              fill="#e74c3c"
+              fill="#27ae60"
               fill-opacity="0.25"
-              stroke="#e74c3c"
+              stroke="#27ae60"
               stroke-width="2"
               stroke-linejoin="round"
             />
@@ -254,7 +254,7 @@ function bullBearTone(view: string | undefined) {
               :cy="radarPoint(i, (Math.max(0, Math.min(100, d.score)) / 100) * RADAR_R).y"
               r="3.5"
               fill="white"
-              stroke="#e74c3c"
+              stroke="#27ae60"
               stroke-width="2"
             />
             <!-- 维度标签 -->
@@ -279,7 +279,7 @@ function bullBearTone(view: string | undefined) {
               dominant-baseline="central"
               font-size="10"
               font-weight="700"
-              fill="#e74c3c"
+              fill="#27ae60"
             >{{ radarData[i].score.toFixed(0) }}</text>
           </svg>
         </div>

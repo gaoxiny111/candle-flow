@@ -144,7 +144,7 @@ class GrowthAnalyzer(BaseAnalyzer):
         v_shape = False
         marginal_recovery = False
         # 周期股识别：营收同比放宽（主动收缩贸易≠衰退）
-        cycle_industries = ("煤炭", "焦炭", "有色", "钢铁", "化工", "航运", "港口", "开采", "化肥", "磷", "矿")
+        cycle_industries = ("煤炭", "焦炭", "有色", "钢铁", "化工", "航运", "港口", "开采", "化肥", "磷", "矿", "农化", "农药")
         industry_str = str(kwargs.get("industry") or "")
         is_cycle = any(k in industry_str for k in cycle_industries)
         if not profit_illusion and cagr_drag and yoy_p is not None and yoy_r is not None:
@@ -171,6 +171,10 @@ class GrowthAnalyzer(BaseAnalyzer):
                     warnings.append(
                         "近3年净利润复合增速为负，但最新报告期已现拐点，需观察持续性"
                     )
+                    # 下调 CAGR 指标权重，避免下行期拖垮底部复苏叙事
+                    for ind in indicators:
+                        if "CAGR" in ind.name:
+                            ind.weight = 1.2
             # 非周期股原逻辑
             elif yoy_p >= 8 and yoy_r >= 0:
                 v_shape = True

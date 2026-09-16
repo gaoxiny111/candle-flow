@@ -77,21 +77,36 @@ class RiskAnalyzer(BaseAnalyzer):
             days_delta = ar_metrics.get("days_delta_5y")
             notes_yoy = ar_metrics.get("notes_yoy_pct")
             parts: list[str] = []
+            ar_is_warning = True
             if days_latest is not None and days_5y is not None and days_delta is not None:
-                parts.append(
-                    f"应收账款周转天数从{float(days_5y):.1f}天升至{float(days_latest):.1f}天"
-                    f"（五年+{float(days_delta):.1f}天）"
-                )
+                delta_f = float(days_delta)
+                if delta_f > 0:
+                    parts.append(
+                        f"应收账款周转天数从{float(days_5y):.1f}天升至{float(days_latest):.1f}天"
+                        f"（五年+{delta_f:.1f}天）"
+                    )
+                elif delta_f < -2:
+                    # 天数下降 ≥2天：是改善，不应扣分
+                    parts.append(
+                        f"应收账款周转天数从{float(days_5y):.1f}天降至{float(days_latest):.1f}天"
+                        f"（五年{delta_f:.1f}天，回款效率改善）"
+                    )
+                    ar_is_warning = False
+                else:
+                    parts.append(
+                        f"应收账款周转天数{float(days_latest):.1f}天（五年{delta_f:+.1f}天）"
+                    )
             if notes_yoy is not None and float(notes_yoy) > 30:
                 parts.append(f"应收票据同比+{float(notes_yoy):.0f}%")
             if parts:
-                parts.append("反映下游付款节奏放缓")
+                if ar_is_warning:
+                    parts.append("反映下游付款节奏放缓")
                 # 神华等煤炭龙头：前五大客户多为五大发电集团（央企），坏账风险可控
                 if "神华" in name or "601088" in str(kwargs.get("symbol") or ""):
                     parts.append("客户信用质量高（五大发电集团央企为主），坏账风险可控")
                 if bool(div_profile_early.get("is_dividend_asset")) or any(k in industry for k in ("煤炭", "焦炭", "煤业", "开采")):
                     risk_score -= 3
-                else:
+                elif ar_is_warning:
                     risk_score -= 6
                 warnings.append("，".join(parts))
 
@@ -114,10 +129,18 @@ class RiskAnalyzer(BaseAnalyzer):
         short_to_cash = (short_debt / cash) if cash > 0 else 0.0
         div_profile = div_profile_early
         is_div = bool(div_profile.get("is_dividend_asset"))
+        # 周期/资源股（磷化工/农化/矿等）现金+短债双高是行业特性（运营资金需求大）
+        cycle_industries_risk = ("煤炭", "焦炭", "化工", "农化", "化肥", "磷", "矿", "有色", "钢铁", "航运")
+        is_cycle_risk = any(k in industry for k in cycle_industries_risk)
 
         if cash > 1e9 and short_debt > 1e9 and short_to_cash >= 0.40:
-            warnings.append("存贷双高，需关注资金真实性")
-            risk_score -= 20
+            if is_cycle_risk:
+                # 周期/资源股：双高是行业特性（大量运营资金+票据贴现），不扣分
+                warnings.append("存贷双高（周期/资源股行业特性：运营资金需求大+票据贴现所致）")
+                risk_score -= 2  # 轻扣而非重扣20
+            else:
+                warnings.append("存贷双高，需关注资金真实性")
+                risk_score -= 20
         elif cash > 5e9 and short_to_cash < 0.25 and (dr_f is None or dr_f < 45):
             if short_debt < 1e8 and ibd_f < 1e8:
                 warnings.append(
