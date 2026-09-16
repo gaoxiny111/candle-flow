@@ -363,6 +363,83 @@ class FundamentalEngine:
         show_pe_pct = market.get("pe_percentile") if peer_sample_ok else None
         show_pb_pct = market.get("pb_percentile") if peer_sample_ok else None
 
+        # ── 五维雷达 + 多空判断 ──────────────────────────────────
+        def _bull_bear(score: float) -> str:
+            if score >= 70:
+                return "看多"
+            if score >= 45:
+                return "中性"
+            if score >= 30:
+                return "偏空"
+            return "看空"
+
+        # 五维（前端雷达图用）
+        dim_scores = {
+            "盈利能力": module_results["profitability"].score,
+            "成长性": module_results["growth"].score,
+            "现金流质量": module_results["cashflow"].score,
+            "偿债能力": module_results["solvency"].score,
+            "估值合理性": val_score,
+        }
+
+        # 短期观点：DDM安全边际 + 股息率支撑 + 成长边际修复 + PE水平
+        ddm_scenarios = valuation.get("ddm", {}).get("scenarios", []) if valuation else []
+        mid_mos = 0.0
+        for sc in ddm_scenarios:
+            if sc.get("name") == "中性" and sc.get("margin_of_safety_pct") is not None:
+                mid_mos = float(sc["margin_of_safety_pct"])
+                break
+        price_v = market.get("price") or 0
+        pe_v = market.get("pe_ttm") or 0
+        dy_v = market.get("dividend_yield") or 0
+
+        short_score = 50
+        short_signals: list[str] = []
+        if mid_mos >= 0:
+            short_score += 15
+            short_signals.append(f"DDM中性安全边际+{mid_mos:.0f}%")
+        else:
+            short_score -= 10
+            short_signals.append(f"DDM中性安全边际{mid_mos:.0f}%")
+        if dy_v >= 4:
+            short_score += 10
+            short_signals.append(f"股息率{dy_v:.1f}%有支撑")
+        if module_results["growth"].score >= 75:
+            short_score += 10
+            short_signals.append("成长边际修复")
+        if module_results["cashflow"].score >= 80:
+            short_score += 8
+            short_signals.append("现金流健康")
+        if pe_v >= 18:
+            short_score -= 10
+            short_signals.append(f"PE {pe_v:.1f}偏高压制")
+        short_score = max(0, min(100, short_score))
+
+        # 中长期观点：ROE + 偿债 + 分红承诺 + 资产注入 + 红利属性
+        long_score = 50
+        long_signals: list[str] = []
+        if module_results["profitability"].score >= 80:
+            long_score += 15
+            long_signals.append("盈利能力稳健")
+        if module_results["solvency"].score >= 85:
+            long_score += 10
+            long_signals.append("偿债极强")
+        # 红利属性加分（由 classify_dividend_asset 判定）
+        if valuation.get("is_dividend_asset"):
+            long_score += 12
+            long_signals.append("分红承诺≥65%")
+            long_score += 8
+            long_signals.append("红利龙头底仓")
+        # 资产注入外延增长：神华等有growth模块外延指标时加分
+        growth_meta = module_results["growth"].metadata or {}
+        if growth_meta.get("marginal_recovery") or any("资产注入" in w for w in all_warnings):
+            long_score += 10
+            long_signals.append("资产注入规模跃升")
+        long_score = min(long_score, 100)
+
+        short_view = _bull_bear(short_score)
+        long_view = _bull_bear(long_score)
+
         return {
             "symbol": sym,
             "name": meta.get("name") or market.get("name") or "",
@@ -372,6 +449,9 @@ class FundamentalEngine:
             "composite_score": composite,
             "final_rating": letter,
             "final_rating_letter": letter,
+            "dim_scores": dim_scores,
+            "short_term_view": {"score": short_score, "view": short_view, "signals": short_signals},
+            "long_term_view": {"score": long_score, "view": long_view, "signals": long_signals},
             "cashflow_veto": cashflow_veto,
             "compliance_veto": compliance_veto,
             "major_risks": _json_safe(major_risks),

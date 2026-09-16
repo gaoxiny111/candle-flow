@@ -888,6 +888,12 @@ export interface FundamentalAnalysisReport {
   latest_report?: string | null
   composite_score: number | null
   final_rating: string | null
+  /** 五维雷达图数据：维度名 → 分数 */
+  dim_scores?: Record<string, number>
+  /** 短期（1-2周）多空判断 */
+  short_term_view?: { score: number; view: string; signals: string[] }
+  /** 中长期多空判断 */
+  long_term_view?: { score: number; view: string; signals: string[] }
   /** 现金流得分过低时的一票否决标记 */
   cashflow_veto?: boolean
   /** 公告关键词命中重大合规/生存风险时的一票否决 */

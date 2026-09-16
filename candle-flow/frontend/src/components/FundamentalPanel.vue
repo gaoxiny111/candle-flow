@@ -85,6 +85,77 @@ const displayWarnings = computed(() => {
 })
 const majorRiskEvents = computed(() => report.value?.major_risks?.events ?? [])
 const observeRiskEvents = computed(() => report.value?.major_risks?.observe_events ?? [])
+
+// ── 五维雷达图（纯 SVG） ──────────────────────────────────
+const RADAR_LABELS = ['盈利能力', '成长性', '现金流质量', '偿债能力', '估值合理性']
+const RADAR_SIZE = 240 // SVG viewBox 边长
+const RADAR_CX = RADAR_SIZE / 2
+const RADAR_CY = RADAR_SIZE / 2
+const RADAR_R = 90 // 数据半径
+
+const radarData = computed(() => {
+  const dims = report.value?.dim_scores ?? {}
+  return RADAR_LABELS.map((name) => ({
+    name,
+    score: dims[name] ?? 0,
+  }))
+})
+
+/** 生成每个顶点的极坐标 (x,y)，radius 按 score/100 映射 */
+function radarPoint(i: number, radius: number): { x: number; y: number } {
+  const n = RADAR_LABELS.length
+  const angle = (-Math.PI / 2) + (i * 2 * Math.PI) / n
+  return {
+    x: RADAR_CX + radius * Math.cos(angle),
+    y: RADAR_CY + radius * Math.sin(angle),
+  }
+}
+
+const radarPolygonPoints = computed(() => {
+  return radarData.value
+    .map((d, i) => {
+      const r = (Math.max(0, Math.min(100, d.score)) / 100) * RADAR_R
+      const p = radarPoint(i, r)
+      return `${p.x.toFixed(1)},${p.y.toFixed(1)}`
+    })
+    .join(' ')
+})
+
+/** 同心圆（5圈：20/40/60/80/100） */
+const radarRings = [20, 40, 60, 80, 100]
+
+/** 轴端点（最外圈） */
+const radarAxisEnds = computed(() =>
+  RADAR_LABELS.map((_, i) => radarPoint(i, RADAR_R)),
+)
+
+/** 标签位置（最外圈外 22px） */
+const radarLabelPos = computed(() =>
+  RADAR_LABELS.map((_, i) => radarPoint(i, RADAR_R + 22)),
+)
+
+/** 分数标注位置（数据点外 12px） */
+const radarScorePos = computed(() =>
+  radarData.value.map((d, i) => {
+    const r = (Math.max(0, Math.min(100, d.score)) / 100) * RADAR_R
+    const base = radarPoint(i, r)
+    const outer = radarPoint(i, r + 14)
+    // 往标签方向偏
+    const dx = outer.x - base.x
+    const dy = outer.y - base.y
+    return {
+      x: base.x + dx * 0.35,
+      y: base.y + dy * 0.35,
+    }
+  }),
+)
+
+function bullBearTone(view: string | undefined) {
+  if (view === '看多') return 'good'
+  if (view === '中性') return 'mid'
+  if (view === '偏空' || view === '看空') return 'bad'
+  return 'mid'
+}
 </script>
 
 <template>
@@ -131,6 +202,110 @@ const observeRiskEvents = computed(() => report.value?.major_risks?.observe_even
             <span v-else-if="report.market.pe_percentile_na" class="na">
               · PE分位 {{ report.market.pe_percentile_na }}
             </span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 五维雷达 + 多空判断 -->
+      <div v-if="report.dim_scores" class="radar-block">
+        <div class="radar-wrap">
+          <svg
+            :viewBox="`0 0 ${RADAR_SIZE} ${RADAR_SIZE}`"
+            class="radar-svg"
+            aria-label="五维分析雷达图"
+          >
+            <!-- 同心圆 -->
+            <polygon
+              v-for="ring in radarRings"
+              :key="ring"
+              :points="RADAR_LABELS.map((_, i) => {
+                const p = radarPoint(i, (ring / 100) * RADAR_R)
+                return `${p.x.toFixed(1)},${p.y.toFixed(1)}`
+              }).join(' ')"
+              fill="none"
+              stroke="var(--border-color, #e5e5e5)"
+              stroke-width="1"
+            />
+            <!-- 轴线 -->
+            <line
+              v-for="(end, i) in radarAxisEnds"
+              :key="`axis-${i}`"
+              :x1="RADAR_CX"
+              :y1="RADAR_CY"
+              :x2="end.x"
+              :y2="end.y"
+              stroke="var(--border-color, #e5e5e5)"
+              stroke-width="1"
+            />
+            <!-- 数据多边形 -->
+            <polygon
+              :points="radarPolygonPoints"
+              fill="#e74c3c"
+              fill-opacity="0.25"
+              stroke="#e74c3c"
+              stroke-width="2"
+              stroke-linejoin="round"
+            />
+            <!-- 顶点小圆点 -->
+            <circle
+              v-for="(d, i) in radarData"
+              :key="`dot-${i}`"
+              :cx="radarPoint(i, (Math.max(0, Math.min(100, d.score)) / 100) * RADAR_R).x"
+              :cy="radarPoint(i, (Math.max(0, Math.min(100, d.score)) / 100) * RADAR_R).y"
+              r="3.5"
+              fill="white"
+              stroke="#e74c3c"
+              stroke-width="2"
+            />
+            <!-- 维度标签 -->
+            <text
+              v-for="(pos, i) in radarLabelPos"
+              :key="`lbl-${i}`"
+              :x="pos.x"
+              :y="pos.y"
+              text-anchor="middle"
+              dominant-baseline="central"
+              font-size="12"
+              font-weight="600"
+              fill="var(--text-primary, #333)"
+            >{{ RADAR_LABELS[i] }}</text>
+            <!-- 顶点分数 -->
+            <text
+              v-for="(pos, i) in radarScorePos"
+              :key="`sc-${i}`"
+              :x="pos.x"
+              :y="pos.y"
+              text-anchor="middle"
+              dominant-baseline="central"
+              font-size="10"
+              font-weight="700"
+              fill="#e74c3c"
+            >{{ radarData[i].score.toFixed(0) }}</text>
+          </svg>
+        </div>
+
+        <div class="bull-bear-wrap">
+          <!-- 短期 -->
+          <div class="bull-card">
+            <div class="bull-label">短期（1-2周）</div>
+            <div class="bull-view" :class="bullBearTone(report.short_term_view?.view)">
+              {{ report.short_term_view?.view ?? '—' }}
+            </div>
+            <div class="bull-score">{{ report.short_term_view?.score?.toFixed(0) ?? '—' }} / 100</div>
+            <ul v-if="report.short_term_view?.signals?.length" class="bull-signals">
+              <li v-for="(s, i) in report.short_term_view.signals" :key="i">{{ s }}</li>
+            </ul>
+          </div>
+          <!-- 中长期 -->
+          <div class="bull-card">
+            <div class="bull-label">中长期</div>
+            <div class="bull-view" :class="bullBearTone(report.long_term_view?.view)">
+              {{ report.long_term_view?.view ?? '—' }}
+            </div>
+            <div class="bull-score">{{ report.long_term_view?.score?.toFixed(0) ?? '—' }} / 100</div>
+            <ul v-if="report.long_term_view?.signals?.length" class="bull-signals">
+              <li v-for="(s, i) in report.long_term_view.signals" :key="i">{{ s }}</li>
+            </ul>
           </div>
         </div>
       </div>
@@ -379,6 +554,36 @@ const observeRiskEvents = computed(() => report.value?.major_risks?.observe_even
 .rating strong.good { color: #389e0d; }
 .rating strong.bad { color: #cf1322; }
 .market { font-size: 13px; color: var(--text-secondary); margin-top: 4px; }
+
+/* ── 五维雷达 + 多空 ─────────────────────────────── */
+.radar-block {
+  display: flex; gap: 20px; align-items: flex-start;
+  padding: 14px 12px;
+  border: 1px solid var(--border-color); border-radius: 10px;
+  margin-bottom: var(--space-md);
+  background: var(--bg-secondary, #fafafa);
+}
+.radar-wrap { flex: 0 0 auto; display: flex; justify-content: center; align-items: center; }
+.radar-svg { width: 240px; height: 240px; display: block; }
+.bull-bear-wrap { flex: 1; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.bull-card {
+  background: white; border: 1px solid var(--border-color); border-radius: 8px;
+  padding: 10px 14px;
+}
+[data-theme='dark'] .bull-card { background: var(--bg-secondary, #1a1a1a); }
+.bull-label { font-size: 12px; color: var(--text-secondary); font-weight: 600; }
+.bull-view { font-size: 20px; font-weight: 700; margin: 2px 0; }
+.bull-view.good { color: #389e0d; }
+.bull-view.mid { color: #d48806; }
+.bull-view.bad { color: #cf1322; }
+.bull-score { font-size: 11px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.bull-signals { margin: 6px 0 0; padding-left: 16px; font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+.bull-signals li { margin: 2px 0; }
+
+@media (max-width: 720px) {
+  .radar-block { flex-direction: column; align-items: center; }
+  .bull-bear-wrap { width: 100%; }
+}
 .veto-banner {
   background: #fff1f0;
   border: 1px solid #ffa39e;
