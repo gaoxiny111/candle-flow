@@ -143,8 +143,36 @@ class GrowthAnalyzer(BaseAnalyzer):
         cagr_drag = profit_cagr_3y < 0 or rev_cagr_3y < 0
         v_shape = False
         marginal_recovery = False
+        # 周期股识别：营收同比放宽（主动收缩贸易≠衰退）
+        cycle_industries = ("煤炭", "焦炭", "有色", "钢铁", "化工", "航运", "港口", "开采", "化肥", "磷", "矿")
+        industry_str = str(kwargs.get("industry") or "")
+        is_cycle = any(k in industry_str for k in cycle_industries)
         if not profit_illusion and cagr_drag and yoy_p is not None and yoy_r is not None:
-            if yoy_p >= 8 and yoy_r >= 0:
+            # 周期股：营收同比允许为负（主动收缩低毛利业务），只要求净利转正
+            if is_cycle:
+                if yoy_p >= 5 and yoy_r >= -15:
+                    v_shape = True
+                    strong = yoy_p >= 15
+                    indicators.append(
+                        IndicatorResult(
+                            name="成长拐点",
+                            value=round(yoy_p, 2),
+                            score=82.0 if strong else 76.0,
+                            level=AnalysisLevel.GOOD,
+                            trend="up",
+                            weight=3.0,
+                            period=yoy_period,
+                            comment=(
+                                "周期底部复苏：历史CAGR为负但净利同比转正"
+                                f"（营收同比{yoy_r:+.1f}%为主动收缩低毛利贸易/周期特征）"
+                            ),
+                        )
+                    )
+                    warnings.append(
+                        "近3年净利润复合增速为负，但最新报告期已现拐点，需观察持续性"
+                    )
+            # 非周期股原逻辑
+            elif yoy_p >= 8 and yoy_r >= 0:
                 v_shape = True
                 strong = yoy_p >= 20
                 indicators.append(
@@ -166,9 +194,13 @@ class GrowthAnalyzer(BaseAnalyzer):
                 warnings.append(
                     "近3年净利润复合增速为负，但最新报告期已现拐点，需观察持续性"
                 )
-            elif yoy_p >= 0 and yoy_r >= 3:
-                # 边际改善：营收明显企稳、利润止跌回升（含个位数正增长）
-                marginal_recovery = True
+            # 边际改善
+            if not v_shape:
+                # 周期股：营收同比放宽至 ≥-10%（允许小幅收缩）
+                if is_cycle and yoy_p >= 0 and yoy_r >= -10:
+                    marginal_recovery = True
+                elif not is_cycle and yoy_p >= 0 and yoy_r >= 3:
+                    marginal_recovery = True
                 ded_note = ""
                 # 扣非改善：主业修复信号（神华中报扣非强于归母时常出现）
                 ded_yoy = kwargs.get("deducted_yoy_pct")

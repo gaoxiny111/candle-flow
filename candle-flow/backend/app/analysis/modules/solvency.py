@@ -86,6 +86,16 @@ class SolvencyAnalyzer(BaseAnalyzer):
             and (ibd_ratio is None or float(ibd_ratio) < 20)
             and (debt_ratio is None or float(debt_ratio) < 45)
         )
+        # 周期/资源股：存货（矿石/化肥等）变现强，速动比率口径失真
+        cycle_industries = ("煤炭", "焦炭", "有色", "钢铁", "化工", "航运", "港口", "开采", "化肥", "磷", "矿", "石油", "天然气", "农化", "农药")
+        industry_str = str(kwargs.get("industry") or "")
+        is_cycle_asset = any(k in industry_str for k in cycle_industries)
+        # 有息负债率 < 30% 且经营负债主导 → 也视为产业链强势
+        if not supply_chain_power and is_cycle_asset and ibd_ratio is not None:
+            if float(ibd_ratio) < 30 and op_liab > 1e9:
+                supply_chain_power = True
+        # 周期股补充：速动比率口径对重资产资源股失真（存货变现强）
+        cycle_supplement = is_cycle_asset and ibd_ratio is not None and float(ibd_ratio) < 35
 
         current_ratio = kwargs.get("current_ratio")
         if current_ratio is None and bs.get("current_ratio") is not None:
@@ -130,6 +140,13 @@ class SolvencyAnalyzer(BaseAnalyzer):
                     cr_comment = (
                         f"账面流动比率 {cr:.2f}；现金奶牛/产业链强势下经营性负债≠偿债风险，已降权"
                     )
+            elif cycle_supplement:
+                # 周期股补充：存货变现强，流动比率口径同样失真
+                cr_weight = 1.2
+                score_cr = max(score_cr, 60.0)
+                cr_comment = (
+                    f"账面流动比率 {cr:.2f}；周期股存货变现强，传统制造业口径已降权"
+                )
             indicators.append(
                 IndicatorResult(
                     name="流动比率",
@@ -160,6 +177,14 @@ class SolvencyAnalyzer(BaseAnalyzer):
                 else:
                     score_qr = max(score_qr, 70.0)
                     qr_comment = f"账面速动比率 {qr:.2f}；产业链强势龙头已降权传统速动口径"
+            elif cycle_supplement:
+                # 周期/资源股：存货（矿石/化肥）变现能力强，速动比率口径失真
+                qr_weight = 0.6
+                score_qr = max(score_qr, 65.0)
+                qr_comment = (
+                    f"账面速动比率 {qr:.2f}；周期/资源股存货变现强，"
+                    "传统制造业速动口径失真，已降权并提底分"
+                )
             indicators.append(
                 IndicatorResult(
                     name="速动比率",
