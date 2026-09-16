@@ -532,10 +532,19 @@ class FundamentalEngine:
 
         if is_div:
             # 红利资产：PEG 成长尺子不适用
+            # 彻底清空 value/current/growth_rate/growth_label，
+            # 避免前端仍展示 13.9 这类失真数字误导用户
             if "PEG" in rel:
+                rel["PEG"]["value"] = None
+                rel["PEG"]["current"] = None
+                rel["PEG"]["growth_rate"] = None
+                rel["PEG"]["growth_label"] = None
                 rel["PEG"]["signal"] = "—"
                 rel["PEG"]["skipped_for_dividend_asset"] = True
-                rel["PEG"]["note"] = "高股息/红利资产不适用 PEG 成长估值"
+                rel["PEG"]["note"] = (
+                    "高股息/红利资产不适用 PEG 成长估值；"
+                    "建议改看股息率利差、分红确定性与 EV/EBITDA"
+                )
             # 历史分位偏高 ≠ 泡沫：降级为「合理偏高」说明，不参与「高估」扣分
             for _mk in ("PE_TTM", "PB"):
                 if _mk in rel:

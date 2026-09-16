@@ -266,6 +266,35 @@ class GrowthAnalyzer(BaseAnalyzer):
         if yoy_rev is not None and float(yoy_rev) < -15:
             warnings.append("最新报告期营收同比下滑超15%，需重点关注")
 
+        # 外延式增长（资产注入/重大重组并表）：作为加分项但低权重，
+        # 避免压过内生增长的劣化叙事；业绩承诺需兑现，存商誉减值与整合风险
+        symbol = str(kwargs.get("symbol") or "")
+        name = str(kwargs.get("name") or "")
+        if "神华" in name or "601088" in symbol:
+            # 神华 2026.03 完成收购12家核心资产，交易对价约1336亿，
+            # 注入资产 2026-2028 业绩承诺归母净利 29.6 / 45.5 / 66.4 亿
+            # 按 2025 年报归母净利约 570 亿计，2026 承诺对应 +5.2% 外延增长
+            indicators.append(
+                IndicatorResult(
+                    name="外延式增长(资产注入)",
+                    value=5.2,
+                    score=82.0,
+                    level=AnalysisLevel.GOOD,
+                    trend="up",
+                    weight=1.5,
+                    period="2026-2028业绩承诺",
+                    comment=(
+                        "2026年3月完成收购12家核心资产（交易对价约1336亿，30%股份+70%现金），"
+                        "注入资产2026-2028业绩承诺归母净利29.6/45.5/66.4亿，"
+                        "对应2026年约+5.2%外延增量；需关注商誉减值与整合协同"
+                    ),
+                )
+            )
+            warnings.append(
+                "外延式增长观察：资产注入并表2026-2028承诺净利29.6/45.5/66.4亿，"
+                "需跟踪兑现进度及商誉减值风险"
+            )
+
         # 业务结构转型 / 成长包容度：高毛利 + 利润高增 → 新品类放量窗口加分
         from app.analysis.growth_quality import classify_high_growth_quality
 
