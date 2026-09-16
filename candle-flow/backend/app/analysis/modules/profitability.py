@@ -5,6 +5,7 @@ import pandas as pd
 from app.analysis.base import AnalysisLevel, BaseAnalyzer, IndicatorResult, ModuleResult, format_report_period, score_to_level
 from app.analysis.dividend_profile import DIVIDEND_ASSET_WACC_PCT, classify_dividend_asset
 from app.analysis.growth_quality import HIGH_GROWTH_WACC_PCT, classify_high_growth_quality
+from app.analysis.growth_profile import classify_growth_stock
 
 
 def _estimate_wacc_pct(
@@ -93,6 +94,19 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
 
         # 周期/蓝筹 ROE：12%+ 已属优秀（对照神华等龙头报告）
         roe_score, roe_level = self._score_by_range(roe, (12, 100), (8, 12), (5, 8))
+        roe_comment_suffix = ""
+        # 成长股/周期底部：ROE 标注异常低谷，降权 30%
+        _roe_is_growth = classify_growth_stock(
+            symbol=kwargs.get("symbol"),
+            gross_margin_pct=kwargs.get("latest_gross_margin"),
+            revenue_yoy=kwargs.get("revenue_yoy"),
+            profit_yoy=kwargs.get("profit_yoy"),
+            pe_ttm=kwargs.get("pe_ttm"),
+        ).get("is_growth_stock")
+        if _roe_is_growth and roe < 5:
+            roe_score = round(roe_score * 0.7, 1)
+            roe_level = score_to_level(roe_score)
+            roe_comment_suffix = "；周期底部异常值，已降权评估"
         indicators.append(
             IndicatorResult(
                 name="ROE(%)",
@@ -101,7 +115,7 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
                 level=roe_level,
                 trend=self._calc_trend(roe_series),
                 weight=3.0,
-                comment=f"杜邦: 净利率{net_margin:.1%} × 周转{asset_turnover:.2f} × 权益乘数{equity_multiplier:.2f}",
+                comment=f"杜邦: 净利率{net_margin:.1%} × 周转{asset_turnover:.2f} × 权益乘数{equity_multiplier:.2f}{roe_comment_suffix}",
                 period=annual_period,
             )
         )
@@ -155,6 +169,19 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
             payout_ratio_pct=kwargs.get("payout_ratio_pct"),
         )
         is_div = bool(div_profile.get("is_dividend_asset"))
+
+        # 成长股/周期底部反转识别（用于 ROIC/ROE 降权）
+        gs = classify_growth_stock(
+            symbol=kwargs.get("symbol"),
+            gross_margin_pct=float(profile_gm) if profile_gm is not None else None,
+            revenue_yoy=kwargs.get("revenue_yoy"),
+            profit_yoy=kwargs.get("profit_yoy"),
+            profit_cagr_3y=None,  # 由 engine 传 metadata，模块内不算
+            pe_ttm=kwargs.get("pe_ttm"),
+            is_high_growth_quality=is_hgq,
+            is_dividend_asset=is_div,
+        )
+        is_growth_stock = bool(gs.get("is_growth_stock"))
         debt_ratio = kwargs.get("debt_ratio")
         wacc_pct = _estimate_wacc_pct(
             float(debt_ratio) if debt_ratio is not None else None,
@@ -192,7 +219,7 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
                 else ("高成长赛道WACC" if is_hgq else "WACC")
             )
             if roic < wacc_pct:
-                if is_div or is_hgq:
+                if is_div or is_hgq or is_growth_stock:
                     roic_below_wacc = False
                     if is_div:
                         dy = div_profile.get("dividend_yield_pct")
@@ -205,6 +232,17 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
                         warnings.append(
                             f"ROIC({roic:.1f}%)略低于红利口径WACC(≈{wacc_pct:.1f}%)，"
                             f"但高股息资产以分红回报为主，不按价值否决处理"
+                        )
+                    elif is_growth_stock and not is_hgq:
+                        # 周期底部反转：ROIC<WACC 是底部特征，不作否决
+                        roic_comment = (
+                            f"ROIC {roic:.1f}% < WACC≈{wacc_pct:.0f}%："
+                            f"周期底部/成长股特征，当前 ROE/ROIC 为异常低谷值，"
+                            f"参考营收增速与拐点确认评估真实盈利能力"
+                        )
+                        warnings.append(
+                            f"周期底部反转：ROIC({roic:.1f}%)低于WACC(≈{wacc_pct:.0f}%)，"
+                            f"为低谷特征不作价值否决；关注拐点持续性"
                         )
                     else:
                         gm = growth_profile.get("gross_margin_pct")

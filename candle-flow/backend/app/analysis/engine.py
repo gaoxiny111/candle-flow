@@ -27,6 +27,7 @@ from app.analysis.dividend_profile import (
     dividend_valuation_note,
 )
 from app.analysis.growth_quality import HIGH_GROWTH_WACC_PCT, classify_high_growth_quality
+from app.analysis.growth_profile import classify_growth_stock
 from app.analysis.financials import build_financial_dataframe, industry_averages
 from app.analysis.models.dcf import DCFModel
 from app.analysis.models.ddm import DDMModel
@@ -276,6 +277,35 @@ class FundamentalEngine:
 
         composite = _compose(val_score)
         letter = rating_label(composite)
+
+        # ── 成长股/周期底部反转识别 ──────────────────────────
+        growth_mod = module_results.get("growth")
+        prof_mod = module_results.get("profitability")
+        # 先尝试从已算好的 valuation 中拿 is_dividend_asset（如果有）
+        _is_div_hint = bool((valuation or {}).get("is_dividend_asset")) if valuation else False
+        gs = classify_growth_stock(
+            symbol=sym,
+            gross_margin_pct=(
+                growth_quality.gross_margin_pct
+                if (growth_quality := (valuation.get("growth_quality") or {}))
+                else None
+            ),
+            revenue_yoy=meta.get("revenue_yoy"),
+            profit_yoy=meta.get("profit_yoy"),
+            profit_cagr_3y=float(growth_mod.metadata.get("profit_cagr_3y") or -99)
+            if growth_mod
+            else None,
+            pe_ttm=market.get("pe_ttm"),
+            is_v_shape=bool(growth_mod.metadata.get("v_shape")) if growth_mod else False,
+            is_marginal_recovery=bool(growth_mod.metadata.get("marginal_recovery"))
+            if growth_mod
+            else False,
+            is_high_growth_quality=bool(valuation.get("is_high_growth_quality")),
+            is_dividend_asset=_is_div_hint,
+        )
+        if prof_mod is not None:
+            prof_mod.metadata["is_growth_stock"] = gs.get("is_growth_stock")
+            prof_mod.metadata["growth_stock_tier"] = gs.get("tier")
 
         # 价值陷阱：E 档 / ROIC<WACC / ST·退市·连续亏损 → 估值分锁定 ≤28
         val_score, valuation, composite, letter = self._apply_value_trap_veto(
@@ -610,6 +640,53 @@ class FundamentalEngine:
         result["dividend_profile"] = div_profile
         result["is_dividend_asset"] = is_div
 
+        # ── 成长股/周期底部反转识别（用于估值框架切换） ──────────────
+        # 这里只算 growth_stock_tier，不影响 value_trap_veto（那个在 run_full_analysis 前）
+        gs_ctx = classify_growth_stock(
+            symbol=meta.get("symbol"),
+            gross_margin_pct=meta.get("latest_gross_margin"),
+            revenue_yoy=meta.get("revenue_yoy"),
+            profit_yoy=meta.get("profit_yoy"),
+            profit_cagr_3y=float(
+                fin_df["net_profit"].pct_change(3).dropna().iloc[-1] * 100
+            )
+            if len(fin_df) >= 4 and "net_profit" in fin_df.columns
+            else None,
+            pe_ttm=pe,
+            is_high_growth_quality=bool(result.get("is_high_growth_quality")),
+            is_dividend_asset=is_div,
+        )
+        is_growth = bool(gs_ctx.get("is_growth_stock"))
+        result["growth_stock_profile"] = gs_ctx
+        result["is_growth_stock"] = is_growth
+
+        # ── 成长股：PE/PB 极端值（周期底部/高增长）不直接判高估 ─────
+        if is_growth and not is_div:
+            for _mk in ("PE_TTM", "PB"):
+                if _mk in rel:
+                    if _mk == "PE_TTM" and pe is not None and float(pe) > 80:
+                        rel[_mk]["signal"] = "合理"
+                        rel[_mk]["growth_percentile_softened"] = True
+                        rel[_mk]["note"] = (
+                            f"PE {float(pe):.0f}x 为周期底部/高增长特征，"
+                            "trailing PE 失真，参考 PS/营收增速/毛利率"
+                        )
+                    elif _mk == "PB" and pb is not None and float(pb) > 8:
+                        rel[_mk]["signal"] = "合理"
+                        rel[_mk]["growth_percentile_softened"] = True
+                        rel[_mk]["note"] = (
+                            f"PB {float(pb):.1f}x 为成长股/周期底部特征，"
+                            "参考技术壁垒（毛利率）与赛道景气度"
+                        )
+            if "PEG" in rel and (
+                rel["PEG"].get("growth_rate") is not None
+                and float(rel["PEG"]["growth_rate"]) <= 0
+            ):
+                rel["PEG"]["value"] = None
+                rel["PEG"]["current"] = None
+                rel["PEG"]["signal"] = "—"
+                rel["PEG"]["note"] = "成长股/周期底部：负CAGR使PEG失真，参考PS与营收增速"
+
         if is_div:
             # 红利资产：PEG 成长尺子不适用
             # 彻底清空 value/current/growth_rate/growth_label，
@@ -733,6 +810,29 @@ class FundamentalEngine:
                 _add_points("可比公司", 82, "相对可比低估")
             elif comps_signal == "高估":
                 _add_points("可比公司", 40, "相对可比高估")
+            # ── 成长股估值框架补充 ───────────────────────────────────────
+            if is_growth:
+                # 毛利率溢价（技术壁垒代理）
+                gm = meta.get("latest_gross_margin")
+                if gm is not None:
+                    gm = float(gm)
+                    if gm >= 50:
+                        _add_points("毛利率溢价", 88, f"毛利率{gm:.0f}% 技术壁垒强")
+                    elif gm >= 40:
+                        _add_points("毛利率溢价", 76, f"毛利率{gm:.0f}% 有技术壁垒")
+                # 营收增速（赛道景气度代理）
+                ry = meta.get("revenue_yoy")
+                if ry is not None:
+                    ry = float(ry)
+                    if ry >= 30:
+                        _add_points("营收增速", 88, f"营收同比+{ry:.0f}% 高景气")
+                    elif ry >= 15:
+                        _add_points("营收增速", 75, f"营收同比+{ry:.0f}% 景气")
+                    elif ry >= 0:
+                        _add_points("营收增速", 60, f"营收同比+{ry:.0f}%")
+                # 周期底部反转加分
+                if gs_ctx.get("tier") == "turnaround":
+                    _add_points("周期反转溢价", 72, "CAGR负但拐点确认，底部区域")
             base_score = sum(scores) / len(scores) if scores else 55.0
         rationale_parts: list[str] = []
         if is_div:
@@ -745,6 +845,11 @@ class FundamentalEngine:
             )
             rationale_parts.append(
                 "红利/高股息口径：以股息率、分红比例、国债利差与现金流覆盖为主，弱化 PE/PB/PEG 历史分位"
+            )
+        elif is_growth:
+            rationale_parts.append(
+                "成长/周期反转口径：PE/PB 极端值不直接判高估，"
+                "参考毛利率（技术壁垒）、营收增速（赛道景气）与周期位置"
             )
         if breakdown:
             parts = [f"{b['factor']}{b['points']:.0f}" for b in breakdown]
@@ -835,9 +940,11 @@ class FundamentalEngine:
             if "存在退市/ST风险标识" not in reasons:
                 reasons.append("证券简称含ST/退")
 
-        # 高股息/高成长赛道：ROIC<WACC 不得作为价值陷阱理由
+        # 高股息/高成长赛道/周期底部反转：ROIC<WACC 不得作为价值陷阱理由
         if prof is not None and (
-            prof.metadata.get("is_dividend_asset") or prof.metadata.get("is_high_growth_quality")
+            prof.metadata.get("is_dividend_asset")
+            or prof.metadata.get("is_high_growth_quality")
+            or prof.metadata.get("is_growth_stock")
         ):
             reasons = [r for r in reasons if r != "ROIC低于WACC"]
 
