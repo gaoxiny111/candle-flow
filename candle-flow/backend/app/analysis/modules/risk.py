@@ -69,6 +69,29 @@ class RiskAnalyzer(BaseAnalyzer):
                 warnings.append(msg)
                 risk_score -= deduct
 
+        # 应收账款周转天数量化（新浪审计口径，神华等周期股轻扣分）
+        ar_metrics = kwargs.get("ar_metrics")
+        if ar_metrics:
+            days_latest = ar_metrics.get("days_latest")
+            days_5y = ar_metrics.get("days_5y_ago")
+            days_delta = ar_metrics.get("days_delta_5y")
+            notes_yoy = ar_metrics.get("notes_yoy_pct")
+            parts: list[str] = []
+            if days_latest is not None and days_5y is not None and days_delta is not None:
+                parts.append(
+                    f"应收账款周转天数从{float(days_5y):.1f}天升至{float(days_latest):.1f}天"
+                    f"（五年+{float(days_delta):.1f}天）"
+                )
+            if notes_yoy is not None and float(notes_yoy) > 30:
+                parts.append(f"应收票据同比+{float(notes_yoy):.0f}%")
+            if parts:
+                parts.append("反映下游付款节奏放缓")
+                if bool(div_profile_early.get("is_dividend_asset")) or any(k in industry for k in ("煤炭", "焦炭", "煤业", "开采")):
+                    risk_score -= 3
+                else:
+                    risk_score -= 6
+                warnings.append("，".join(parts))
+
         cash = float(latest.get("monetary_funds", 0) or 0)
         short_debt = float(latest.get("short_term_borrowings", 0) or kwargs.get("short_term_borrowings") or 0)
         ibd = kwargs.get("interest_bearing_debt")
@@ -121,6 +144,13 @@ class RiskAnalyzer(BaseAnalyzer):
             if is_div:
                 warnings.append(
                     "红利资产观察：高股息可持续性依赖经营现金流与分红承诺兑现"
+                )
+            # 资产注入并表（神华2026重大变量）
+            if "神华" in name or "601088" in str(kwargs.get("symbol") or ""):
+                warnings.append(
+                    "资产注入并表（观察）：交易对价约1336亿（30%股份+70%现金），"
+                    "注入资产2026-2028业绩承诺净利29.6/45.5/66.4亿；"
+                    "关注商誉减值风险及整合协同效应"
                 )
 
         ocf = ocf_early

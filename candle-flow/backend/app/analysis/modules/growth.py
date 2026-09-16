@@ -171,10 +171,14 @@ class GrowthAnalyzer(BaseAnalyzer):
                 marginal_recovery = True
                 ded_note = ""
                 # 扣非改善：主业修复信号（神华中报扣非强于归母时常出现）
+                ded_yoy = kwargs.get("deducted_yoy_pct")
                 if deducted is not None and parent_np is not None:
                     try:
                         if float(deducted) > 0 and float(parent_np) > 0:
-                            ded_note = "；扣非净利同步改善，主业盈利韧性增强"
+                            if ded_yoy is not None and float(ded_yoy) > 0:
+                                ded_note = f"；扣非同比+{float(ded_yoy):.1f}%，主业修复更强"
+                            else:
+                                ded_note = "；扣非净利同步改善，主业盈利韧性增强"
                     except (TypeError, ValueError):
                         pass
                 cycle_industries = ("煤炭", "焦炭", "有色", "钢铁", "化工", "航运", "港口", "开采")
@@ -211,6 +215,46 @@ class GrowthAnalyzer(BaseAnalyzer):
                 for ind in indicators:
                     if "CAGR" in ind.name:
                         ind.weight = 1.2
+                # 单季业绩加速（Q2 环比/同比大幅改善 → 修复力度超预期）
+                sq = kwargs.get("single_quarter")
+                if sq and sq.get("net_profit") is not None:
+                    sq_yoy = sq.get("yoy_pct")
+                    sq_qoq = sq.get("qoq_pct")
+                    if sq_yoy is not None and sq_qoq is not None:
+                        # 修复力度超预期 → 加分项
+                        if float(sq_yoy) >= 30 or float(sq_qoq) >= 50:
+                            sq_score = 86.0
+                            sq_comment = (
+                                f"Q2单季净利环比+{float(sq_qoq):.0f}%、同比+{float(sq_yoy):.0f}%，"
+                                f"修复力度超预期"
+                            )
+                        elif float(sq_yoy) >= 15 or float(sq_qoq) >= 30:
+                            sq_score = 82.0
+                            sq_comment = (
+                                f"Q2单季净利环比+{float(sq_qoq):.0f}%、同比+{float(sq_yoy):.0f}%，"
+                                f"修复力度较强"
+                            )
+                        else:
+                            sq_score = 75.0
+                            sq_comment = (
+                                f"Q2单季净利环比+{float(sq_qoq):.0f}%、同比+{float(sq_yoy):.0f}%"
+                            )
+                        # 扣非增速补充
+                        ded_yoy = kwargs.get("deducted_yoy_pct")
+                        if ded_yoy is not None and float(ded_yoy) > 0:
+                            sq_comment += f"；扣非同比+{float(ded_yoy):.1f}%，主业修复更强"
+                        indicators.append(
+                            IndicatorResult(
+                                name="单季业绩加速",
+                                value=round(float(sq_yoy), 2),
+                                score=sq_score,
+                                level=AnalysisLevel.GOOD,
+                                trend="up",
+                                weight=2.8,
+                                period=sq.get("label") or yoy_period,
+                                comment=sq_comment,
+                            )
+                        )
                 warnings.append(
                     "近3年复合增速为负，但最新报告期已现边际修复"
                     "（周期企稳+主业/多业务改善），非纯粹衰退通道"

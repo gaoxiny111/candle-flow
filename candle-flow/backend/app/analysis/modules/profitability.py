@@ -287,7 +287,7 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
                 IndicatorResult(
                     name="股息率(%)",
                     value=round(dy, 2),
-                    score=90.0 if dy >= 5 else 78.0,
+                    score=90.0 if dy >= 5 else (88.0 if dy >= 4 else 78.0),
                     level=AnalysisLevel.EXCELLENT if dy >= 5 else AnalysisLevel.GOOD,
                     weight=2.0,
                     comment=(

@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 # 中国十年期国债收益率近似（百分点）；作股息利差锚，可日后改为实时抓取
-CN_10Y_BOND_YIELD_PCT = 2.0
+# 2026 年 10Y 国债收益率中枢约 1.7%（1 年期 MLF 多次调降后的低利率环境）
+CN_10Y_BOND_YIELD_PCT = 1.7
 
 HIGH_DIV_YIELD_PCT = 5.0
 SOFT_DIV_YIELD_PCT = 4.0

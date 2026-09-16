@@ -105,6 +105,58 @@ def fetch_deducted_parent_netprofit(symbol: str, report_date: str | None = None)
     return None
 
 
+def fetch_deducted_yoy(symbol: str, report_date: str | None = None) -> float | None:
+    """扣非归母净利同比（%）：取最近两期 DEDUCT_PARENT_NETPROFIT 计算（支持中报对比）。"""
+    import requests
+
+    code = _income_code(symbol)
+    if not code:
+        return None
+    try:
+        r = requests.get(
+            "https://datacenter-web.eastmoney.com/api/data/v1/get",
+            params={
+                "reportName": "RPT_DMSK_FN_INCOME",
+                "columns": "SECURITY_CODE,REPORT_DATE,DEDUCT_PARENT_NETPROFIT",
+                "filter": f'(SECURITY_CODE="{code}")',
+                "pageNumber": "1",
+                "pageSize": "12",
+                "sortColumns": "REPORT_DATE",
+                "sortTypes": "-1",
+                "source": "WEB",
+                "client": "WEB",
+            },
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://data.eastmoney.com/"},
+            timeout=12,
+        )
+        if not r.ok:
+            return None
+        rows = ((r.json() or {}).get("result") or {}).get("data") or []
+    except Exception:
+        return None
+
+    by_date: dict[str, float] = {}
+    for row in rows:
+        rd = str(row.get("REPORT_DATE") or "")[:10].replace("-", "")
+        v = row.get("DEDUCT_PARENT_NETPROFIT")
+        if len(rd) == 8 and v is not None:
+            by_date[rd] = float(v)
+
+    cur = report_date.replace("-", "")[:8] if report_date else None
+    if cur and cur in by_date:
+        y_ago = f"{int(cur[:4]) - 1}{cur[4:]}"
+        cur_v, prev_v = by_date.get(cur), by_date.get(y_ago)
+    elif rows:
+        cur_v = rows[0].get("DEDUCT_PARENT_NETPROFIT")
+        rd0 = str(rows[0].get("REPORT_DATE") or "")[:10].replace("-", "")
+        prev_v = by_date.get(f"{int(rd0[:4]) - 1}{rd0[4:]}") if len(rd0) == 8 else None
+    else:
+        return None
+    if cur_v is None or prev_v is None or abs(float(prev_v)) < 1e-6:
+        return None
+    return round((float(cur_v) / float(prev_v) - 1) * 100, 2)
+
+
 def _income_code(symbol: str) -> str:
     from app.utils.symbol import SymbolError, normalize_symbol, parse_symbol
 
@@ -182,6 +234,149 @@ def _debt_ratio_fallback(symbol: str, equity: float | None, total_assets: float 
         # 资产负债率 ≈ 1 - 权益/总资产
         return round(max(0.0, min(100.0, (1 - equity / total_assets) * 100)), 2)
     return None
+
+
+def _sina_to_zcfz(row: dict[str, Any]) -> dict[str, Any] | None:
+    """新浪原始资产负债表行 → 与 _parse_em_zcfz_row 同构的偿债简表。"""
+    from app.analysis.sina_financials import interest_bearing_debt
+
+    ta = row.get("total_assets")
+    tl = row.get("total_liabilities")
+    if not ta or not tl or float(ta) <= 0:
+        return None
+    ibd = interest_bearing_debt(row)
+    return {
+        "debt_ratio": round(float(tl) / float(ta) * 100, 2),
+        "total_assets": float(ta),
+        "total_liabilities": float(tl),
+        "monetary_funds": row.get("monetary_funds"),
+        "accounts_receivable": row.get("accounts_receivable"),
+        "inventory": row.get("inventory"),
+        "accounts_payable": row.get("accounts_payable"),
+        "advance_receipts": row.get("advance_receipts"),
+        "tax_payable": row.get("tax_payable"),
+        "staff_salary_payable": row.get("staff_salary_payable"),
+        "other_payable": row.get("other_payable"),
+        "interest_bearing_debt": float(ibd),
+        "short_term_borrowings": float(row.get("short_term_borrowings") or 0),
+        "long_term_borrowings": float(row.get("long_term_borrowings") or 0),
+        "non_current_due_within_1y": row.get("non_current_due_within_1y"),
+        "bonds_payable": row.get("bonds_payable"),
+        "interest_bearing_explicit": 1.0,
+        "notes_receivable": row.get("notes_receivable"),
+        "source": "sina_original",
+    }
+
+
+_QUARTER_PREV_MD = {"0331": None, "0630": "0331", "0930": "0630", "1231": "0930"}
+_QUARTER_NO = {"0331": 1, "0630": 2, "0930": 3, "1231": 4}
+
+
+def _single_quarter_from_sina(
+    is_map: dict[str, dict[str, float | None]], report_date: str | None
+) -> dict[str, Any] | None:
+    """累计利润表差分 → 最新单季归母净利及同比/环比（如 2026Q2 同比+42%、环比+69%）。"""
+    ymd = str(report_date or "").replace("-", "")[:8]
+    if len(ymd) != 8:
+        return None
+    y, md = int(ymd[:4]), ymd[4:]
+    q = _QUARTER_NO.get(md)
+    if q is None:
+        return None
+
+    def _np(year: int, mdx: str) -> float | None:
+        row = is_map.get(f"{year}{mdx}")
+        if not row:
+            return None
+        v = row.get("parent_net_profit")
+        return float(v) if v is not None else None
+
+    cur_cum = _np(y, md)
+    prev_cum = _np(y - 1, md)
+    if cur_cum is None or prev_cum is None:
+        return None
+    if q == 1:
+        cur_sq, prev_sq = cur_cum, prev_cum
+    else:
+        prev_md = _QUARTER_PREV_MD[md]
+        a, b = _np(y, prev_md), _np(y - 1, prev_md)
+        if a is None or b is None:
+            return None
+        cur_sq, prev_sq = cur_cum - a, prev_cum - b
+    # 环比上一单季
+    if q == 1:
+        q4_prev_year = _np(y - 1, "1231")
+        q3_prev_year = _np(y - 1, "0930")
+        prev_sq_qoq = (
+            q4_prev_year - q3_prev_year
+            if q4_prev_year is not None and q3_prev_year is not None
+            else None
+        )
+    else:
+        # 上一单季净利：Q2→Q1累计（即Q1单季）；Q3→Q2单季=Q2累计−Q1累计；Q4→Q3单季
+        prev_md = _QUARTER_PREV_MD[md]
+        prev_cum_for_qoq = _np(y, prev_md)
+        if q == 2:
+            prev_sq_qoq = prev_cum_for_qoq
+        else:
+            prev_prev_md = _QUARTER_PREV_MD[prev_md]
+            prev_prev_cum = _np(y, prev_prev_md)
+            if prev_cum_for_qoq is not None and prev_prev_cum is not None:
+                prev_sq_qoq = prev_cum_for_qoq - prev_prev_cum
+            else:
+                prev_sq_qoq = None
+    yoy = (cur_sq / prev_sq - 1) * 100 if prev_sq else None
+    qoq = (cur_sq / prev_sq_qoq - 1) * 100 if prev_sq_qoq else None
+    return {
+        "label": f"{y}Q{q}",
+        "report_date": ymd,
+        "net_profit": cur_sq,
+        "yoy_pct": round(yoy, 1) if yoy is not None else None,
+        "qoq_pct": round(qoq, 1) if qoq is not None else None,
+    }
+
+
+def _ar_metrics_from_sina(
+    bs_map: dict[str, dict[str, float | None]],
+    is_map: dict[str, dict[str, float | None]],
+    annual_dates: list[str],
+) -> dict[str, Any] | None:
+    """应收账款周转天数（期末口径，AR/营收×365）五年变化 + 应收票据同比。"""
+    ann = sorted(d for d in annual_dates if str(d).endswith("1231"))
+    if not ann:
+        return None
+
+    def _days(ymd: str) -> float | None:
+        b, i = bs_map.get(ymd), is_map.get(ymd)
+        if not b or not i:
+            return None
+        ar, rev = b.get("accounts_receivable"), i.get("revenue")
+        if ar is None or rev is None or float(rev) <= 0:
+            return None
+        return float(ar) / float(rev) * 365.0
+
+    latest = ann[-1]
+    days_latest = _days(latest)
+    if days_latest is None:
+        return None
+    out: dict[str, Any] = {
+        "period": f"{latest[:4]}年报",
+        "days_latest": round(days_latest, 1),
+        "days_5y_ago": None,
+        "days_delta_5y": None,
+        "notes_yoy_pct": None,
+    }
+    old = f"{int(latest[:4]) - 5}1231"
+    days_old = _days(old)
+    if days_old is not None:
+        out["days_5y_ago"] = round(days_old, 1)
+        out["days_delta_5y"] = round(days_latest - days_old, 1)
+    b_now, b_prev = bs_map.get(latest), bs_map.get(ann[-2]) if len(ann) >= 2 else None
+    if b_now and b_prev:
+        n_now, n_prev = b_now.get("notes_receivable"), b_prev.get("notes_receivable")
+        if n_now and n_prev and float(n_prev) > 0:
+            out["notes_yoy_pct"] = round((float(n_now) / float(n_prev) - 1) * 100, 1)
+    return out
 
 
 def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -316,25 +511,157 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
             meta["latest_gross_margin"] = latest_gm
         meta["income_enriched"] = True
 
-    # 资产负债率：必须优先年报；用个股资产负债表，避免全市场 zcfz 分页
+    # 新浪原始披露口径校准（东财在同一控制下企业合并后会追溯重述历史报表，
+    # 如神华 2026 年资产注入后，东财 2025 年报被改写为总资产 9038 亿/负债率 33.2%）
+    import datetime as _dt
+
+    from app.analysis.sina_financials import (
+        PAGE_BALANCE as _SINA_BS,
+        PAGE_CASHFLOW as _SINA_CF,
+        PAGE_INCOME as _SINA_IS,
+        fetch_statements as _sina_fetch,
+        free_cashflow as _sina_fcf,
+    )
+
+    _sina_years = list(range(_dt.date.today().year - 7, _dt.date.today().year + 1))
+    sina_bs_all = _sina_fetch(symbol, _SINA_BS, _sina_years)
+    sina_cf_all = _sina_fetch(symbol, _SINA_CF, _sina_years)
+    sina_is_all = _sina_fetch(symbol, _SINA_IS, _sina_years)
+    sina_bs_map = {
+        k: adapted
+        for k, v in sina_bs_all.items()
+        if (adapted := _sina_to_zcfz(v)) is not None
+    }
+
+    # 年报序列覆盖：真实 OCF / CapEx（替代 OCF×0.25 占位）与明细资产项
+    for idx in fd.index:
+        key = str(idx)
+        cf_r = sina_cf_all.get(key)
+        if cf_r:
+            if cf_r.get("operating_cashflow") is not None:
+                fd.at[idx, "operating_cashflow"] = float(cf_r["operating_cashflow"])
+            if cf_r.get("capex") is not None:
+                fd.at[idx, "capital_expenditure"] = abs(float(cf_r["capex"]))
+        b = sina_bs_map.get(key)
+        if b:
+            for col in (
+                "total_assets",
+                "monetary_funds",
+                "accounts_receivable",
+                "notes_receivable",
+                "inventory",
+                "goodwill",
+                "interest_bearing_debt",
+                "short_term_borrowings",
+            ):
+                val = b.get(col)
+                if val is not None:
+                    fd.at[idx, col] = float(val)
+
+    # 最新报告期（可中报）：经营现金流/资本开支/FCF + 单季利润 + 扣非同比
+    latest_ymd = str(meta.get("latest_report") or "")
+    if latest_ymd:
+        cf_latest = sina_cf_all.get(latest_ymd)
+        if cf_latest and cf_latest.get("operating_cashflow") is not None:
+            meta["latest_operating_cashflow"] = float(cf_latest["operating_cashflow"])
+            if cf_latest.get("capex") is not None:
+                meta["latest_capex"] = abs(float(cf_latest["capex"]))
+            fcf_latest = _sina_fcf(cf_latest)
+            if fcf_latest is not None:
+                meta["latest_fcf"] = float(fcf_latest)
+        bs_latest = sina_bs_all.get(latest_ymd)
+        if bs_latest and bs_latest.get("total_assets") and bs_latest.get("total_liabilities"):
+            from app.analysis.sina_financials import interest_bearing_debt as _ibd
+
+            _ta = float(bs_latest["total_assets"])
+            _ibd_v = _ibd(bs_latest)
+            meta["interim_balance_sheet"] = {
+                "report_date": latest_ymd,
+                "debt_ratio": round(float(bs_latest["total_liabilities"]) / _ta * 100, 2),
+                "interest_bearing_ratio": round(_ibd_v / _ta * 100, 2),
+                "total_assets": _ta,
+                "interest_bearing_debt": _ibd_v,
+                "source": "sina_original",
+            }
+        sq = _single_quarter_from_sina(sina_is_all, latest_ymd)
+        if sq:
+            meta["single_quarter"] = sq
+        if latest_ymd and not latest_ymd.endswith("1231"):
+            ded_yoy = fetch_deducted_yoy(symbol, latest_ymd)
+            if ded_yoy is not None:
+                meta["deducted_yoy_pct"] = ded_yoy
+        meta["ar_metrics"] = _ar_metrics_from_sina(sina_bs_all, sina_is_all, list(fd.index))
+
+    # 真实分红历史：D0 / 分红率 / 连续分红年限（红利框架与 DDM 输入）
+    try:
+        from app.analysis.dividend_data import fetch_dividend_history
+
+        div_hist = fetch_dividend_history(symbol)
+    except Exception:
+        div_hist = {}
+    latest_fy = div_hist.get("latest_fy") if div_hist else None
+    if latest_fy and latest_fy.get("dps"):
+        fy_ymd = f"{int(latest_fy['year'])}1231"
+        np_fy = (sina_is_all.get(fy_ymd) or {}).get("parent_net_profit")
+        if np_fy is None and fy_ymd in fd.index:
+            np_fy = float(fd.at[fy_ymd, "net_profit"]) if pd.notna(fd.at[fy_ymd, "net_profit"]) else None
+        cf_fy = sina_cf_all.get(fy_ymd)
+        fcf_fy = _sina_fcf(cf_fy) if cf_fy else None
+        cash_total = latest_fy.get("cash_total")
+        payout = (
+            round(float(cash_total) / float(np_fy) * 100, 1)
+            if cash_total and np_fy and float(np_fy) > 0
+            else None
+        )
+        meta["dividend"] = {
+            "d0": float(latest_fy["dps"]),
+            "fy": int(latest_fy["year"]),
+            "cash_total": float(cash_total) if cash_total else None,
+            "payout_ratio_pct": payout,
+            "consecutive_years": int(div_hist.get("consecutive_years") or 0),
+            "current_interim": div_hist.get("current_interim"),
+            "fcf": float(fcf_fy) if fcf_fy is not None else None,
+            "fcf_dividend_gap": (
+                round(float(fcf_fy) - float(cash_total), 2)
+                if fcf_fy is not None and cash_total
+                else None
+            ),
+        }
+        if payout is not None:
+            meta["payout_ratio_pct"] = payout
+
+    # 资产负债率：新浪原始审计口径优先，东财个股表兜底
     debt_ratio = None
     zcfz_row: dict[str, float] | None = None
     zcfz_date: str | None = None
+    zcfz_source: str | None = None
     by_date = _fetch_symbol_zcfz(symbol)
-    for cand in list(reversed(list(fd.index))):
-        item = by_date.get(str(cand))
+
+    def _pick_bs(ymd: str) -> tuple[dict | None, str | None]:
+        item = sina_bs_map.get(ymd)
         if item and item.get("debt_ratio") is not None:
-            zcfz_row = item
-            zcfz_date = str(cand)
+            return item, "sina_original"
+        item = by_date.get(ymd)
+        if item and item.get("debt_ratio") is not None:
+            return item, "eastmoney"
+        return None, None
+
+    for cand in list(reversed(list(fd.index))):
+        item, src = _pick_bs(str(cand))
+        if item:
+            zcfz_row, zcfz_date, zcfz_source = item, str(cand), src
             debt_ratio = float(zcfz_row["debt_ratio"])
             break
-    if zcfz_row is None and by_date:
-        annuals = sorted(k for k in by_date if str(k).endswith("1231"))
-        pick = annuals[-1] if annuals else sorted(by_date)[-1]
-        zcfz_row = by_date[pick]
-        zcfz_date = pick
-        if zcfz_row.get("debt_ratio") is not None:
-            debt_ratio = float(zcfz_row["debt_ratio"])
+    if zcfz_row is None:
+        for pool in (sina_bs_map, by_date):
+            annuals = sorted(k for k in pool if str(k).endswith("1231"))
+            if annuals:
+                pick = annuals[-1]
+                item, src = _pick_bs(pick)
+                if item:
+                    zcfz_row, zcfz_date, zcfz_source = item, pick, src
+                    debt_ratio = float(zcfz_row["debt_ratio"])
+                    break
     if debt_ratio is None and not fd.empty:
         last = fd.iloc[-1]
         # 无总资产时用权益粗估（负债率未知则跳过）
@@ -383,6 +710,8 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
             "current_ratio": current_ratio,
             "quick_ratio": quick_ratio,
             "estimated": not bool(zcfz_row.get("interest_bearing_explicit")),
+            "source": zcfz_source or zcfz_row.get("source") or "eastmoney",
+            "notes_receivable": zcfz_row.get("notes_receivable"),
         }
         meta["interest_bearing_ratio"] = ibd_ratio
         meta["interest_bearing_debt"] = ibd
@@ -396,7 +725,7 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
             eq = fd.at[idx, "equity"]
             if pd.isna(eq) or eq <= 0:
                 continue
-            z_item = by_date.get(str(idx)) if by_date else None
+            z_item = sina_bs_map.get(str(idx)) or (by_date.get(str(idx)) if by_date else None)
             if z_item and z_item.get("total_assets"):
                 ta = float(z_item["total_assets"])
             elif zcfz_row and zcfz_row.get("total_assets") and str(idx) == zcfz_date:

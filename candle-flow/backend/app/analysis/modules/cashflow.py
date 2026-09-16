@@ -124,6 +124,11 @@ class CashflowAnalyzer(BaseAnalyzer):
         if len(fcf.dropna()):
             fcf_val = float(fcf.iloc[-1])
             fcf_positive = int((fcf > 0).sum())
+            # FCF/净利比率：衡量自由现金流对利润的覆盖质量
+            fcf_np_ratio: float | None = None
+            np_latest = float(net_profit.dropna().iloc[-1]) if len(net_profit.dropna()) else None
+            if np_latest and abs(np_latest) > 1e-6:
+                fcf_np_ratio = fcf_val / np_latest
             if paper_wealth and fcf_val > 0:
                 fcf_score, fcf_level = 28.0, AnalysisLevel.POOR
                 fcf_comment = (
@@ -134,9 +139,27 @@ class CashflowAnalyzer(BaseAnalyzer):
                 fcf_score, fcf_level = 40.0, AnalysisLevel.POOR
                 fcf_comment = f"当期亏损但自由现金流为正，需排查营运负债变动（近{len(fcf)}期中{fcf_positive}期为正）"
             else:
-                fcf_score = 70 if fcf_val > 0 else 30
+                if fcf_val > 0:
+                    # 基础 70 分，FCF/净利比率微调
+                    if fcf_np_ratio is not None:
+                        if fcf_np_ratio >= 0.8:
+                            fcf_score = 85.0
+                        elif fcf_np_ratio >= 0.6:
+                            fcf_score = 80.0
+                        elif fcf_np_ratio >= 0.4:
+                            fcf_score = 78.0
+                        elif fcf_np_ratio >= 0.2:
+                            fcf_score = 72.0
+                        else:
+                            fcf_score = 68.0
+                    else:
+                        fcf_score = 70.0
+                else:
+                    fcf_score = 30.0
                 fcf_level = AnalysisLevel.GOOD if fcf_val > 0 else AnalysisLevel.POOR
                 fcf_comment = f"近{len(fcf)}期中有{fcf_positive}期为正"
+                if fcf_np_ratio is not None and fcf_val > 0:
+                    fcf_comment += f"，FCF/净利={fcf_np_ratio:.1%}"
             indicators.append(
                 IndicatorResult(
                     name="自由现金流(元)",
@@ -146,6 +169,42 @@ class CashflowAnalyzer(BaseAnalyzer):
                     trend=self._calc_trend(fcf),
                     weight=2.5,
                     comment=fcf_comment,
+                    period=annual_period,
+                )
+            )
+
+        # FCF 覆盖分红：红利资产核心风险点
+        div_info = kwargs.get("dividend_info") or {}
+        if div_info and div_info.get("fcf_dividend_gap") is not None:
+            gap = float(div_info["fcf_dividend_gap"])
+            fcf_amt = div_info.get("fcf")
+            cash_div = div_info.get("cash_total")
+            # 统一转亿显示
+            fcf_yi = float(fcf_amt) / 1e8 if fcf_amt and float(fcf_amt) > 1e6 else float(fcf_amt or 0)
+            cash_yi = float(cash_div) / 1e8 if cash_div and float(cash_div) > 1e6 else float(cash_div or 0)
+            gap_yi = abs(gap) / 1e8 if abs(gap) > 1e6 else abs(gap)
+            if gap < 0 and fcf_amt is not None and cash_div is not None:
+                cover_score = 65.0
+                cover_comment = (
+                    f"自由现金流 {fcf_yi:.0f}亿低于现金分红 {cash_yi:.0f}亿，"
+                    f"缺口约{gap_yi:.0f}亿，需消耗存量货币资金，"
+                    f"高分红可持续性核心风险点"
+                )
+                warnings.append(cover_comment)
+            elif gap >= 0 and fcf_amt is not None and cash_div is not None:
+                cover_score = 85.0
+                cover_comment = f"自由现金流 {fcf_yi:.0f}亿覆盖现金分红 {cash_yi:.0f}亿有余"
+            else:
+                cover_score = 70.0
+                cover_comment = "分红数据不完整，覆盖率粗估"
+            indicators.append(
+                IndicatorResult(
+                    name="FCF覆盖分红",
+                    value=round(gap, 1),
+                    score=cover_score,
+                    level=score_to_level(cover_score),
+                    weight=2.0,
+                    comment=cover_comment,
                     period=annual_period,
                 )
             )
