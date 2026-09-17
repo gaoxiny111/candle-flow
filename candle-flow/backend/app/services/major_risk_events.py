@@ -124,6 +124,12 @@ RISK_RULES: list[dict[str, Any]] = [
     },
 ]
 
+# 风险释放关键词：减持完毕、承诺不减持等 → 观察级风险可释放
+RISK_RELEASE_KEYWORDS = (
+    "减持完毕", "减持完成", "减持计划实施完毕", "减持计划届满",
+    "承诺不减持", "自愿承诺锁定", "延长锁定期", "承诺延长",
+)
+
 SEVERITY_BY_ID = {str(r["id"]): str(r["severity"]) for r in RISK_RULES}
 
 _cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -273,6 +279,39 @@ def scan_notice_titles(notices: list[dict[str, str]]) -> list[RiskHit]:
     return hits
 
 
+def scan_risk_release(notices: list[dict[str, str]]) -> dict[str, Any]:
+    """扫描风险释放信号：减持完毕、承诺不减持等。
+
+    返回 {released: bool, release_type: str, release_date: str, lock_commitment: bool}
+    """
+    released = False
+    release_type = ""
+    release_date = ""
+    lock_commitment = False
+
+    for n in notices:
+        title = n.get("title") or ""
+        for kw in RISK_RELEASE_KEYWORDS:
+            if kw in title:
+                released = True
+                release_date = n.get("notice_date") or ""
+                if "承诺" in title or "锁定" in title:
+                    lock_commitment = True
+                    release_type = "commitment"
+                elif not release_type:
+                    release_type = "completed"
+                break
+        if released and lock_commitment:
+            break  # 已找到最强信号
+
+    return {
+        "released": released,
+        "release_type": release_type,
+        "release_date": release_date,
+        "lock_commitment": lock_commitment,
+    }
+
+
 def fetch_controller_pledge_ratio(symbol: str) -> dict[str, Any]:
     """
     东财重要股东质押明细：取近窗内控股股东（优先）单笔「占所持股份比例」的合理最大值。
@@ -410,6 +449,8 @@ def detect_major_risk_events(symbol: str) -> dict[str, Any]:
 
     notices = fetch_stock_notices(sym)
     hits = scan_notice_titles(notices)
+    # 风险释放检测：减持完毕、承诺不减持等
+    risk_release = scan_risk_release(notices)
 
     events: list[dict[str, Any]] = [
         {
@@ -480,21 +521,37 @@ def detect_major_risk_events(symbol: str) -> dict[str, Any]:
             break
 
     fatal = bool(survival)
+    # 观察级风险释放：减持完毕+承诺不减持时，减持类观察事件可释放
+    if risk_release.get("released"):
+        released_ids = {"reduce_hold"}
+        for ev in observe:
+            if ev.get("rule_id") in released_ids:
+                ev["released"] = True
+                ev["release_type"] = risk_release.get("release_type", "")
+    # 过滤已释放的事件，不计入观察级扣分
+    observe_active = [e for e in observe if not e.get("released")]
+    observe_released = [e for e in observe if e.get("released")]
+
     result = {
         "fatal": fatal,
         "events": survival,  # 红灯只列生存级
-        "observe_events": observe,
+        "observe_events": observe_active,  # 未释放的观察级
+        "observe_events_released": observe_released,  # 已释放的观察级
+        "risk_released": risk_release.get("released", False),
+        "risk_release_type": risk_release.get("release_type", ""),
+        "risk_release_date": risk_release.get("release_date", ""),
+        "risk_lock_commitment": risk_release.get("lock_commitment", False),
         "event_count": len(survival),
-        "observe_count": len(observe),
+        "observe_count": len(observe_active),  # 只计未释放的
         "notice_scanned": len(notices),
         "pledge_ratio": pledge_ratio,
         "pledge_invalid": pledge_invalid,
         "pledge_holder": pledge_info.get("holder") or "",
         "message": COMPLIANCE_VETO_MESSAGE if fatal else "",
-        "observe_message": OBSERVE_RISK_MESSAGE if observe and not fatal else "",
+        "observe_message": OBSERVE_RISK_MESSAGE if observe_active and not fatal else "",
         "audit_opinion_hint": audit_opinion,
         "labels": sorted({str(e["label"]) for e in survival}),
-        "observe_labels": sorted({str(e["label"]) for e in observe}),
+        "observe_labels": sorted({str(e["label"]) for e in observe_active}),
     }
     _cache[sym.upper()] = (now, result)
     return dict(result)

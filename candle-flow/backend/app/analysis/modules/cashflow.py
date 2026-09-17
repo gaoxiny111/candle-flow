@@ -125,6 +125,44 @@ class CashflowAnalyzer(BaseAnalyzer):
                     period=period_for_cr,
                 )
             )
+            # ── 现金流改善趋势：连续环比改善说明阶段性占用正在修复 ──
+            # 高成长扩张期企业（如半导体）现金流滞后是常态，关键看趋势方向
+            ocf_trend_boost = 0.0
+            if len(ocf.dropna()) >= 3:
+                ocf_vals = ocf.dropna().values
+                qoq_changes = []
+                for i in range(1, len(ocf_vals)):
+                    prev_v = float(ocf_vals[i - 1])
+                    curr_v = float(ocf_vals[i])
+                    if abs(prev_v) > 1e-6:
+                        qoq_changes.append((curr_v - prev_v) / abs(prev_v))
+                    elif curr_v > 0:
+                        qoq_changes.append(1.0)  # 从负转正视为改善
+                    else:
+                        qoq_changes.append(0.0)
+                # 检查最近2-3期是否连续改善
+                recent = qoq_changes[-3:] if len(qoq_changes) >= 3 else qoq_changes[-2:] if len(qoq_changes) >= 2 else []
+                consecutive_improve = 0
+                for ch in reversed(recent):
+                    if ch > 0:
+                        consecutive_improve += 1
+                    else:
+                        break
+                if consecutive_improve >= 2:
+                    ocf_trend_boost = 12.0 if consecutive_improve >= 3 else 8.0
+                    trend_label = "连续3期" if consecutive_improve >= 3 else "连续2期"
+                    indicators.append(
+                        IndicatorResult(
+                            name="现金流改善趋势",
+                            value=consecutive_improve,
+                            score=80.0 if consecutive_improve >= 3 else 72.0,
+                            level=AnalysisLevel.GOOD,
+                            trend="up",
+                            weight=1.5,
+                            comment=f"经营现金流{trend_label}环比改善，扩张期现金流占用正在修复",
+                            period=latest_period,
+                        )
+                    )
             if use_latest and annual_cash_ratio is not None:
                 a_score, a_level = self._score_by_range(
                     annual_cash_ratio, (1.0, 5.0), (0.7, 1.0), (0.4, 0.7)
@@ -345,7 +383,69 @@ class CashflowAnalyzer(BaseAnalyzer):
             warnings.append("当期净利为负但经营现金流为正，存在亏损现金背离，请结合应付账款变动核实")
 
         # 利润增速 vs 现金流质量背离
+        # ── 区分"暂时滞后"（应收/存货增长合理）vs"结构恶化"（存货增速>营收2倍持续2期） ──
         yoy_profit = kwargs.get("profit_yoy")
+        yoy_rev_val = kwargs.get("revenue_yoy")
+        # 检测应收/存货增长 vs 营收增长，判断现金流占用性质
+        is_temporary_lag = False
+        is_structural_deterioration = False
+        if "accounts_receivable" in fd.columns and "revenue" in fd.columns and len(fd) >= 2:
+            ar_chg = fd["accounts_receivable"].pct_change(fill_method=None).dropna()
+            rev_chg = fd["revenue"].pct_change(fill_method=None).dropna()
+            if len(ar_chg) and len(rev_chg):
+                ar_g = float(ar_chg.iloc[-1])
+                rev_g = float(rev_chg.iloc[-1])
+                if pd.notna(ar_g) and pd.notna(rev_g) and rev_g > 0:
+                    # 应收增速 < 营收2倍 → 应收增长合理，现金流占用是暂时的
+                    if ar_g < rev_g * 2:
+                        is_temporary_lag = True
+        if "inventory" in fd.columns and "revenue" in fd.columns and len(fd) >= 3:
+            inv_chg = fd["inventory"].pct_change(fill_method=None).dropna()
+            rev_chg_inv = fd["revenue"].pct_change(fill_method=None).dropna()
+            if len(inv_chg) >= 2 and len(rev_chg_inv) >= 2:
+                # 检查最近2期存货增速是否都 > 营收2倍
+                inv_recent = inv_chg.iloc[-2:]
+                rev_recent = rev_chg_inv.iloc[-2:]
+                structural_count = 0
+                for iv, rv in zip(inv_recent, rev_recent):
+                    if pd.notna(iv) and pd.notna(rv) and rv > 0 and iv > rv * 2:
+                        structural_count += 1
+                if structural_count >= 2:
+                    is_structural_deterioration = True
+                    is_temporary_lag = False  # 结构恶化优先级更高
+
+        # ── 应收+存货双低：营运资本增长合理，现金流评分保底 ──
+        healthy_wc = False
+        order_backed_inv = False  # 订单备货型存货：存货增速<营收×0.7 + 合同负债正增长
+        _wc_note_parts: list[str] = []  # 评分依据注释
+        if "accounts_receivable" in fd.columns and "inventory" in fd.columns and "revenue" in fd.columns and len(fd) >= 2:
+            ar_chg_wc = fd["accounts_receivable"].pct_change(fill_method=None).dropna()
+            inv_chg_wc = fd["inventory"].pct_change(fill_method=None).dropna()
+            rev_chg_wc = fd["revenue"].pct_change(fill_method=None).dropna()
+            if len(ar_chg_wc) and len(inv_chg_wc) and len(rev_chg_wc):
+                ar_g = float(ar_chg_wc.iloc[-1])
+                inv_g = float(inv_chg_wc.iloc[-1])
+                rev_g = float(rev_chg_wc.iloc[-1])
+                if pd.notna(ar_g) and pd.notna(inv_g) and pd.notna(rev_g) and rev_g > 0:
+                    if ar_g < rev_g and inv_g < rev_g * 1.5:
+                        healthy_wc = True
+                        _wc_note_parts.append(
+                            f"应收增速{ar_g*100:.1f}%、存货增速{inv_g*100:.1f}%"
+                            f"均低于营收增速{rev_g*100:.1f}%"
+                        )
+                    # ── 订单备货型存货检测 ──
+                    if inv_g < rev_g * 0.7 and "advance_receipts" in fd.columns:
+                        adv_series = fd["advance_receipts"].dropna()
+                        if len(adv_series) >= 2:
+                            adv_latest = float(adv_series.iloc[-1])
+                            adv_prev = float(adv_series.iloc[-2])
+                            if adv_latest > 0 and adv_prev > 0 and adv_latest > adv_prev:
+                                order_backed_inv = True
+                                _wc_note_parts.append(
+                                    f"合同负债/预收同比增{(adv_latest/adv_prev-1)*100:.1f}%，"
+                                    f"存货为订单备货而非积压"
+                                )
+
         if yoy_profit is not None and cash_ratio is not None and len(profit_clean) and float(profit_clean.iloc[-1]) > 0:
             yp = float(yoy_profit)
             if yp >= 15 and cash_ratio < 0.5:
@@ -355,7 +455,33 @@ class CashflowAnalyzer(BaseAnalyzer):
                     use_latest and annual_cash_ratio is not None
                     and float(annual_cash_ratio) >= 0.7
                 )
-                if annual_healthy:
+                # ── 暂时滞后型：应收/存货增长合理，现金流占用是扩张所致 ──
+                if is_temporary_lag and not is_structural_deterioration:
+                    # 订单备货型：合同负债增长确认存货为订单驱动，进一步轻扣
+                    if order_backed_inv:
+                        div_score = max(62.0, min(80.0, 80.0 - gap * 8.0))
+                        div_comment = (
+                            f"净利同比+{yp:.1f}% 但经营现金流/净利={cash_ratio:.2f}；"
+                            f"应收/存货增速均低于营收增速，合同负债增长确认订单备货型，"
+                            f"属扩张期正常波动，评分轻扣"
+                        )
+                    else:
+                        div_score = max(55.0, min(75.0, 75.0 - gap * 10.0))
+                        div_comment = (
+                            f"净利同比+{yp:.1f}% 但经营现金流/净利={cash_ratio:.2f}；"
+                            f"应收增速未超营收2倍，属扩张期暂时滞后而非利润注水，"
+                            f"叠加现金流环比改善趋势，评分轻扣"
+                        )
+                elif is_structural_deterioration:
+                    # 结构恶化：存货增速持续超营收2倍，现金流评分压至40以下
+                    div_score = max(10.0, min(38.0, 38.0 - gap * 20.0))
+                    div_comment = (
+                        f"净利同比+{yp:.1f}% 但经营现金流/净利={cash_ratio:.2f}；"
+                        f"存货增速连续2期超营收2倍，疑似结构性堆积，"
+                        f"现金流质量严重恶化"
+                    )
+                    warnings.append("存货增速连续2期超营收2倍，疑似结构性堆积，警惕存货减值风险")
+                elif annual_healthy:
                     # 年报健康 + 当期低 = 阶段性占用，背离度打折
                     div_score = max(40.0, min(65.0, 65.0 - gap * 20.0))
                     div_comment = (
@@ -375,12 +501,12 @@ class CashflowAnalyzer(BaseAnalyzer):
                         value=round(gap, 2),
                         score=round(div_score, 1),
                         level=score_to_level(div_score),
-                        weight=2.5 if not annual_healthy else 1.5,
+                        weight=2.5 if not annual_healthy and not is_temporary_lag else 1.5,
                         comment=div_comment,
                         period=latest_period,
                     )
                 )
-                if not annual_healthy:
+                if not annual_healthy and not is_temporary_lag and not is_structural_deterioration:
                     warnings.append(
                         f"增长质量背离：净利高增(+{yp:.1f}%)与现金流含金量({cash_ratio:.2f})明显背离"
                     )
@@ -424,7 +550,65 @@ class CashflowAnalyzer(BaseAnalyzer):
         if len(ocf.dropna()) >= 3 and (ocf.iloc[-3:] < 0).all():
             warnings.append("经营现金流连续3期为负，造血能力严重不足")
 
+        # ── OCF 环比大幅改善（>100%）额外加分，>200% 加分更多 ──
+        ocf_rebound_boost = 0.0
+        if len(ocf.dropna()) >= 2:
+            ocf_vals_rb = ocf.dropna().values
+            prev_ocf = float(ocf_vals_rb[-2])
+            curr_ocf = float(ocf_vals_rb[-1])
+            if abs(prev_ocf) > 1e-6:
+                ocf_qoq = (curr_ocf - prev_ocf) / abs(prev_ocf)
+                if ocf_qoq > 3.0:
+                    ocf_rebound_boost = 10.0
+                    indicators.append(
+                        IndicatorResult(
+                            name="经营现金流环比大幅改善",
+                            value=round(ocf_qoq * 100, 1),
+                            score=95.0,
+                            level=AnalysisLevel.GOOD,
+                            trend="up",
+                            weight=1.0,
+                            comment=f"最新期经营现金流环比改善{ocf_qoq*100:.0f}%（>300%），造血能力强劲修复",
+                            period=latest_period,
+                        )
+                    )
+                elif ocf_qoq > 2.0:
+                    ocf_rebound_boost = 8.0
+                    indicators.append(
+                        IndicatorResult(
+                            name="经营现金流环比大幅改善",
+                            value=round(ocf_qoq * 100, 1),
+                            score=95.0,
+                            level=AnalysisLevel.GOOD,
+                            trend="up",
+                            weight=1.0,
+                            comment=f"最新期经营现金流环比改善{ocf_qoq*100:.0f}%（>200%），造血能力强劲修复",
+                            period=latest_period,
+                        )
+                    )
+                elif ocf_qoq > 1.0:
+                    ocf_rebound_boost = 5.0
+                    indicators.append(
+                        IndicatorResult(
+                            name="经营现金流环比大幅改善",
+                            value=round(ocf_qoq * 100, 1),
+                            score=90.0,
+                            level=AnalysisLevel.GOOD,
+                            trend="up",
+                            weight=1.0,
+                            comment=f"最新期经营现金流环比改善{ocf_qoq*100:.0f}%（>100%），造血能力显著修复",
+                            period=latest_period,
+                        )
+                    )
+
         module_score = self._weighted_score(indicators) if indicators else 0.0
+        # OCF 环比大幅改善额外加分
+        if ocf_rebound_boost > 0:
+            module_score += ocf_rebound_boost
+        # ── 应收+存货双低 → 现金流评分保底 55-60（仅调分，不作为风险提示） ──
+        if healthy_wc and module_score < 55.0:
+            module_score = 58.0
+
         return ModuleResult(
             module_name="现金流质量",
             score=round(module_score, 1),
@@ -434,5 +618,8 @@ class CashflowAnalyzer(BaseAnalyzer):
             metadata={
                 "paper_wealth": bool(paper_wealth),
                 "consecutive_loss_years": int(consec_loss),
+                "healthy_working_capital": healthy_wc,
+                "order_backed_inventory": order_backed_inv,
+                "scoring_note": "；".join(_wc_note_parts) if _wc_note_parts else None,
             },
         )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from app.analysis.base import AnalysisLevel, BaseAnalyzer, IndicatorResult, ModuleResult, format_report_period, score_to_level
+from app.analysis.config.company_profiles import get_company_profile
 from app.analysis.dividend_profile import DIVIDEND_ASSET_WACC_PCT, classify_dividend_asset
 from app.analysis.growth_quality import HIGH_GROWTH_WACC_PCT, classify_high_growth_quality
 from app.analysis.growth_profile import classify_growth_stock
@@ -69,6 +70,11 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
         if financial_data.empty:
             return ModuleResult("盈利能力", 0, AnalysisLevel.DANGER, warnings=["暂无财务数据"])
 
+        # 公司画像：周期/资源股识别（替代硬编码公司名）
+        _profile = get_company_profile(
+            kwargs.get("name") or "", kwargs.get("symbol") or ""
+        )
+
         fd = financial_data.copy()
         annual_dates = kwargs.get("annual_dates") or list(fd.index)
         annual_period = ""
@@ -80,9 +86,7 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
         _cycle_prof_kw = ("化工", "有色", "煤炭", "钢铁", "化肥", "磷", "矿", "农化", "航运", "开采")
         _industry_str = str(kwargs.get("industry") or "")
         _name_str = str(kwargs.get("name") or "")
-        _is_cyclical_prof = any(k in _industry_str for k in _cycle_prof_kw) or any(
-            k in _name_str for k in ("神华", "云天化", "中煤", "兖矿")
-        )
+        _is_cyclical_prof = any(k in _industry_str for k in _cycle_prof_kw) or _profile.get("cyclical", False)
         # 权重：周期股 ROIC/ROE 主导，毛利率权重下调
         _w_roe = 3.0 if not _is_cyclical_prof else 3.0
         _w_roic = 2.5 if not _is_cyclical_prof else 4.0

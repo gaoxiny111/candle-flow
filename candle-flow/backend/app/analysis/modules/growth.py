@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from app.analysis.base import AnalysisLevel, BaseAnalyzer, IndicatorResult, ModuleResult, format_report_period, score_to_level
+from app.analysis.config.company_profiles import get_company_profile
 
 
 class GrowthAnalyzer(BaseAnalyzer):
@@ -30,6 +31,11 @@ class GrowthAnalyzer(BaseAnalyzer):
         warnings: list[str] = []
         if financial_data.empty or "revenue" not in financial_data:
             return ModuleResult("成长性", 0, AnalysisLevel.DANGER, warnings=["暂无营收数据"])
+
+        # 公司画像：从配置加载个股特殊因子（替代硬编码 if 判断）
+        _profile = get_company_profile(
+            kwargs.get("name") or "", kwargs.get("symbol") or ""
+        )
 
         revenue = financial_data["revenue"]
         profit = financial_data["net_profit"]
@@ -230,9 +236,7 @@ class GrowthAnalyzer(BaseAnalyzer):
                         pass
                 cycle_industries = ("煤炭", "焦炭", "有色", "钢铁", "化工", "航运", "港口", "开采")
                 industry = str(kwargs.get("industry") or "")
-                is_cycle = any(k in industry for k in cycle_industries) or "神华" in str(
-                    kwargs.get("name") or ""
-                )
+                is_cycle = any(k in industry for k in cycle_industries) or _profile.get("cyclical", False)
                 if is_cycle:
                     comment = (
                         f"周期回落后出现边际修复：营收同比+{yoy_r:.1f}%、净利同比+{yoy_p:.1f}%"
@@ -356,74 +360,32 @@ class GrowthAnalyzer(BaseAnalyzer):
             if not _is_active_contraction:
                 warnings.append("最新报告期营收同比下滑超15%，需重点关注")
 
-        # 外延式增长（资产注入/重大重组并表）：作为加分项但低权重，
-        # 避免压过内生增长的劣化叙事；业绩承诺需兑现，存商誉减值与整合风险
+        # 外延式增长（资产注入/重大重组并表）：配置驱动，不再硬编码公司名
         symbol = str(kwargs.get("symbol") or "")
         name = str(kwargs.get("name") or "")
-        if "神华" in name or "601088" in symbol:
-            # 神华 2026.03 完成收购12家核心资产，交易对价约1336亿，
-            # 注入资产 2026-2028 业绩承诺归母净利 29.6 / 45.5 / 66.4 亿
-            # 按 2025 年报归母净利约 570 亿计，2026 承诺对应 +5.2% 外延增长
-            # 同时带来煤炭产量 +56.6%、可采储量 +97.7% 的规模跃升
-            indicators.append(
-                IndicatorResult(
-                    name="外延式增长(资产注入)",
-                    value=5.2,
-                    score=82.0,
-                    level=AnalysisLevel.GOOD,
-                    trend="up",
-                    weight=1.5,
-                    period="2026-2028业绩承诺",
-                    comment=(
-                        "2026年3月完成收购12家核心资产（交易对价约1336亿，30%股份+70%现金）："
-                        "煤炭产量+56.6%、可采储量+97.7%的规模跃升；"
-                        "业绩承诺2026-2028归母净利29.6/45.5/66.4亿，"
-                        "对应2026约+5.2%外延增量；需关注商誉减值与整合协同"
-                    ),
+        _asset_inj = _profile.get("asset_injection")
+        if _asset_inj:
+            _level_map = {
+                "excellent": AnalysisLevel.EXCELLENT,
+                "good": AnalysisLevel.GOOD,
+                "neutral": AnalysisLevel.NEUTRAL,
+                "danger": AnalysisLevel.DANGER,
+            }
+            for _ai in _asset_inj.get("indicators", []):
+                indicators.append(
+                    IndicatorResult(
+                        name=_ai["name"],
+                        value=_ai["value"],
+                        score=float(_ai["score"]),
+                        level=_level_map.get(_ai.get("level", "good"), AnalysisLevel.GOOD),
+                        trend=_ai.get("trend", "up"),
+                        weight=float(_ai.get("weight", 1.5)),
+                        period=_ai.get("period", ""),
+                        comment=_ai.get("comment", ""),
+                    )
                 )
-            )
-            # 外延式增长观察已合并至"并表跃升"warning，避免重复
-            # 并表后规模增速：经营目标全面上调，用历史CAGR评估并表后神华会系统性低估
-            indicators.append(
-                IndicatorResult(
-                    name="并表后规模增速",
-                    value=28.6,
-                    score=84.0,
-                    level=AnalysisLevel.GOOD,
-                    trend="up",
-                    weight=1.8,
-                    period="2026经营目标",
-                    comment=(
-                        "资产注入后2026年经营目标全面上调：商品煤产量5.134亿吨(+55.5%)、"
-                        "发电量2881亿千瓦时(+28.8%)、营收目标3600亿(+28.6%)；"
-                        "历史3年CAGR为负但并表后规模跃升，纯CAGR口径会系统性低估"
-                    ),
-                )
-            )
-            # ── 并表跃升调整因子 ─────────────────────────────────
-            # 纯CAGR口径系统性低估并表后的规模增速，需额外给予并表跃升溢价
-            indicators.append(
-                IndicatorResult(
-                    name="并表跃升调整",
-                    value=28.6,
-                    score=86.0,
-                    level=AnalysisLevel.EXCELLENT,
-                    trend="up",
-                    weight=3.0,
-                    period="2026并表元年",
-                    comment=(
-                        "2026年3月完成12家核心资产并表（交易对价~1336亿），"
-                        "商品煤+55.5%/发电量+28.8%/营收+28.6%规模跃升；"
-                        "业绩承诺2026-2028净利29.6/45.5/66.4亿，"
-                        "纯CAGR口径无法捕捉并表级规模跃升，额外给予并表溢价+8分"
-                    ),
-                )
-            )
-            warnings.append(
-                "并表跃升：2026年3月完成12家资产并表，经营目标全面上调"
-                "（煤+55.5%/电+28.8%/营收+28.6%），历史CAGR口径系统性低估，"
-                "需跟踪业绩承诺兑现及整合协同"
-            )
+            for _aw in _asset_inj.get("warnings", []):
+                warnings.append(_aw)
 
         # 业务结构转型 / 成长包容度：高毛利 + 利润高增 → 新品类放量窗口加分
         from app.analysis.growth_quality import classify_high_growth_quality
@@ -535,20 +497,7 @@ class GrowthAnalyzer(BaseAnalyzer):
         # 支持 kwargs 传入显式数据，或公司特征自动识别
         second_curve = kwargs.get("second_curve")
         if second_curve is None:
-            # 云天化：磷酸铁/磷酸铁锂新能源材料第二曲线
-            if "云天化" in name or "600096" in symbol:
-                second_curve = {
-                    "name": "磷酸铁/磷酸铁锂",
-                    "status": "capacity_ramp",
-                    "detail": (
-                        "10万吨磷酸铁已投产满产满销，2026H1销量5.04万吨超去年全年七成；"
-                        "20万吨磷酸铁+15万吨磷酸铁锂2026Q4-2027年集中释放，"
-                        "规划总产能50万吨；与当升科技合资（云天化控股51%），"
-                        "绑定宁德时代等头部客户"
-                    ),
-                    "score": 88.0,
-                    "bonus": 12,
-                }
+            second_curve = _profile.get("second_curve")
 
         if second_curve and isinstance(second_curve, dict):
             sc_score = float(second_curve.get("score", 80.0))
@@ -585,23 +534,12 @@ class GrowthAnalyzer(BaseAnalyzer):
         # 支持 kwargs 传入显式数据，或公司特征自动识别
         resource_injection = kwargs.get("resource_injection")
         if resource_injection is None:
-            # 云天化：镇雄磷矿24.38亿吨注入预期
-            if ("云天化" in name or "600096" in symbol) and any(
-                k in industry_str for k in ("磷", "矿", "化工")
-            ):
-                resource_injection = {
-                    "name": "镇雄磷矿",
-                    "reserve_billion_tons": 24.38,
-                    "existing_reserve": "近8亿吨",
-                    "total_after_injection": "超32亿吨",
-                    "domestic_share": "近90%",
-                    "cost_self": "200-300元/吨",
-                    "cost_market": "700-1200元/吨",
-                    "cost_advantage": "50%+",
-                    "commitment": "集团承诺取得采矿证后3年内优先注入上市公司",
-                    "score": 82.0,
-                    "bonus": 5,
-                }
+            _ri_profile = _profile.get("resource_injection")
+            if _ri_profile:
+                # 行业匹配检查（部分资源注入需行业条件才生效）
+                _ri_industry_req = _ri_profile.get("industry_required")
+                if not _ri_industry_req or any(k in industry_str for k in _ri_industry_req):
+                    resource_injection = _ri_profile
 
         if resource_injection and isinstance(resource_injection, dict):
             ri_score = float(resource_injection.get("score", 78.0))

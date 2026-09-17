@@ -222,6 +222,9 @@ class FundamentalEngine:
             "pledge_invalid": bool(major_risks.get("pledge_invalid")),
             "major_risk_events": major_risks.get("events") or [],
             "observe_risk_events": major_risks.get("observe_events") or [],
+            "risk_released": bool(major_risks.get("risk_released")),
+            "risk_lock_commitment": bool(major_risks.get("risk_lock_commitment")),
+            "risk_release_type": major_risks.get("risk_release_type") or "",
             "latest_cash_ratio": meta.get("latest_cash_ratio"),
             "eps": meta.get("eps"),
             "deducted_net_profit": meta.get("deducted_net_profit"),
@@ -278,6 +281,19 @@ class FundamentalEngine:
         composite = _compose(val_score)
         letter = rating_label(composite)
 
+        # ── 高成长优质股保护：盈利+成长双强时，现金流低分不致命 ──
+        prof_s = module_results.get("profitability")
+        growth_s = module_results.get("growth")
+        cf_s = module_results.get("cashflow")
+        if (
+            prof_s is not None and prof_s.score >= 85
+            and growth_s is not None and growth_s.score >= 85
+            and cf_s is not None and cf_s.score <= 60
+            and composite < 70
+        ):
+            composite = 70.0
+            letter = rating_label(composite)
+
         # ── 成长股/周期底部反转识别 ──────────────────────────
         growth_mod = module_results.get("growth")
         prof_mod = module_results.get("profitability")
@@ -329,6 +345,16 @@ class FundamentalEngine:
                 _seen_w.add(w)
                 deduped.append(w)
         all_warnings = deduped
+
+        # ── 风险阈值标签：≤2条→风险可控，3-4→风险中等，≥5→风险较高 ──
+        risk_warning_count = len(all_warnings)
+        if risk_warning_count <= 2:
+            risk_level_label = "风险可控"
+        elif risk_warning_count <= 4:
+            risk_level_label = "风险中等"
+        else:
+            risk_level_label = "风险较高"
+
         if valuation.get("value_trap_veto") and valuation.get("value_trap_message"):
             msg = str(valuation["value_trap_message"])
             if msg not in all_warnings:
@@ -499,6 +525,8 @@ class FundamentalEngine:
                 "dividend_yield": market.get("dividend_yield"),
             },
             "warnings": all_warnings,
+            "risk_level_label": risk_level_label,
+            "risk_warning_count": risk_warning_count,
             "summary": self._generate_summary(
                 composite,
                 letter,
@@ -923,7 +951,10 @@ class FundamentalEngine:
             rationale_parts.append("暂无相对估值信号，采用默认中性分")
 
         haircut = 0.0
-        if cashflow_score is not None and cashflow_score < 45:
+        # 高成长科技股：现金流滞后是常态，不因现金流低分扣减估值
+        revenue_yoy_hg = meta.get("revenue_yoy")
+        is_high_growth_val = revenue_yoy_hg is not None and float(revenue_yoy_hg) >= 30
+        if not is_high_growth_val and cashflow_score is not None and cashflow_score < 45:
             cheap_looking = any(
                 (rel.get(k) or {}).get("signal") == "低估" for k in ("PE_TTM", "PB", "PEG")
             ) or base_score >= 70
@@ -943,6 +974,29 @@ class FundamentalEngine:
 
         if not fin_df.empty:
             result["dcf"] = self._build_dcf(fin_df, market, meta)
+            # ── 高成长科技股：DCF 模型过于悲观，仅作极端压力测试参考 ──
+            revenue_yoy_v = meta.get("revenue_yoy")
+            if revenue_yoy_v is not None and float(revenue_yoy_v) >= 30:
+                dcf_r = result["dcf"]
+                dcf_r["role"] = "high_growth_reference"
+                dcf_r["is_reliable"] = False
+                dcf_r["display_label"] = "DCF内在价值（极端悲观情景）"
+                iv_str = None
+                if dcf_r.get("intrinsic_value_per_share"):
+                    iv_str = f"{float(dcf_r['intrinsic_value_per_share']):.2f}元"
+                dcf_r["note"] = (
+                    (dcf_r.get("note") or "")
+                    + f"；高成长科技股（营收增速>30%）DCF模型假设过于保守，"
+                    f"结果仅供参考，核心定价请参考相对估值（PEG/PS/可比公司）"
+                )
+                # DCF 权重降至 10%：高成长股以 PEG/PS/可比公司为主（占 90%）
+                if final_score < 55:
+                    final_score = 60.0
+                    result["composite_valuation_score"] = final_score
+                    result["valuation_rationale"] = (
+                        (result.get("valuation_rationale") or "")
+                        + "；高成长科技股 DCF 权重降至 10%，以 PEG/PS/可比公司为主"
+                    )
 
         # 红利资产：DDM（股利贴现）作为核心参考估值，替代 DCF
         if is_div and not fin_df.empty:
@@ -950,21 +1004,29 @@ class FundamentalEngine:
 
         # 无相对估值信号时：仅用「可信」DCF 的安全边际粗估，避免默认 55 / 爆表估值污染分数
         dcf = result.get("dcf") or {}
-        if not scores and dcf.get("is_reliable") and dcf.get("intrinsic_value_per_share"):
-            price = market.get("price")
-            iv = dcf["intrinsic_value_per_share"]
-            if price and float(price) > 0:
-                mos = (float(iv) - float(price)) / float(price)
-                if mos > 0.3:
-                    result["composite_valuation_score"] = 82.0
-                elif mos > 0:
-                    result["composite_valuation_score"] = 70.0
-                else:
-                    result["composite_valuation_score"] = 50.0
+        if not scores and dcf.get("intrinsic_value_per_share"):
+            # 高成长科技股：DCF 过于悲观，不给低分
+            if dcf.get("role") == "high_growth_reference":
+                result["composite_valuation_score"] = max(final_score, 60.0)
                 result["valuation_rationale"] = (
-                    f"无相对估值信号，按 DCF 安全边际 {mos * 100:.0f}% 给分 "
-                    f"{result['composite_valuation_score']:.0f}"
+                    (result.get("valuation_rationale") or "")
+                    + "；高成长科技股以相对估值（PEG/PS/可比公司）为主，DCF 仅作参考"
                 )
+            elif dcf.get("is_reliable"):
+                price = market.get("price")
+                iv = dcf["intrinsic_value_per_share"]
+                if price and float(price) > 0:
+                    mos = (float(iv) - float(price)) / float(price)
+                    if mos > 0.3:
+                        result["composite_valuation_score"] = 82.0
+                    elif mos > 0:
+                        result["composite_valuation_score"] = 70.0
+                    else:
+                        result["composite_valuation_score"] = 50.0
+                    result["valuation_rationale"] = (
+                        f"无相对估值信号，按 DCF 安全边际 {mos * 100:.0f}% 给分 "
+                        f"{result['composite_valuation_score']:.0f}"
+                    )
 
         return result
 
@@ -1157,8 +1219,8 @@ class FundamentalEngine:
         return 1e9, "default_1e9"
 
     @staticmethod
-    def _base_fcf(fin_df: pd.DataFrame, symbol: str) -> tuple[float | None, str]:
-        """真实 FCF = OCF − |CapEx|；为负时降级 OCF×0.3，再不行跳过。"""
+    def _base_fcf(fin_df: pd.DataFrame, symbol: str, *, is_high_growth: bool = False) -> tuple[float | None, str]:
+        """真实 FCF = OCF − |CapEx|；为负时降级，高成长用 OCF×0.5（扩张期CapEx偏高，OCF更能反映造血能力）。"""
         ocf = float(fin_df.get("operating_cashflow", pd.Series([0])).iloc[-1] or 0)
         capex_raw = fin_df.get("capital_expenditure", pd.Series([0])).iloc[-1]
         capex = abs(float(capex_raw or 0))
@@ -1167,6 +1229,10 @@ class FundamentalEngine:
         if real_fcf > 0:
             return real_fcf, "ocf-capex"
         if ocf > 0:
+            # 高成长科技股：扩张期CapEx偏高导致真实FCF为负，用OCF×0.5近似正常化FCF
+            if is_high_growth:
+                logger.info("[%s] 高成长股真实FCF为负，使用 OCF*0.5 作为基期（扩张期CapEx偏高）", symbol)
+                return ocf * 0.5, "ocf*0.5_high_growth"
             logger.info("[%s] 真实FCF为负/无效，降级使用 OCF*0.3 作为基期", symbol)
             return ocf * 0.3, "ocf*0.3"
         logger.warning("[%s] 无有效现金流数据，跳过 DCF 估值", symbol)
@@ -1393,7 +1459,10 @@ class FundamentalEngine:
 
     def _build_dcf(self, fin_df: pd.DataFrame, market: dict, meta: dict) -> dict[str, Any]:
         symbol = str(meta.get("symbol") or market.get("symbol") or "")
-        base_fcf, fcf_src = self._base_fcf(fin_df, symbol)
+        # ── 提前检测高成长，用于基期FCF选择与参数适配 ──
+        revenue_yoy_val = meta.get("revenue_yoy")
+        is_high_growth = revenue_yoy_val is not None and float(revenue_yoy_val) >= 30
+        base_fcf, fcf_src = self._base_fcf(fin_df, symbol, is_high_growth=is_high_growth)
         if base_fcf is None:
             return {
                 "intrinsic_value_per_share": None,
@@ -1449,19 +1518,38 @@ class FundamentalEngine:
             is_dividend_asset=False,
             is_high_growth_quality=is_hgq,
         )
-        # 低负债/高成长永续增速略抬，避免极端悲观；整体仍作保守参考
-        if is_hgq:
+        # ── 高成长科技股（营收增速>30%）：DCF参数适配 ──
+        # 半导体等行业用更高WACC（8-10%），永续增速3-5%（原2%）
+        industry_str = str(meta.get("industry") or "")
+        is_semiconductor = any(k in industry_str for k in ("半导体", "芯片", "集成电路", "封测", "光模块"))
+        if is_high_growth:
+            # 高成长：永续增速3-5%
+            terminal = 0.04 if is_semiconductor else 0.035
+            # 半导体行业WACC用8-10%（原可能7%偏低）
+            if is_semiconductor and wacc < 0.08:
+                wacc = 0.09
+        elif is_hgq:
             terminal = 0.03
         elif debt_ratio is not None and float(debt_ratio) <= 30:
             terminal = 0.025
         else:
             terminal = 0.02
-        dcf = DCFModel(wacc=wacc, terminal_growth=terminal).value(
-            base_fcf=base_fcf,
-            high_growth_rate=growth,
-            transition_growth_rate=max(0.03, growth * 0.5),
-            shares_outstanding=shares,
-        )
+
+        # 高成长科技股用三情景DCF，取中性值
+        if is_high_growth:
+            dcf = DCFModel(wacc=wacc, terminal_growth=terminal).value_three_scenarios(
+                base_fcf=base_fcf,
+                high_growth_rate=growth,
+                transition_growth_rate=max(0.03, growth * 0.5),
+                shares_outstanding=shares,
+            )
+        else:
+            dcf = DCFModel(wacc=wacc, terminal_growth=terminal).value(
+                base_fcf=base_fcf,
+                high_growth_rate=growth,
+                transition_growth_rate=max(0.03, growth * 0.5),
+                shares_outstanding=shares,
+            )
         dcf["fcf_source"] = fcf_src
         dcf["shares_source"] = shares_src
         dcf["role"] = "pessimistic_reference"
@@ -1469,6 +1557,12 @@ class FundamentalEngine:
             "DCF 为极端悲观情景参考，非核心定价依据；"
             "高成长科技股请优先参考相对估值、机构共识与品类扩张叙事"
         )
+        if is_high_growth:
+            base_note += (
+                f"；高成长参数已适配：WACC≈{wacc*100:.1f}%，"
+                f"永续增速{terminal*100:.1f}%，"
+                f"基期FCF来源={fcf_src}"
+            )
         if is_hgq:
             base_note += (
                 f"；高毛利高成长赛道已用 WACC≈{HIGH_GROWTH_WACC_PCT:.1f}% / "

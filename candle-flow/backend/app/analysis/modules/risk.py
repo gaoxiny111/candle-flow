@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from app.analysis.base import AnalysisLevel, BaseAnalyzer, ModuleResult, score_to_level
+from app.analysis.config.company_profiles import get_company_profile
 from app.analysis.dividend_profile import classify_dividend_asset
 from app.analysis.receivable_quality import ar_turnover_warning, is_quality_receivable_context
 
@@ -16,6 +17,11 @@ class RiskAnalyzer(BaseAnalyzer):
         risk_score = 100.0
         if financial_data.empty:
             return ModuleResult("风险预警", 50, AnalysisLevel.NEUTRAL, warnings=["数据不足，风险评分中性"])
+
+        # 公司画像：从配置加载个股特殊因子
+        _profile = get_company_profile(
+            kwargs.get("name") or "", kwargs.get("symbol") or ""
+        )
 
         latest = financial_data.iloc[-1]
         prev = financial_data.iloc[-2] if len(financial_data) > 1 else latest
@@ -104,9 +110,10 @@ class RiskAnalyzer(BaseAnalyzer):
             if parts:
                 if ar_is_warning:
                     parts.append("反映下游付款节奏放缓")
-                # 神华等煤炭龙头：前五大客户多为五大发电集团（央企），坏账风险可控
-                if "神华" in name or "601088" in str(kwargs.get("symbol") or ""):
-                    parts.append("客户信用质量高（五大发电集团央企为主），坏账风险可控")
+                # 公司画像：应收客户信用质量说明
+                _credit_note = _profile.get("credit_quality_note")
+                if _credit_note:
+                    parts.append(_credit_note)
                 if bool(div_profile_early.get("is_dividend_asset")) or any(k in industry for k in ("煤炭", "焦炭", "煤业", "开采")):
                     risk_score -= 3
                 elif ar_is_warning:
@@ -171,12 +178,13 @@ class RiskAnalyzer(BaseAnalyzer):
             )
 
         # 白酒/高端消费：宏观与政策风险为观察项（轻扣分）
-        if any(k in industry for k in ("白酒", "酿酒", "白酒制造")) or "茅台" in name:
+        _tags = _profile.get("industry_tags", [])
+        if any(k in industry for k in ("白酒", "酿酒", "白酒制造")) or "baijiu" in _tags:
             warnings.append(
                 "宏观与政策风险（观察）：关注高端消费景气度、消费税改革及禁酒/公务消费政策对估值的影响"
             )
             risk_score -= 5
-        if any(k in industry for k in ("煤炭", "焦炭", "煤业", "开采")) or "神华" in name:
+        if any(k in industry for k in ("煤炭", "焦炭", "煤业", "开采")):
             warnings.append(
                 "行业风险（观察）：关注煤炭价格周期波动、长协煤履约率及分红政策稳定性"
             )
@@ -185,20 +193,16 @@ class RiskAnalyzer(BaseAnalyzer):
                 warnings.append(
                     "红利资产观察：高股息可持续性依赖经营现金流与分红承诺兑现"
                 )
-            # 资产注入并表（神华2026重大变量）
-            if "神华" in name or "601088" in str(kwargs.get("symbol") or ""):
-                warnings.append(
-                    "资产注入并表（观察）：交易对价约1336亿（30%股份+70%现金），"
-                    "注入资产2026-2028业绩承诺净利29.6/45.5/66.4亿；"
-                    "关注商誉减值风险及整合协同效应"
-                )
+        # 公司画像：额外风险警告（资产注入、矿进度等）
+        for _rw in _profile.get("risk_warnings", []):
+            warnings.append(_rw["text"])
+            risk_score -= _rw.get("score_deduct", 0)
 
         # ── 光模块/光通信行业特有风险 ─────────────────────────────
         _optical_kw = ("光模块", "光通信", "光电子", "光芯片", "光子")
         is_optical = (
             any(k in industry for k in _optical_kw)
-            or any(k in name for k in ("中际旭创", "新易盛", "天孚通信", "光迅科技"))
-            or "300308" in str(kwargs.get("symbol") or "")
+            or "optical" in _profile.get("industry_tags", [])
         )
         if is_optical:
             # CPO技术替代风险
@@ -231,11 +235,7 @@ class RiskAnalyzer(BaseAnalyzer):
 
         # ── 磷化工/化肥行业特有风险 ─────────────────────────────
         _phosphate_kw = ("磷", "化肥", "硫化工")
-        _is_phosphate = (
-            any(k in industry for k in _phosphate_kw)
-            or "云天化" in name
-            or "600096" in str(kwargs.get("symbol") or "")
-        )
+        _is_phosphate = any(k in industry for k in _phosphate_kw)
         if _is_phosphate:
             # 磷酸铁锂产能过剩风险
             warnings.append(
@@ -249,13 +249,6 @@ class RiskAnalyzer(BaseAnalyzer):
                 "采购价虽低于市场价但持续高位仍压缩磷肥毛利"
             )
             risk_score -= 3
-            # 镇雄磷矿注入进度风险
-            if "云天化" in name or "600096" in str(kwargs.get("symbol") or ""):
-                warnings.append(
-                    "镇雄磷矿注入进度风险：碗厂磷矿(24.38亿吨)2026年12月开工，"
-                    "建设期约5年，取得采矿证后3年内注入，时点存在不确定性"
-                )
-                risk_score -= 2
             # 出口政策变动风险
             warnings.append(
                 "出口政策变动风险：化肥出口法检政策调整可能影响出口量及盈利"
@@ -318,7 +311,21 @@ class RiskAnalyzer(BaseAnalyzer):
             labels = sorted({str(e.get("label") or "") for e in observe_events if e.get("label")})
             if labels:
                 warnings.append("观察级风险：" + "、".join(labels) + "（扣分但不否决）")
-            risk_score -= min(30.0, 12.0 * len(observe_events))
+            # 观察级风险扣分减半（原12分/事件，现6分/事件）
+            risk_score -= min(15.0, 6.0 * len(observe_events))
+
+        # ── 风险释放恢复：减持完毕+承诺不减持时，风险评分恢复 ──
+        risk_released = kwargs.get("risk_released")
+        if risk_released:
+            lock_commitment = kwargs.get("risk_lock_commitment")
+            if lock_commitment:
+                # 减持完毕+承诺锁定：风险评分从当前值恢复至80
+                risk_score = max(risk_score, 80.0)
+                highlights.append("减持完毕+承诺不减持，风险已释放")
+            else:
+                # 仅减持完毕无承诺：恢复至65
+                risk_score = max(risk_score, 65.0)
+                highlights.append("减持已完毕，风险部分释放")
 
         risk_score = max(0.0, risk_score)
         return ModuleResult(
