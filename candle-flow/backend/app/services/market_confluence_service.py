@@ -1,4 +1,4 @@
-"""全市场扫描：今日看涨形态 + 强技术共振，按综合强度分层并做基本面排雷。"""
+"""全市场扫描：K线形态 + 基本面动态权重 + 买点叠加验证。"""
 
 from __future__ import annotations
 
@@ -32,23 +32,26 @@ from app.utils.symbol import normalize_symbol
 logger = logging.getLogger(__name__)
 
 SCAN_WORKERS = 8
+FUND_WORKERS = 8
 KLINE_LIMIT = 90
 MIN_BARS = 40
 DEFAULT_RECENT_BARS = 2
 # 扫描阶段仍用较低门槛收集候选；展示前再切 S/A/B
 CANDIDATE_COMBINED = 80.0
-TIER_B_MIN = 110.0
-TIER_A_MIN = 115.0
-TIER_S_MIN = 120.0
+# 动态权重后的综合分分层阈值（按基本面评分 A/B/C/D/E）
+TIER_A_MIN = 85.0   # 基本面≥85 → A
+TIER_B_MIN = 70.0   # 基本面≥70 → B
+TIER_C_MIN = 55.0   # 基本面≥55 → C
+TIER_D_MIN = 40.0   # 基本面≥40 → D，<40 → E
 DEBT_MAX = 70.0
 ROE_MIN = 5.0  # 过低盈利能力（如 ROE 1.5%）剔除
 PROFIT_YOY_MIN = -30.0  # 最新净利同比暴跌剔除
 PE_MAX = 80.0  # 估值极端（PE>80 且为正）剔除
 CACHE_TTL_SEC = 600
-CACHE_VERSION = 5
+CACHE_VERSION = 6
 
 Outcome = Literal["hit", "ok", "skipped", "error"]
-Tier = Literal["S", "A", "B"]
+Tier = Literal["A", "B", "C", "D", "E"]
 ProgressCb = Callable[[int, int, str], None]
 
 _cache: dict[str, Any] = {"ts": 0.0, "payload": None, "version": 0}
@@ -76,14 +79,189 @@ def _is_candidate(pattern_score: float, effective: float, soft_items: list[SoftC
     return _combined_score(pattern_score, effective, soft_items) >= CANDIDATE_COMBINED
 
 
-def _tier_of(score: float) -> Tier | None:
-    if score >= TIER_S_MIN:
-        return "S"
-    if score >= TIER_A_MIN:
+def _tier_of(fundamental_score: float) -> Tier:
+    """按基本面评分返回 A/B/C/D/E 等级。"""
+    if fundamental_score >= TIER_A_MIN:
         return "A"
-    if score >= TIER_B_MIN:
+    if fundamental_score >= TIER_B_MIN:
         return "B"
-    return None
+    if fundamental_score >= TIER_C_MIN:
+        return "C"
+    if fundamental_score >= TIER_D_MIN:
+        return "D"
+    return "E"
+
+
+# ── 动态权重 & 买点信号 ──────────────────────────────────────
+
+def _kline_weight(fundamental_score: float) -> float:
+    """根据基本面评分返回 K 线权重（剩余为基本面权重）。
+    ≥80 → 30% K线（侧重趋势确认）
+    60-80 → 50% K线（侧重拐点信号）
+    <60 → 70% K线（仅短线博弈）
+    """
+    if fundamental_score >= 80:
+        return 0.30
+    if fundamental_score >= 60:
+        # 60-80 线性插值：60→0.50, 80→0.30
+        return 0.50 - (fundamental_score - 60) / 20.0 * 0.20
+    return 0.70
+
+
+def _calc_peg(pe: float | None, profit_yoy: float | None) -> float | None:
+    """PEG = PE / 净利润增速(%)。增速≤0 时返回 None。"""
+    if pe is None or profit_yoy is None:
+        return None
+    if profit_yoy <= 0:
+        return None
+    try:
+        return round(float(pe) / float(profit_yoy), 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _sma(values: list[float], period: int) -> float | None:
+    if len(values) < period:
+        return None
+    return sum(values[-period:]) / period
+
+
+def _detect_buy_signal(
+    klines: list,
+    fundamental_score: float,
+    peg: float | None,
+    pe: float | None,
+) -> dict[str, Any]:
+    """买点信号叠加验证。
+    - 强买入: 基本面≥80 + PEG<1.5 + 突破20日均线 + 成交量放大20%
+    - 观察: 基本面≥80 + PEG>2 + 回踩60日均线缩量
+    - 短线博弈: 基本面<60 + K线突破信号
+    """
+    if not klines or len(klines) < 60:
+        return {"signal": "insufficient_data", "label": "数据不足"}
+
+    closes = [float(k.close) for k in klines]
+    volumes = [float(k.volume) for k in klines]
+    idx = len(klines) - 1
+    price = closes[idx]
+
+    ma20 = _sma(closes, 20)
+    ma60 = _sma(closes, 60)
+
+    # 成交量：近5日均量 vs 近20日均量
+    vol_5 = _sma(volumes, 5)
+    vol_20 = _sma(volumes, 20)
+    vol_ratio = (vol_5 / vol_20 - 1.0) if vol_5 and vol_20 and vol_20 > 0 else 0.0
+
+    above_ma20 = ma20 is not None and price > ma20
+    near_ma60 = ma60 is not None and abs(price - ma60) / ma60 < 0.03 if ma60 else False
+    vol_up_20pct = vol_ratio > 0.20
+    vol_shrink = vol_ratio < -0.10
+
+    # 强买入信号
+    if (
+        fundamental_score >= 80
+        and peg is not None and peg < 1.5
+        and above_ma20
+        and vol_up_20pct
+    ):
+        return {
+            "signal": "strong_buy",
+            "label": "强买入",
+            "reasons": [
+                f"基本面{fundamental_score:.0f}分（优质）",
+                f"PEG={peg}（<1.5 估值合理）",
+                f"价格{price:.2f} > MA20={ma20:.2f}（突破20日均线）",
+                f"近5日量能较20日均量+{vol_ratio*100:.0f}%（放量）",
+            ],
+        }
+
+    # 观察信号
+    if (
+        fundamental_score >= 80
+        and peg is not None and peg > 2.0
+        and near_ma60
+        and vol_shrink
+    ):
+        return {
+            "signal": "watch",
+            "label": "观察",
+            "reasons": [
+                f"基本面{fundamental_score:.0f}分（优质）",
+                f"PEG={peg}（>2 估值偏高）",
+                f"价格{price:.2f} 回踩 MA60={ma60:.2f}（±3%）",
+                f"近5日量能较20日均量{vol_ratio*100:.0f}%（缩量）",
+            ],
+            "note": "等待估值消化",
+        }
+
+    # 短线博弈（基本面<60 但有技术突破）
+    if fundamental_score < 60 and above_ma20 and vol_up_20pct:
+        return {
+            "signal": "short_term",
+            "label": "短线博弈",
+            "reasons": [
+                f"基本面{fundamental_score:.0f}分（偏弱）",
+                f"价格突破MA20 + 放量{vol_ratio*100:.0f}%",
+            ],
+            "note": "严格止损，仅短线",
+        }
+
+    # 默认：技术信号描述
+    reasons: list[str] = []
+    if above_ma20:
+        reasons.append(f"站上MA20({ma20:.2f})")
+    elif ma20:
+        reasons.append(f"低于MA20({ma20:.2f})")
+    if vol_up_20pct:
+        reasons.append(f"放量+{vol_ratio*100:.0f}%")
+    elif vol_shrink:
+        reasons.append(f"缩量{vol_ratio*100:.0f}%")
+
+    return {
+        "signal": "neutral",
+        "label": "中性",
+        "reasons": reasons or ["无明显技术信号"],
+    }
+
+
+def _compute_fundamental_score(symbol: str) -> dict[str, Any]:
+    """对单只股票运行完整基本面分析，返回 composite_score 及关键指标。"""
+    try:
+        from app.analysis.engine import FundamentalEngine
+
+        engine = FundamentalEngine()
+        result = engine.run_full_analysis(symbol, db=None)
+        composite = result.get("composite_score")
+        if composite is None:
+            return {"score": None, "error": result.get("error", "no_composite_score")}
+        return {
+            "score": float(composite),
+            "profitability": result.get("modules", {}).get("profitability", {}).get("score"),
+            "growth": result.get("modules", {}).get("growth", {}).get("score"),
+            "cashflow": result.get("modules", {}).get("cashflow", {}).get("score"),
+            "valuation_score": result.get("modules", {}).get("valuation", {}).get("score"),
+            "pe_ttm": result.get("market", {}).get("pe_ttm"),
+            "profit_yoy": result.get("meta", {}).get("profit_yoy"),
+        }
+    except Exception as exc:
+        logger.debug("fundamental analysis failed for %s: %s", symbol, exc)
+        return {"score": None, "error": str(exc)}
+
+
+def _fund_level(score: float) -> str:
+    """基本面评分→字母等级。"""
+    if score >= 85:
+        return "A"
+    if score >= 75:
+        return "B+"
+    if score >= 65:
+        return "B"
+    if score >= 55:
+        return "C"
+    if score >= 40:
+        return "D"
+    return "E"
 
 
 def _fund_reject_reasons(
@@ -113,22 +291,20 @@ def _fund_reject_reasons(
 
 
 def _apply_tiers(items: list[dict]) -> tuple[list[dict], dict[str, list[dict]], dict[str, int]]:
-    """第二层：看涨已过滤后的列表按综合强度切 S/A/B。"""
-    tiers: dict[str, list[dict]] = {"S": [], "A": [], "B": []}
+    """按基本面评分切 A/B/C/D/E。"""
+    tiers: dict[str, list[dict]] = {"A": [], "B": [], "C": [], "D": [], "E": []}
     kept: list[dict] = []
     for row in items:
-        score = float(row.get("combined_score") or 0)
-        tier = _tier_of(score)
-        if not tier:
-            continue
+        fund_score = float(row.get("fundamental_score") or 0)
+        tier = _tier_of(fund_score)
         row = dict(row)
         row["tier"] = tier
         tiers[tier].append(row)
         kept.append(row)
     for t in tiers:
-        tiers[t].sort(key=lambda r: r.get("combined_score", 0), reverse=True)
-    kept.sort(key=lambda r: r.get("combined_score", 0), reverse=True)
-    counts = {t: len(tiers[t]) for t in ("S", "A", "B")}
+        tiers[t].sort(key=lambda r: r.get("fundamental_score", 0), reverse=True)
+    kept.sort(key=lambda r: r.get("fundamental_score", 0), reverse=True)
+    counts = {t: len(tiers[t]) for t in ("A", "B", "C", "D", "E")}
     return kept, tiers, counts
 
 
@@ -204,6 +380,9 @@ class MarketConfluenceService:
                     "close": round(float(bar.close), 4),
                 }
             if best:
+                # 附带 K 线数据用于后续买点信号检测
+                best["_closes"] = [round(float(k.close), 4) for k in klines]
+                best["_volumes"] = [float(k.volume) for k in klines]
                 return best, "hit"
             return None, "ok"
         except Exception as exc:
@@ -305,12 +484,87 @@ class MarketConfluenceService:
             kept.append(enriched)
         return kept, removed
 
+    def _fundamental_prescreen(
+        self, universe: list[tuple[str, str]]
+    ) -> tuple[list[tuple[str, str]], dict[str, int]]:
+        """第一层：对全量宇宙股做轻量基本面预筛，只保留合格股进入 K 线扫描。
+        使用已有的财报快照 + PE 数据，不跑完整分析引擎。
+        返回 (qualified_list, stats)。
+        """
+        if not universe:
+            return [], {"total": 0, "qualified": 0, "rejected": 0}
+
+        stats = {"total": len(universe), "qualified": 0, "rejected": 0, "no_data": 0}
+        sym_list = [s for s, _ in universe]
+
+        # 批量取 PE
+        pe_map = self._pe_map(sym_list)
+
+        # 财报快照
+        fund_map: dict[str, dict[str, float]] = {}
+        debt_map: dict[str, float] = {}
+        try:
+            snap_date, snap_df = resolve_latest_report_frame()
+            if snap_df is not None and not snap_df.empty:
+                for _, row in snap_df.iterrows():
+                    sym = _to_symbol(row.get("股票代码"))
+                    if not sym:
+                        continue
+                    entry: dict[str, float] = {}
+                    np_ = _num(row.get("净利润")) or _num(row.get("归母净利润")) or _num(row.get("净利润-净利润"))
+                    if np_ is not None:
+                        entry["net_profit"] = float(np_)
+                    roe = _num(row.get("净资产收益率"))
+                    if roe is not None:
+                        entry["roe"] = float(roe)
+                    py = _num(row.get("净利润-同比增长")) or _num(row.get("净利润同比增长"))
+                    if py is not None:
+                        entry["profit_yoy"] = float(py)
+                    if entry:
+                        fund_map[sym] = entry
+            debt_date = str(snap_date or "")
+            if debt_date and not debt_date.endswith("1231") and len(debt_date) >= 4:
+                debt_date = f"{debt_date[:4]}1231"
+            if debt_date:
+                debt_map = _fetch_debt_map(debt_date) or {}
+        except Exception as exc:
+            logger.warning("prescreen fundamental enrich failed: %s", exc)
+
+        qualified: list[tuple[str, str]] = []
+        for sym, name in universe:
+            fund = fund_map.get(sym) or {}
+            profit = fund.get("net_profit")
+            roe = fund.get("roe")
+            profit_yoy = fund.get("profit_yoy")
+            debt = debt_map.get(sym)
+            pe = pe_map.get(sym)
+
+            reasons = _fund_reject_reasons(
+                name=name,
+                profit=profit,
+                debt=debt,
+                roe=roe,
+                profit_yoy=profit_yoy,
+                pe=pe,
+            )
+            if reasons:
+                stats["rejected"] += 1
+                continue
+            if not fund and pe is None:
+                # 无任何基本面数据，也跳过
+                stats["no_data"] += 1
+                continue
+            qualified.append((sym, name))
+            stats["qualified"] += 1
+
+        return qualified, stats
+
     def scan_market(
         self,
         recent_bars: int = DEFAULT_RECENT_BARS,
         force: bool = False,
         *,
-        require_fresh: bool = True,
+        require_fresh: bool = False,
         progress: ProgressCb | None = None,
     ) -> dict[str, Any]:
         now = time.time()
@@ -328,52 +582,86 @@ class MarketConfluenceService:
             return cached
 
         universe, filt = self._symbols_with_klines(require_fresh=require_fresh)
-        jobs = [_Job(sym, name, recent_bars) for sym, name in universe]
-        raw_hits: list[dict] = []
-        skipped = 0
-        errors = 0
-        workers = min(SCAN_WORKERS, max(1, len(jobs)))
-        done = 0
-        total = len(jobs)
-        if progress:
-            progress(0, total, "scan")
-        if jobs:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {pool.submit(self._scan_job, job): job for job in jobs}
-                for fut in as_completed(futures):
-                    result, outcome = fut.result()
-                    done += 1
-                    if outcome == "hit" and result:
-                        raw_hits.append(result)
-                    elif outcome == "skipped":
-                        skipped += 1
-                    elif outcome == "error":
-                        errors += 1
-                    if progress:
-                        progress(done, total, "scan")
 
-        # 第一层已在 job 内完成（仅看涨）；此处统计候选
-        bullish_candidates = sorted(raw_hits, key=lambda r: r.get("combined_score", 0), reverse=True)
-        # 第二层：强度分层（丢弃 <110）
+        # ── 第一层：基本面预筛（全量宇宙 → 合格股） ──
         if progress:
-            progress(done, total, "tier")
-        tiered, _, _ = _apply_tiers(bullish_candidates)
-        # 第三层：基本面排雷
+            progress(0, len(universe), "prescreen")
+        qualified_universe, prescreen_stats = self._fundamental_prescreen(universe)
         if progress:
-            progress(done, total, "fundamentals")
-        screened, fund_removed = self._fundamental_screen(tiered)
-        items, tiers, tier_counts = _apply_tiers(screened)
+            progress(len(universe), len(universe), "prescreen")
+
+        # ── 第二层：对合格股跑完整基本面分析 ──
+        fund_scores: dict[str, dict[str, Any]] = {}
+        fund_symbols = [sym for sym, _ in qualified_universe]
+        total = len(fund_symbols)
+        if progress:
+            progress(0, total, "fundamentals")
+        if fund_symbols:
+            fund_workers = min(FUND_WORKERS, max(1, len(fund_symbols)))
+            with ThreadPoolExecutor(max_workers=fund_workers) as pool:
+                fund_futures = {
+                    pool.submit(_compute_fundamental_score, sym): sym
+                    for sym in fund_symbols
+                }
+                done = 0
+                for fut in as_completed(fund_futures):
+                    sym = fund_futures[fut]
+                    try:
+                        fund_scores[sym] = fut.result()
+                    except Exception:
+                        fund_scores[sym] = {"score": None, "error": "unknown"}
+                    done += 1
+                    if progress:
+                        progress(done, total, "fundamentals")
+
+        # ── 第三层：构建展示数据 + 分层 ──
+        enriched_items: list[dict] = []
+        fund_no_score = 0
+        for sym, name in qualified_universe:
+            fund = fund_scores.get(sym) or {}
+            fund_score = fund.get("score")
+            if fund_score is None:
+                fund_no_score += 1
+                continue
+
+            pe = fund.get("pe_ttm")
+            profit_yoy = fund.get("profit_yoy")
+            peg = _calc_peg(pe, profit_yoy)
+
+            enriched = {
+                "symbol": sym,
+                "name": name,
+                "fundamental_score": round(fund_score, 1),
+                "fundamental_level": _fund_level(fund_score),
+                "combined_score": round(fund_score, 1),
+                "peg": peg,
+                "pe_ttm": pe,
+                "profit_yoy": profit_yoy,
+                "roe": fund.get("roe"),
+                "debt_ratio": fund.get("debt_ratio"),
+                "fund_modules": {
+                    "profitability": fund.get("profitability"),
+                    "growth": fund.get("growth"),
+                    "cashflow": fund.get("cashflow"),
+                    "valuation": fund.get("valuation_score"),
+                },
+            }
+            enriched_items.append(enriched)
+
+        # 按基本面评分分层 A/B/C/D/E
+        if progress:
+            progress(total, total, "tier")
+        items, tiers, tier_counts = _apply_tiers(enriched_items)
 
         payload = {
             "items": items,
             "tiers": tiers,
             "tier_counts": tier_counts,
             "count": len(items),
-            "raw_hit_count": len(raw_hits),
-            "bullish_count": len(bullish_candidates),
-            "tiered_before_fund": len(tiered),
-            "fund_removed": fund_removed,
-            "scanned": len(jobs),
+            "fund_analyzed": len(fund_scores),
+            "fund_no_score": fund_no_score,
+            "prescreen": prescreen_stats,
+            "scanned": total,
             "universe_size": filt.get("universe_size", len(universe)),
             "prefiltered": filt.get("scannable", len(universe)),
             "prefilter": {
@@ -382,14 +670,16 @@ class MarketConfluenceService:
                 "short_bars": filt.get("short_bars", 0),
                 "stale_kline": filt.get("stale_kline", 0),
             },
-            "skipped": skipped,
-            "errors": errors,
+            "skipped": 0,
+            "errors": 0,
             "recent_bars": recent_bars,
             "cached": False,
             "cache_age_sec": 0,
             "description": (
-                "仅看涨；按综合强度分 S(≥120)/A(115-119)/B(110-114)；"
-                "并剔除亏损、负债率>70%、ROE<5%、净利同比<-30%、PE>80、ST/退市风险股"
+                "基本面预筛 → 完整基本面分析 → 按评分分层；"
+                f"全量 {prescreen_stats['total']} 只 → 基本面合格 {prescreen_stats['qualified']} 只 → "
+                f"展示 {len(items)} 只；"
+                "分层 A(≥85)/B(70-84)/C(55-69)/D(40-54)/E(<40)"
             ),
         }
         _cache["ts"] = now

@@ -176,27 +176,48 @@ export interface MarketConfluenceItem {
   signal_level: string
   candle_date: string
   close: number
-  tier?: 'S' | 'A' | 'B' | string
+  tier?: 'A' | 'B' | 'C' | 'D' | 'E' | string
   net_profit?: number | null
   debt_ratio?: number | null
   roe?: number | null
   profit_yoy?: number | null
   pe_ttm?: number | null
+  // 动态权重 & 买点信号
+  fundamental_score?: number | null
+  fundamental_level?: string
+  kline_weight?: number
+  fundamental_weight?: number
+  kline_score_normalized?: number
+  peg?: number | null
+  buy_signal?: {
+    signal: string
+    label: string
+    reasons: string[]
+    note?: string
+  }
+  fund_modules?: {
+    profitability?: number | null
+    growth?: number | null
+    cashflow?: number | null
+    valuation?: number | null
+  }
 }
 
 export interface MarketConfluenceScanResult {
   items: MarketConfluenceItem[]
   tiers?: {
-    S: MarketConfluenceItem[]
     A: MarketConfluenceItem[]
     B: MarketConfluenceItem[]
+    C: MarketConfluenceItem[]
+    D: MarketConfluenceItem[]
+    E: MarketConfluenceItem[]
   }
-  tier_counts?: { S: number; A: number; B: number }
+  tier_counts?: { A: number; B: number; C: number; D: number; E: number }
   count: number
   raw_hit_count?: number
   bullish_count?: number
-  tiered_before_fund?: number
-  fund_removed?: number
+  fund_analyzed?: number
+  fund_no_score?: number
   scanned: number
   universe_size: number
   prefiltered?: number
@@ -212,6 +233,8 @@ export interface MarketConfluenceScanResult {
   cached: boolean
   cache_age_sec: number
   description?: string
+  weight_rules?: Record<string, { kline_weight: number; focus: string }>
+  buy_signal_rules?: Record<string, string>
 }
 
 export interface JobProgress {

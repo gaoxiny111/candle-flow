@@ -34,7 +34,7 @@ const marketProgress = ref<JobProgress | null>(null)
 const marketScanError = ref('')
 const marketScanHint = ref('')
 const marketItems = ref<MarketConfluenceItem[]>([])
-const marketTierFilter = ref<'all' | 'S' | 'A' | 'B'>('all')
+const marketTierFilter = ref<'all' | 'A' | 'B' | 'C' | 'D' | 'E'>('all')
 const marketStats = ref<{
   scanned: number
   universe_size: number
@@ -42,8 +42,9 @@ const marketStats = ref<{
   cached: boolean
   raw_hit_count?: number
   bullish_count?: number
-  fund_removed?: number
-  tier_counts?: { S: number; A: number; B: number }
+  fund_analyzed?: number
+  fund_no_score?: number
+  tier_counts?: { A: number; B: number; C: number; D: number; E: number }
 } | null>(null)
 let percentileTimer: ReturnType<typeof setTimeout> | null = null
 let analysisToken = 0
@@ -214,10 +215,26 @@ const filteredMarketItems = computed(() => {
 })
 
 function tierLabel(tier?: string) {
-  if (tier === 'S') return 'S · 核心池'
-  if (tier === 'A') return 'A · 观察池'
-  if (tier === 'B') return 'B · 备选池'
-  return '—'
+  const labels: Record<string, string> = {
+    A: 'A · 优质（≥85）',
+    B: 'B · 良好（70-84）',
+    C: 'C · 中等（55-69）',
+    D: 'D · 偏弱（40-54）',
+    E: 'E · 高风险（<40）',
+  }
+  return labels[tier || ''] || '—'
+}
+
+function fundScoreClass(score: number): string {
+  if (score >= 80) return 'fund-good'
+  if (score >= 60) return 'fund-mid'
+  return 'fund-bad'
+}
+
+function pegClass(peg: number): string {
+  if (peg < 1.5) return 'peg-good'
+  if (peg > 2) return 'peg-bad'
+  return 'peg-mid'
 }
 
 onMounted(async () => {
@@ -338,7 +355,7 @@ async function loadMarketScan(force = false) {
   marketScanning.value = true
   marketScanError.value = ''
   marketProgress.value = { status: 'running', message: force ? '正在重新扫描…' : '扫描启动中…', pct: 0 }
-  marketScanHint.value = force ? '正在重新扫描全市场…' : '正在扫描全市场强技术共振信号…'
+  marketScanHint.value = force ? '正在重新扫描全市场…' : '正在扫描全市场基本面…'
   try {
     const { data } = await scanMarketConfluence({ force, recent_bars: 2 }, (job) => {
       marketProgress.value = job
@@ -355,7 +372,8 @@ async function loadMarketScan(force = false) {
           cached: payload.cached,
           raw_hit_count: payload.raw_hit_count,
           bullish_count: payload.bullish_count,
-          fund_removed: payload.fund_removed,
+          fund_analyzed: payload.fund_analyzed,
+          fund_no_score: payload.fund_no_score,
           tier_counts: payload.tier_counts,
         }
       : null
@@ -364,9 +382,8 @@ async function loadMarketScan(force = false) {
     const age = payload?.cache_age_sec
     const pref = payload?.prefiltered
     marketScanHint.value = payload?.cached
-      ? `缓存结果（${age ?? 0}s 前）：看涨候选 ${payload.bullish_count ?? '—'} → 展示 ${payload.count} 只（S ${tc?.S ?? 0} / A ${tc?.A ?? 0} / B ${tc?.B ?? 0}）`
-      : `有效标的 ${pref ?? payload?.scanned ?? 0}/${payload?.universe_size ?? 0}；看涨候选 ${payload?.bullish_count ?? 0} → 分层后 ${payload?.count ?? 0} 只（S ${tc?.S ?? 0} / A ${tc?.A ?? 0} / B ${tc?.B ?? 0}）` +
-        (payload?.fund_removed ? `，基本面剔除 ${payload.fund_removed}` : '')
+      ? `缓存结果（${age ?? 0}s 前）：基本面合格 ${payload.prescreen?.qualified ?? '—'} → 展示 ${payload.count} 只（A ${tc?.A ?? 0} / B ${tc?.B ?? 0} / C ${tc?.C ?? 0} / D ${tc?.D ?? 0} / E ${tc?.E ?? 0}）`
+      : `全量 ${payload.prescreen?.total ?? pref ?? payload?.scanned ?? 0} 只 → 基本面合格 ${payload.prescreen?.qualified ?? 0} 只（剔除 ${payload.prescreen?.rejected ?? 0}） → 展示 ${payload?.count ?? 0} 只（A ${tc?.A ?? 0} / B ${tc?.B ?? 0} / C ${tc?.C ?? 0} / D ${tc?.D ?? 0} / E ${tc?.E ?? 0}）`
   } catch (e) {
     marketScanError.value = apiErrorText(e, '市场扫描失败')
     marketScanHint.value = ''
@@ -560,8 +577,8 @@ async function switchBoardTab(tab: 'watch' | 'market') {
           <div class="progress-track"><div class="progress-fill" :style="{ width: `${marketProgressPct}%` }" /></div>
         </div>
         <p class="market-desc">
-          自动扫描主板非 ST，仅保留<strong>看涨</strong>强共振，再按综合强度分层：
-          S≥120 核心池 / A 115–119 观察池 / B 110–114 备选池；并剔除亏损、负债率&gt;70%、ROE&lt;5%、净利同比&lt;-30%、PE&gt;80。
+          自动扫描主板非 ST，先做<strong>基本面预筛</strong>（剔除亏损/高负债/低 ROE/净利暴跌/高 PE），再对合格股做 K 线形态扫描，按基本面评分分层：
+          A≥85 优质 / B 70-84 良好 / C 55-69 中等 / D 40-54 偏弱 / E&lt;40 高风险。
         </p>
         <p v-if="marketScanHint" class="scan-hint">{{ marketScanHint }}</p>
         <p v-if="marketScanError" class="follow-error">{{ marketScanError }}</p>
@@ -581,19 +598,11 @@ async function switchBoardTab(tab: 'watch' | 'market') {
           </button>
           <button
             type="button"
-            class="tier-chip tier-s"
-            :class="{ active: marketTierFilter === 'S' }"
-            @click="marketTierFilter = 'S'"
-          >
-            S 核心 {{ marketStats?.tier_counts?.S ?? 0 }}
-          </button>
-          <button
-            type="button"
             class="tier-chip tier-a"
             :class="{ active: marketTierFilter === 'A' }"
             @click="marketTierFilter = 'A'"
           >
-            A 观察 {{ marketStats?.tier_counts?.A ?? 0 }}
+            A 优质 {{ marketStats?.tier_counts?.A ?? 0 }}
           </button>
           <button
             type="button"
@@ -601,12 +610,36 @@ async function switchBoardTab(tab: 'watch' | 'market') {
             :class="{ active: marketTierFilter === 'B' }"
             @click="marketTierFilter = 'B'"
           >
-            B 备选 {{ marketStats?.tier_counts?.B ?? 0 }}
+            B 良好 {{ marketStats?.tier_counts?.B ?? 0 }}
+          </button>
+          <button
+            type="button"
+            class="tier-chip tier-c"
+            :class="{ active: marketTierFilter === 'C' }"
+            @click="marketTierFilter = 'C'"
+          >
+            C 中等 {{ marketStats?.tier_counts?.C ?? 0 }}
+          </button>
+          <button
+            type="button"
+            class="tier-chip tier-d"
+            :class="{ active: marketTierFilter === 'D' }"
+            @click="marketTierFilter = 'D'"
+          >
+            D 偏弱 {{ marketStats?.tier_counts?.D ?? 0 }}
+          </button>
+          <button
+            type="button"
+            class="tier-chip tier-e"
+            :class="{ active: marketTierFilter === 'E' }"
+            @click="marketTierFilter = 'E'"
+          >
+            E 高风险 {{ marketStats?.tier_counts?.E ?? 0 }}
           </button>
         </div>
 
         <div v-if="!marketScanning && !marketItems.length && !marketScanError" class="empty">
-          暂无达标看涨强共振。可点「重新扫描」，或先在图表页同步更多股票的 K 线。
+          暂无基本面合格股票。可点「重新扫描」，或先在图表页同步更多股票的 K 线。
         </div>
         <template v-else-if="filteredMarketItems.length">
           <div class="watch-table-wrap">
@@ -616,20 +649,18 @@ async function switchBoardTab(tab: 'watch' | 'market') {
                   <th>等级</th>
                   <th>股票</th>
                   <th>代码</th>
-                  <th>形态</th>
-                  <th>共振</th>
-                  <th>综合强度</th>
-                  <th>ROE</th>
+                  <th>基本面评分</th>
+                  <th>PEG</th>
                   <th>PE</th>
+                  <th>ROE</th>
                   <th>负债率</th>
-                  <th>日期</th>
                   <th>操作</th>
                 </tr>
               </thead>
               <tbody>
                 <tr
                   v-for="item in filteredMarketItems"
-                  :key="item.symbol + item.pattern_name + item.candle_date"
+                  :key="item.symbol"
                   class="watch-row market-hit"
                   :class="'tier-row-' + (item.tier || '').toLowerCase()"
                 >
@@ -641,30 +672,19 @@ async function switchBoardTab(tab: 'watch' | 'market') {
                   <td class="symbol-name">{{ item.name || '—' }}</td>
                   <td class="symbol-code">{{ item.symbol.split('.')[0] }}</td>
                   <td>
-                    <div class="pattern-cell">{{ patternNameZh(item.pattern_name) }}</div>
-                    <div class="muted">形态分 {{ item.pattern_score }}</div>
+                    <span class="fund-score" :class="fundScoreClass(item.fundamental_score)">
+                      {{ item.fundamental_score?.toFixed(1) ?? '—' }}
+                    </span>
                   </td>
                   <td>
-                    <div class="confluence-highlight">汇聚 {{ item.confluence_count }} 项</div>
-                    <div class="hit-tags">
-                      <span v-for="h in item.confluence_detail.slice(0, 4)" :key="h.name" class="hit-tag">
-                        {{ h.name }}
-                      </span>
-                    </div>
+                    <span v-if="item.peg != null" :class="pegClass(item.peg)">{{ item.peg.toFixed(2) }}</span>
+                    <span v-else class="muted">—</span>
                   </td>
-                  <td class="score-cell strong">{{ item.combined_score }}</td>
-                  <td class="div-cell">
-                    {{ item.roe != null ? item.roe.toFixed(1) + '%' : '—' }}
-                  </td>
-                  <td class="div-cell">
-                    {{ item.pe_ttm != null ? item.pe_ttm.toFixed(1) : '—' }}
-                  </td>
-                  <td class="div-cell">
-                    {{ item.debt_ratio != null ? item.debt_ratio.toFixed(1) + '%' : '—' }}
-                  </td>
-                  <td>{{ item.candle_date }}</td>
+                  <td>{{ item.pe_ttm?.toFixed(1) ?? '—' }}</td>
+                  <td>{{ item.roe?.toFixed(1) ?? '—' }}%</td>
+                  <td>{{ item.debt_ratio?.toFixed(1) ?? '—' }}%</td>
                   <td>
-                    <button type="button" class="link-btn" @click="openDetail(item.symbol)">详情</button>
+                    <button class="follow-btn" @click="openChart(item.symbol)">图表</button>
                   </td>
                 </tr>
               </tbody>
@@ -673,10 +693,10 @@ async function switchBoardTab(tab: 'watch' | 'market') {
           <div class="watch-cards market-cards">
             <article
               v-for="item in filteredMarketItems"
-              :key="'mkt-' + item.symbol + item.pattern_name + item.candle_date"
+              :key="'mkt-' + item.symbol"
               class="watch-card market-card"
               :class="'tier-row-' + (item.tier || '').toLowerCase()"
-              @click="openDetail(item.symbol)"
+              @click="openChart(item.symbol)"
             >
               <div class="watch-card-head">
                 <div>
@@ -688,25 +708,17 @@ async function switchBoardTab(tab: 'watch' | 'market') {
                 </span>
               </div>
               <div class="watch-card-quote">
-                <span>综合 {{ item.combined_score }}</span>
-                <span class="muted">{{ item.candle_date }}</span>
+                <span>基本面 {{ item.fundamental_score?.toFixed(1) ?? '—' }}</span>
+                <span v-if="item.peg != null" :class="pegClass(item.peg)">PEG {{ item.peg.toFixed(2) }}</span>
               </div>
               <div class="watch-card-metrics">
-                <div><span class="k">形态</span><span>{{ patternNameZh(item.pattern_name) }}</span></div>
-                <div><span class="k">共振</span><span>{{ item.confluence_count }} 项</span></div>
-                <div><span class="k">ROE</span><span>{{ item.roe != null ? item.roe.toFixed(1) + '%' : '—' }}</span></div>
-                <div><span class="k">PE</span><span>{{ item.pe_ttm != null ? item.pe_ttm.toFixed(1) : '—' }}</span></div>
-                <div><span class="k">负债率</span><span>{{ item.debt_ratio != null ? item.debt_ratio.toFixed(1) + '%' : '—' }}</span></div>
-                <div><span class="k">形态分</span><span>{{ item.pattern_score }}</span></div>
-              </div>
-              <div v-if="item.confluence_detail?.length" class="hit-tags market-card-tags">
-                <span v-for="h in item.confluence_detail.slice(0, 4)" :key="h.name" class="hit-tag">
-                  {{ h.name }}
-                </span>
+                <div><span class="k">PE</span><span>{{ item.pe_ttm?.toFixed(1) ?? '—' }}</span></div>
+                <div><span class="k">ROE</span><span>{{ item.roe?.toFixed(1) ?? '—' }}%</span></div>
+                <div><span class="k">负债率</span><span>{{ item.debt_ratio?.toFixed(1) ?? '—' }}%</span></div>
               </div>
               <div class="watch-card-head market-card-foot">
-                <span class="muted">点按查看详情</span>
-                <button type="button" class="link-btn" @click.stop="openDetail(item.symbol)">详情</button>
+                <span class="muted">点按查看图表</span>
+                <button type="button" class="link-btn" @click.stop="openChart(item.symbol)">图表</button>
               </div>
             </article>
           </div>
@@ -866,9 +878,11 @@ th { color: var(--text-secondary); font-weight: 500; }
   cursor: pointer;
 }
 .tier-chip.active { color: var(--text-primary); border-color: var(--color-primary); background: rgba(24, 144, 255, 0.08); }
-.tier-chip.tier-s.active { border-color: #d48806; background: rgba(250, 173, 20, 0.12); color: #ad6800; }
 .tier-chip.tier-a.active { border-color: #389e0d; background: rgba(82, 196, 26, 0.12); color: #389e0d; }
-.tier-chip.tier-b.active { border-color: #8c8c8c; background: rgba(0, 0, 0, 0.04); }
+.tier-chip.tier-b.active { border-color: #1677ff; background: rgba(24, 144, 255, 0.10); color: #1677ff; }
+.tier-chip.tier-c.active { border-color: #d48806; background: rgba(250, 173, 20, 0.12); color: #ad6800; }
+.tier-chip.tier-d.active { border-color: #d46b08; background: rgba(255, 120, 50, 0.10); color: #d46b08; }
+.tier-chip.tier-e.active { border-color: #cf1322; background: rgba(245, 34, 45, 0.10); color: #cf1322; }
 .tier-badge {
   display: inline-block;
   font-size: 12px;
@@ -879,8 +893,15 @@ th { color: var(--text-secondary); font-weight: 500; }
 }
 .tier-badge.tier-s { background: rgba(250, 173, 20, 0.18); color: #ad6800; }
 .tier-badge.tier-a { background: rgba(82, 196, 26, 0.15); color: #389e0d; }
-.tier-badge.tier-b { background: rgba(0, 0, 0, 0.06); color: var(--text-secondary); }
-.tier-row-s { background: rgba(250, 173, 20, 0.05); }
+.tier-badge.tier-b { background: rgba(24, 144, 255, 0.12); color: #1677ff; }
+.tier-badge.tier-c { background: rgba(250, 173, 20, 0.15); color: #ad6800; }
+.tier-badge.tier-d { background: rgba(255, 120, 50, 0.12); color: #d46b08; }
+.tier-badge.tier-e { background: rgba(245, 34, 45, 0.12); color: #cf1322; }
+.tier-row-a { background: rgba(82, 196, 26, 0.04); }
+.tier-row-b { background: rgba(24, 144, 255, 0.03); }
+.tier-row-c { background: rgba(250, 173, 20, 0.03); }
+.tier-row-d { background: rgba(255, 120, 50, 0.03); }
+.tier-row-e { background: rgba(245, 34, 45, 0.03); }
 .market-hit { background: rgba(82, 196, 26, 0.04); }
 .market-hit:hover { background: rgba(24, 144, 255, 0.06); }
 .confluence-highlight { font-weight: 650; color: #389e0d; }
@@ -895,6 +916,27 @@ th { color: var(--text-secondary); font-weight: 500; }
 .pattern-cell { font-weight: 600; }
 .muted { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
 .score-cell.strong { color: #389e0d; }
+/* 动态权重 & 买点信号样式 */
+.fund-score { font-weight: 700; font-size: 14px; }
+.fund-good { color: #389e0d; }
+.fund-mid { color: #d48806; }
+.fund-bad { color: #cf1322; }
+.weight-badge {
+  font-size: 12px; font-weight: 600;
+  padding: 2px 6px; border-radius: 4px;
+  background: rgba(24, 144, 255, 0.08); color: #1677ff;
+}
+.peg-good { color: #389e0d; font-weight: 600; }
+.peg-mid { color: #d48806; font-weight: 600; }
+.peg-bad { color: #cf1322; font-weight: 600; }
+.buy-signal-tag {
+  display: inline-block; font-size: 12px; font-weight: 600;
+  padding: 2px 8px; border-radius: 4px; white-space: nowrap;
+}
+.signal-strong_buy { background: rgba(245, 34, 45, 0.12); color: #cf1322; }
+.signal-watch { background: rgba(250, 173, 20, 0.15); color: #ad6800; }
+.signal-short_term { background: rgba(24, 144, 255, 0.12); color: #1677ff; }
+.signal-neutral { background: rgba(0, 0, 0, 0.06); color: var(--text-secondary); }
 .badge {
   display: inline-block;
   padding: 2px 8px;
