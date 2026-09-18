@@ -14,6 +14,35 @@ from app.services.fundamental_screen import (
 )
 
 
+def normalize_profit_yoy(raw: float | None) -> dict[str, Any]:
+    """
+    净利润同比的口径拆分（展示 vs 外推）：
+
+    - profit_yoy        : 真实披露同比，原样保留，用于展示 / 成长性评分 / 风险提示
+    - profit_yoy_forward: 仅用于前瞻外推（动态PE 等）。基期接近 0 或并表暴增时
+                          按 ±300% 上限折减，避免把一次性增速当成可持续增速
+                          （例如 493% 直接外推会算出 4x 的前瞻PE）
+
+    历史行为是把 profit_yoy 本身硬截断为 300，导致 2026 中报 493.25% 显示成 300%，
+    且 PEG/前瞻成长性都建立在错误分母上。
+    """
+    if raw is None:
+        return {
+            "profit_yoy": None,
+            "profit_yoy_raw": None,
+            "profit_yoy_forward": None,
+            "profit_yoy_extreme": False,
+        }
+    v = float(raw)
+    extreme = abs(v) > 300
+    return {
+        "profit_yoy": v,
+        "profit_yoy_raw": v,
+        "profit_yoy_extreme": extreme,
+        "profit_yoy_forward": (300.0 if v > 0 else -80.0) if extreme else v,
+    }
+
+
 def _pick(row: Any, *keys: str) -> float | None:
     for k in keys:
         v = _num(row.get(k)) if hasattr(row, "get") else None
@@ -443,19 +472,19 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
         meta["name"] = meta.get("name") or str(latest_raw.get("股票简称") or "")
         meta["industry"] = meta.get("industry") or str(latest_raw.get("所处行业") or "")
         meta["revenue_yoy"] = _pick(latest_raw, "营业总收入-同比增长")
-        meta["profit_yoy"] = _pick(latest_raw, "净利润-同比增长")
-        # 极端同比（基期接近 0）截断，避免 1000%+ 扭曲评分
-        if meta.get("profit_yoy") is not None and abs(float(meta["profit_yoy"])) > 300:
-            meta["profit_yoy_raw"] = meta["profit_yoy"]
-            meta["profit_yoy"] = 300.0 if float(meta["profit_yoy"]) > 0 else -80.0
+        # 真实披露同比一律原样保留（展示 / 成长性评分 / 风险提示都以它为准）；
+        # 只有前瞻外推场景才用折减后口径，见 normalize_profit_yoy。
+        meta.update(normalize_profit_yoy(_pick(latest_raw, "净利润-同比增长")))
         meta["ocf_per_share"] = _pick(latest_raw, "每股经营现金流量")
         meta["eps"] = _pick(latest_raw, "每股收益")
         meta["latest_report"] = latest_d
-        # 当期（可中报）利润含金量：每股经营现金流 / 每股收益 ≈ OCF/净利
+        # 当期（可中报）利润含金量：每股经营现金流 / 每股收益 ≈ OCF/净利。
+        # 注意这是近似口径（每股指标各自四舍五入），下面拿到同报告期绝对值后会覆盖。
         ocf_ps = meta.get("ocf_per_share")
         eps = meta.get("eps")
         if ocf_ps is not None and eps is not None and abs(float(eps)) > 1e-9:
             meta["latest_cash_ratio"] = float(ocf_ps) / float(eps)
+            meta["latest_cash_ratio_source"] = "每股经营现金流/每股收益（近似口径）"
         # 扣非归母净利：识别「归母高增但主业仍亏」的利润幻增
         ded = fetch_deducted_parent_netprofit(symbol, latest_d)
         if ded is not None:
@@ -569,6 +598,24 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
             fcf_latest = _sina_fcf(cf_latest)
             if fcf_latest is not None:
                 meta["latest_fcf"] = float(fcf_latest)
+        # ── 当期利润含金量：用「同报告期绝对值」统一口径（分子 OCF / 分母归母净利）──
+        # 原先用 每股经营现金流/每股收益 估算，两个每股指标各自四舍五入后
+        # 会带来 ~2pct 偏差（如 -288.2% vs 实际 -289.9%）。
+        _np_period = (sina_is_all.get(latest_ymd) or {}).get("parent_net_profit")
+        if _np_period is None:
+            _np_period = _pick(latest_raw, "净利润", "归母净利润") if latest_raw else None
+        if (
+            meta.get("latest_operating_cashflow") is not None
+            and _np_period is not None
+            and abs(float(_np_period)) > 1e-6
+        ):
+            meta["latest_cash_ratio"] = round(
+                float(meta["latest_operating_cashflow"]) / float(_np_period), 4
+            )
+            meta["latest_cash_ratio_source"] = (
+                f"经营现金流/归母净利（{latest_ymd}同期绝对值口径）"
+            )
+            meta["latest_period_net_profit"] = float(_np_period)
         bs_latest = sina_bs_all.get(latest_ymd)
         if bs_latest and bs_latest.get("total_assets") and bs_latest.get("total_liabilities"):
             from app.analysis.sina_financials import interest_bearing_debt as _ibd
@@ -646,11 +693,26 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
             return item, "eastmoney"
         return None, None
 
+    # 「以最新报告期为锚」：中报/季报已披露时，优先采用最新报告期的资产负债表，
+    # 否则会出现「2026 中报已出，但仍用 2025 年报负债率」的滞后
+    # （例：商络电子 2025 年报 72.96% → 2026 中报 75.76%，+2.8pct 风险信号被掩盖）。
+    if latest_ymd and not latest_ymd.endswith("1231"):
+        _item, _src = _pick_bs(latest_ymd)
+        if _item:
+            zcfz_row, zcfz_date, zcfz_source = _item, latest_ymd, _src
+            debt_ratio = float(zcfz_row["debt_ratio"])
+            meta["debt_ratio_period"] = latest_ymd
+            meta["debt_ratio_scope"] = "最新报告期"
+
     for cand in list(reversed(list(fd.index))):
+        if zcfz_row is not None:
+            break
         item, src = _pick_bs(str(cand))
         if item:
             zcfz_row, zcfz_date, zcfz_source = item, str(cand), src
             debt_ratio = float(zcfz_row["debt_ratio"])
+            meta["debt_ratio_period"] = str(cand)
+            meta["debt_ratio_scope"] = "最近年报"
             break
     if zcfz_row is None:
         for pool in (sina_bs_map, by_date):
@@ -661,6 +723,8 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
                 if item:
                     zcfz_row, zcfz_date, zcfz_source = item, pick, src
                     debt_ratio = float(zcfz_row["debt_ratio"])
+                    meta["debt_ratio_period"] = pick
+                    meta["debt_ratio_scope"] = "最近年报"
                     break
     if debt_ratio is None and not fd.empty:
         last = fd.iloc[-1]
@@ -696,8 +760,14 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
         ibd_ratio = round(ibd / float(ta) * 100, 2) if ta and float(ta) > 0 else None
         ca = cash + ar + inv
         cl_est = op_liab + short_borrow
-        current_ratio = round(ca / cl_est, 2) if cl_est > 0 else None
-        quick_ratio = round((cash + ar) / cl_est, 2) if cl_est > 0 else None
+        # 分子为 0 表示该数据源没映射到货币资金/应收账款/存货（银行等金融股
+        # 用「现金及存放央行款项」「客户贷款」等科目），属「不可得」而非
+        # 「流动性为 0」。此前按 0 参与打分，20 家 A 股银行的流动/速动比率
+        # 全部是 0.0 → 各自拿到 0 分（最差档），把存款类机构误判成流动性枯竭。
+        current_ratio = round(ca / cl_est, 2) if cl_est > 0 and ca > 0 else None
+        quick_ratio = (
+            round((cash + ar) / cl_est, 2) if cl_est > 0 and (cash + ar) > 0 else None
+        )
         meta["balance_sheet"] = {
             "report_date": zcfz_date,
             "total_assets": ta,

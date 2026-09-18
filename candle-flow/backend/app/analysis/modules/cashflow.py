@@ -4,6 +4,18 @@ import numpy as np
 import pandas as pd
 
 from app.analysis.base import AnalysisLevel, BaseAnalyzer, IndicatorResult, ModuleResult, format_report_period, score_to_level
+from app.analysis.config.company_profiles import distribution_benchmarks, is_distribution
+
+
+def _fmt_yi(value: float) -> str:
+    """
+    金额（已是「亿」单位）的自适应精度显示。
+
+    小额金额不能用 %.0f：0.45 亿会被舍成「0亿」，让「现金分红 0亿」这种
+    与事实不符的文案出现在报告里。10 亿以下保留 1 位小数，否则取整。
+    """
+    v = float(value or 0)
+    return f"{v:.1f}" if abs(v) < 10 else f"{v:.0f}"
 
 
 class CashflowAnalyzer(BaseAnalyzer):
@@ -14,6 +26,18 @@ class CashflowAnalyzer(BaseAnalyzer):
         warnings: list[str] = []
         if financial_data.empty:
             return ModuleResult("现金流质量", 0, AnalysisLevel.DANGER, warnings=["暂无现金流数据"])
+
+        # 分销/贸易商业模式：低净利率、高周转，上游预付 + 下游长账期，
+        # 扩张期经营现金流为负属行业常态，不能直接套用制造业阈值。
+        is_dist = is_distribution(
+            str(kwargs.get("name") or ""),
+            str(kwargs.get("symbol") or ""),
+            str(kwargs.get("industry") or ""),
+        ) or str(kwargs.get("cashflow_profile") or "") == "distribution"
+        rev_yoy_v = kwargs.get("revenue_yoy")
+        dist_expanding = (
+            is_dist and rev_yoy_v is not None and float(rev_yoy_v) >= 15
+        )
 
         fd = financial_data
         annual_dates = kwargs.get("annual_dates") or list(fd.index)
@@ -85,13 +109,17 @@ class CashflowAnalyzer(BaseAnalyzer):
             if use_latest and kwargs.get("eps") is not None and float(kwargs.get("eps") or 0) < 0:
                 profit_for_sign = -1.0
             score_ratio = cash_ratio  # 默认用当期值，后续按趋势逻辑覆盖
+            cr_label = "经营现金流/净利润(当期)"
+            # 必须先初始化：下方「年报对照」「指标权重」等处在分支外读取它，
+            # 而 profit_for_sign < 0 分支不会进入均值判断逻辑，
+            # 否则亏损股（如万科A）会直接抛 NameError 导致整个分析中断。
+            is_anomaly = False
             if profit_for_sign < 0:
                 score, level = 35.0, AnalysisLevel.POOR
                 cr_comment = "净利为负时该比率失真，不按利润含金量解读"
             else:
                 # ── 优先用5年均值评分，避免单期扰动（如所得税集中支付） ──
                 # 判断当期是否偏离均值超过2个标准差
-                is_anomaly = False
                 if (cash_ratio_5y_avg is not None and cash_ratio_5y_std is not None
                         and cash_ratio_5y_std > 1e-6):
                     if abs(cash_ratio - cash_ratio_5y_avg) > 2 * cash_ratio_5y_std:
@@ -107,6 +135,8 @@ class CashflowAnalyzer(BaseAnalyzer):
                     if is_temporary:
                         # 短期扰动（所得税集中支付/战略备货/汇兑），不降级，按5年均值评分
                         score_ratio = cash_ratio_5y_avg
+                        # 按均值打分 → 标签与展示值也必须切到均值口径
+                        cr_label = "经营现金流/净利润(5年均值)"
                         reason = "利润高增+战略备货" if profit_growing else "所得税/汇兑等"
                         cr_comment = (
                             f"当期经营现金流/净利={cash_ratio:.2f}偏离5年均值{cash_ratio_5y_avg:.2f}"
@@ -116,6 +146,7 @@ class CashflowAnalyzer(BaseAnalyzer):
                     else:
                         # 结构性恶化，按当期值评分
                         score_ratio = cash_ratio
+                        cr_label = "经营现金流/净利润(当期)"
                         reason2 = "年报不健康" if not annual_ok else "利润无增长"
                         cr_comment = (
                             f"当期经营现金流/净利={cash_ratio:.2f}显著偏离5年均值{cash_ratio_5y_avg:.2f}"
@@ -124,6 +155,7 @@ class CashflowAnalyzer(BaseAnalyzer):
                 elif cash_ratio_5y_avg is not None:
                     # 当期正常，按5年均值评分
                     score_ratio = cash_ratio_5y_avg
+                    cr_label = "经营现金流/净利润(5年均值)"
                     cr_comment = (
                         f"5年均值{score_ratio:.2f}（当期{cash_ratio:.2f}），"
                         f"避免单期扰动，按趋势值评分"
@@ -137,6 +169,12 @@ class CashflowAnalyzer(BaseAnalyzer):
                 if use_latest and cash_ratio < 0.4 and not is_anomaly:
                     # ── 年报修正锚：上年年报健康时，中报/季报低比值可能是阶段性现象 ──
                     # 战略备货（存货↑）+ 订单饱满（应收↑）导致现金流占用，≠利润注水
+                    #
+                    # 本分支一律按「当期值」定性与打分，因此名称与展示值必须同步切到当期。
+                    # 否则会出现 name=「(5年均值)」、value=1.16（五年均值）、score=25（当期口径）
+                    # 这种名/值/分三者互相矛盾的报告（深圳华强即如此）。
+                    cr_label = "经营现金流/净利润(当期)"
+                    score_ratio = cash_ratio
                     annual_ok = annual_cash_ratio is not None and float(annual_cash_ratio) >= 0.7
                     yoy_p_v = kwargs.get("profit_yoy")
                     profit_growing = yoy_p_v is not None and float(yoy_p_v) >= 15
@@ -157,17 +195,52 @@ class CashflowAnalyzer(BaseAnalyzer):
                     else:
                         score = min(score, 25.0)
                         level = AnalysisLevel.DANGER
+                        # 年报对照锚的措辞必须与事实一致：进入本分支只说明
+                        # 「年报健康 + 利润高增」不同时成立。若 annual_ok 为假，
+                        # 上年年报本身也不健康（深圳华强 2025 年报 OCF/净利 -2.14），
+                        # 此时再写「勿被上年年报高含金量掩盖」即自相矛盾。
+                        if annual_cash_ratio is None:
+                            _annual_txt = "且无可对照的健康年报锚"
+                        elif annual_ok:
+                            _annual_txt = (
+                                f"上年年报 {float(annual_cash_ratio):.2f} 虽健康，"
+                                f"但本期利润未高增，现金流回落不宜按扩张占用豁免"
+                            )
+                        else:
+                            _annual_txt = (
+                                f"上年年报 {float(annual_cash_ratio):.2f} 同样不健康，"
+                                f"已连续两期利润含金量偏低"
+                            )
                         cr_comment = (
                             f"当期({period_for_cr})经营现金流/净利仅 {cash_ratio:.1%}，"
-                            f"显著弱于健康阈值；勿被上年年报高含金量掩盖"
+                            f"显著弱于健康阈值；{_annual_txt}"
                         )
                         warnings.append(
                             f"当期现金流恶化：经营现金流/净利润={cash_ratio:.1%}（{period_for_cr}），"
                             f"利润含金量偏低"
                         )
+            # ── 商业模式差异化：分销/贸易类扩张期现金流为负属行业常态 ──
+            if is_dist:
+                _relaxed = self._score_by_range(
+                    score_ratio, (0.5, 5.0), (0.2, 0.5), (0.05, 0.2)
+                )[0]
+                if dist_expanding:
+                    score = max(score, _relaxed, 52.0)
+                    level = score_to_level(score)
+                    cr_comment += (
+                        f"；分销模式（低净利率高周转，上游预付/下游长账期）下，"
+                        f"营收{float(rev_yoy_v):+.1f}% 扩张期经营现金流为负属行业常态，"
+                        f"已按分销口径下移阈值"
+                    )
+                else:
+                    score = max(score, min(_relaxed, 55.0))
+                    level = score_to_level(score)
+                    cr_comment += "；已按分销/贸易商业模式下移阈值"
+            if kwargs.get("latest_cash_ratio_source") and use_latest:
+                cr_comment += f"；口径：{kwargs['latest_cash_ratio_source']}"
             indicators.append(
                 IndicatorResult(
-                    name="经营现金流/净利润(5年均值)",
+                    name=cr_label,
                     value=round(score_ratio, 2),
                     score=score,
                     level=level,
@@ -216,9 +289,21 @@ class CashflowAnalyzer(BaseAnalyzer):
                         )
                     )
             if use_latest and annual_cash_ratio is not None:
-                a_score, a_level = self._score_by_range(
-                    annual_cash_ratio, (1.0, 5.0), (0.7, 1.0), (0.4, 0.7)
+                _bench_ocf = (
+                    float(distribution_benchmarks().get("ocf_to_profit") or 0)
+                    if is_dist
+                    else None
                 )
+                if is_dist and _bench_ocf and annual_cash_ratio < 0:
+                    # 分销/贸易：同业经营现金流/净利中位为负（实测 -2.25），
+                    # 此处仅作年报对照，与当期同口径按同业中位相对评估，
+                    # 不套用制造业 (1.0/0.7/0.4) 绝对阈值
+                    a_score = 55.0 if annual_cash_ratio >= _bench_ocf else 40.0
+                    a_level = score_to_level(a_score)
+                else:
+                    a_score, a_level = self._score_by_range(
+                        annual_cash_ratio, (1.0, 5.0), (0.7, 1.0), (0.4, 0.7)
+                    )
                 indicators.append(
                     IndicatorResult(
                         name="年报经营现金流/净利润",
@@ -289,9 +374,10 @@ class CashflowAnalyzer(BaseAnalyzer):
             gap = float(div_info["fcf_dividend_gap"])
             fcf_amt = div_info.get("fcf")
             cash_div = div_info.get("cash_total")
-            # 统一转亿显示
-            fcf_yi = float(fcf_amt) / 1e8 if fcf_amt and float(fcf_amt) > 1e6 else float(fcf_amt or 0)
-            cash_yi = float(cash_div) / 1e8 if cash_div and float(cash_div) > 1e6 else float(cash_div or 0)
+            # 统一转亿显示：必须按绝对值判断量级，否则负值（FCF<0）不换算，
+            # 会输出「自由现金流 -1119194300亿」这类量级错误
+            fcf_yi = float(fcf_amt) / 1e8 if abs(float(fcf_amt or 0)) > 1e6 else float(fcf_amt or 0)
+            cash_yi = float(cash_div) / 1e8 if abs(float(cash_div or 0)) > 1e6 else float(cash_div or 0)
             gap_yi = abs(gap) / 1e8 if abs(gap) > 1e6 else abs(gap)
             # 从 fd 年报序列取货币资金（用于动态判断短期分红可持续性）
             if "monetary_funds" in fd.columns:
@@ -319,24 +405,24 @@ class CashflowAnalyzer(BaseAnalyzer):
                     # 货币资金≥2倍缺口 → 短期可持续性无虞
                     cover_score = 75.0
                     cover_comment = (
-                        f"自由现金流 {fcf_yi:.0f}亿低于现金分红 {cash_yi:.0f}亿，"
-                        f"缺口约{gap_yi:.0f}亿；但账面货币资金 {cash_reserve_yi:.0f}亿 "
+                        f"自由现金流 {_fmt_yi(fcf_yi)}亿低于现金分红 {_fmt_yi(cash_yi)}亿，"
+                        f"缺口约{_fmt_yi(gap_yi)}亿；但账面货币资金 {_fmt_yi(cash_reserve_yi)}亿 "
                         f"覆盖缺口{cash_multi:.1f}倍，短期可持续性无虞"
                     )
                 elif cash_reserve_yi > 0 and cash_reserve_yi >= gap_yi:
                     # 货币资金可覆盖缺口但缓冲有限
                     cover_score = 70.0
                     cover_comment = (
-                        f"自由现金流 {fcf_yi:.0f}亿低于现金分红 {cash_yi:.0f}亿，"
-                        f"缺口约{gap_yi:.0f}亿；账面货币资金 {cash_reserve_yi:.0f}亿 "
+                        f"自由现金流 {_fmt_yi(fcf_yi)}亿低于现金分红 {_fmt_yi(cash_yi)}亿，"
+                        f"缺口约{_fmt_yi(gap_yi)}亿；账面货币资金 {_fmt_yi(cash_reserve_yi)}亿 "
                         f"可覆盖但缓冲有限，跟踪经营现金流修复"
                     )
                 else:
                     # 货币资金不足以覆盖缺口
                     cover_score = 60.0
                     cover_comment = (
-                        f"自由现金流 {fcf_yi:.0f}亿低于现金分红 {cash_yi:.0f}亿，"
-                        f"缺口约{gap_yi:.0f}亿，账面货币资金 {cash_reserve_yi:.0f}亿 "
+                        f"自由现金流 {_fmt_yi(fcf_yi)}亿低于现金分红 {_fmt_yi(cash_yi)}亿，"
+                        f"缺口约{_fmt_yi(gap_yi)}亿，账面货币资金 {_fmt_yi(cash_reserve_yi)}亿 "
                         f"覆盖不足，高分红可持续性核心风险点"
                     )
                     warnings.append(cover_comment)
@@ -359,7 +445,7 @@ class CashflowAnalyzer(BaseAnalyzer):
                     )
             elif gap >= 0 and fcf_amt is not None and cash_div is not None:
                 cover_score = 85.0
-                cover_comment = f"自由现金流 {fcf_yi:.0f}亿覆盖现金分红 {cash_yi:.0f}亿有余"
+                cover_comment = f"自由现金流 {_fmt_yi(fcf_yi)}亿覆盖现金分红 {_fmt_yi(cash_yi)}亿有余"
             else:
                 cover_score = 70.0
                 cover_comment = "分红数据不完整，覆盖率粗估"
@@ -508,7 +594,16 @@ class CashflowAnalyzer(BaseAnalyzer):
                     and float(annual_cash_ratio) >= 0.7
                 )
                 # ── 暂时滞后型：应收/存货增长合理，现金流占用是扩张所致 ──
-                if is_temporary_lag and not is_structural_deterioration:
+                if is_dist and dist_expanding and not is_structural_deterioration:
+                    # 分销/贸易扩张期：现金流占用是商业模式使然，评分轻扣且设下限，
+                    # 关注点转为「营运资本质量 + 是否随营收收敛」而非单期正负
+                    div_score = max(45.0, min(72.0, 72.0 - gap * 4.0))
+                    div_comment = (
+                        f"净利同比+{yp:.1f}% 但经营现金流/净利={cash_ratio:.2f}；"
+                        f"分销/贸易模式（上游预付、下游长账期）在营收扩张期必然占用营运资本，"
+                        f"不按制造业含金量口径扣分，重点跟踪应收账龄与存货周转是否随规模收敛"
+                    )
+                elif is_temporary_lag and not is_structural_deterioration:
                     # 订单备货型：合同负债增长确认存货为订单驱动，进一步轻扣
                     if order_backed_inv:
                         div_score = max(62.0, min(80.0, 80.0 - gap * 8.0))
@@ -590,13 +685,19 @@ class CashflowAnalyzer(BaseAnalyzer):
                 )
                 # 营收高增且应收增速≥营收2倍 → 营运资本占用（非财务造假指控）
                 if rev_g >= 0.20 and ar_g > rev_g * 2 and ar_g > 0.2:
-                    msg, _ = ar_turnover_warning(quality_context=quality_ar, severe_wc_spike=True)
+                    msg, _ = ar_turnover_warning(
+                        quality_context=quality_ar, severe_wc_spike=True, distribution=is_dist
+                    )
                     warnings.append(msg)
                 elif rev_g < 0 and ar_g > rev_g:
-                    msg, _ = ar_turnover_warning(quality_context=quality_ar)
+                    msg, _ = ar_turnover_warning(
+                        quality_context=quality_ar, distribution=is_dist
+                    )
                     warnings.append(msg)
                 elif rev_g >= 0 and ar_g > rev_g + 0.10:
-                    msg, _ = ar_turnover_warning(quality_context=quality_ar)
+                    msg, _ = ar_turnover_warning(
+                        quality_context=quality_ar, distribution=is_dist
+                    )
                     warnings.append(msg)
 
         if len(ocf.dropna()) >= 3 and (ocf.iloc[-3:] < 0).all():
@@ -653,13 +754,62 @@ class CashflowAnalyzer(BaseAnalyzer):
                         )
                     )
 
+        # ── 分销/贸易模式专用观察项：营运资本质量与现金流收敛性 ──
+        if is_dist:
+            ar_m = kwargs.get("ar_metrics") or {}
+            days_latest = ar_m.get("days_latest")
+            days_delta = ar_m.get("days_delta_5y")
+            _obs_parts = [
+                "分销模式核心不是单期经营现金流正负，而是①应收账龄结构 "
+                "②存货周转与跌价风险 ③现金流是否随营收规模收敛"
+            ]
+            if days_latest is not None:
+                _obs_parts.append(f"应收周转天数 {float(days_latest):.0f} 天")
+                if days_delta is not None:
+                    _obs_parts.append(
+                        f"较5年前 {float(days_delta):+.0f} 天"
+                        f"（{'账期拉长，占用加剧' if float(days_delta) > 30 else '基本稳定'}）"
+                    )
+            indicators.append(
+                IndicatorResult(
+                    name="分销模式观察项",
+                    value=round(float(days_latest), 1) if days_latest is not None else 0.0,
+                    score=62.0 if (days_delta is None or float(days_delta) <= 30) else 48.0,
+                    level=AnalysisLevel.NEUTRAL
+                    if (days_delta is None or float(days_delta) <= 30)
+                    else AnalysisLevel.POOR,
+                    trend="down" if (days_delta is not None and float(days_delta) > 30) else "flat",
+                    weight=1.5,
+                    comment="；".join(_obs_parts),
+                    period=ar_m.get("period") or latest_period,
+                )
+            )
+            if days_delta is not None and float(days_delta) > 30:
+                warnings.append(
+                    f"分销模式应收质量：周转天数较5年前拉长{float(days_delta):.0f}天，"
+                    f"账期放宽可能掩盖下游需求压力与坏账风险"
+                )
+
         module_score = self._weighted_score(indicators) if indicators else 0.0
         # OCF 环比大幅改善额外加分
         if ocf_rebound_boost > 0:
             module_score += ocf_rebound_boost
+        # 下限保护前的真实加权分：必须留痕，否则「模块分为何停在 52.0 不动」
+        # 在报告里无法解释（原始加权可能远低于下限，指标级再加分也纹丝不动）。
+        raw_module_score = round(module_score, 1)
+        floor_applied: str | None = None
         # ── 应收+存货双低 → 现金流评分保底 55-60（仅调分，不作为风险提示） ──
         if healthy_wc and module_score < 55.0:
             module_score = 58.0
+            floor_applied = "healthy_working_capital"
+        # ── 分销/贸易扩张期保底：商业模式决定的负现金流不应拉低到 D/E 档 ──
+        if dist_expanding and module_score < 52.0:
+            module_score = 52.0
+            floor_applied = "distribution_expanding"
+            warnings.append(
+                f"分销/贸易扩张期经营现金流为负属行业常态，现金流评分已按商业模式下限保护"
+                f"（原始加权 {raw_module_score:.1f} 分 → 52 分）；仍需跟踪应收账龄与存货跌价"
+            )
 
         return ModuleResult(
             module_name="现金流质量",
@@ -672,6 +822,10 @@ class CashflowAnalyzer(BaseAnalyzer):
                 "consecutive_loss_years": int(consec_loss),
                 "healthy_working_capital": healthy_wc,
                 "order_backed_inventory": order_backed_inv,
+                "business_model": "distribution" if is_dist else None,
+                "distribution_expanding": bool(dist_expanding),
+                "raw_weighted_score": raw_module_score,
+                "floor_applied": floor_applied,
                 "scoring_note": "；".join(_wc_note_parts) if _wc_note_parts else None,
             },
         )

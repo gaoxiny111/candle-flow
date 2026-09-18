@@ -395,3 +395,86 @@ def test_observe_pledge_does_not_force_e(monkeypatch):
     # 5年均值评分：年报OCF/NP健康(>0.7) + 利润高增(+80%) → 短期扰动，按均值评分
     assert cr["value"] > 0.8  # 5年均值在1.0左右，而非当期0.13
     assert "短期扰动" in (cr.get("comment") or "")
+
+
+# ── 风险释放：减持计划到期/届满 ────────────────────────────────────
+# RISK_RELEASE_KEYWORDS 是枚举式的，实务标题写法无法穷举。格力电器
+# 2026-06-22「关于大股东减持计划期限届满暨减持结果的公告」因关键词只列了
+# 「减持计划届满」（少「期限」两字）而未被识别为释放，导致减持已到期结束
+# 仍按新增观察级风险扣 8 分。以下测试锁定「减持 + 届满/到期」组合释放规则。
+
+
+def _release_scan(title: str):
+    from app.services.major_risk_events import scan_risk_release
+
+    return scan_risk_release([{"title": title, "notice_date": "2026-06-22"}])
+
+
+@pytest.mark.parametrize(
+    "title",
+    (
+        "格力电器:关于大股东减持计划期限届满暨减持结果的公告",  # 真实漏判案例
+        "XX:关于股东减持计划届满的公告",
+        "XX:关于减持计划期限届满的公告",
+        "XX:减持期限届满暨减持结果公告",
+        "XX:关于股东减持计划时间届满的公告",
+        "XX:关于减持计划实施完毕的公告",
+        "XX:关于股东承诺不减持股份的公告",
+    ),
+)
+def test_reduce_plan_expiry_is_release_signal(title):
+    assert _release_scan(title)["released"] is True
+
+
+@pytest.mark.parametrize(
+    "title",
+    (
+        "XX:关于大股东拟减持股份的公告",  # 新增减持风险，不得释放
+        "XX:关于股东减持计划的预披露公告",
+        "XX:关于限售期届满的提示性公告",  # 无减持语义，不得因「届满」二字释放
+        "XX:关于控股股东部分股份被司法冻结的公告",
+    ),
+)
+def test_non_release_titles_not_released(title):
+    assert _release_scan(title)["released"] is False
+
+
+def test_reduce_hold_observe_event_released_by_plan_expiry(monkeypatch):
+    """端到端：减持计划期限届满 → 该观察事件不计入 observe_count。"""
+    clear_major_risk_cache()
+    monkeypatch.setattr(
+        "app.services.major_risk_events.fetch_stock_notices",
+        lambda *_a, **_k: [
+            {
+                "title": "格力电器:关于大股东减持计划期限届满暨减持结果的公告",
+                "notice_date": "2026-06-22",
+                "url": "",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "app.services.major_risk_events.fetch_controller_pledge_ratio",
+        lambda *_a, **_k: {"ratio": None, "invalid": False, "source": "", "holder": ""},
+    )
+    result = detect_major_risk_events("000651.SZ")
+    assert result["risk_released"] is True
+    assert result["observe_count"] == 0
+    assert any(e["rule_id"] == "reduce_hold" for e in result["observe_events_released"])
+
+
+def test_reduce_hold_still_counts_when_only_plan_announced(monkeypatch):
+    """反例：仅「拟减持」公告时，观察事件仍应计入并扣分。"""
+    clear_major_risk_cache()
+    monkeypatch.setattr(
+        "app.services.major_risk_events.fetch_stock_notices",
+        lambda *_a, **_k: [
+            {"title": "XX:关于大股东拟减持股份的公告", "notice_date": "2026-06-22", "url": ""}
+        ],
+    )
+    monkeypatch.setattr(
+        "app.services.major_risk_events.fetch_controller_pledge_ratio",
+        lambda *_a, **_k: {"ratio": None, "invalid": False, "source": "", "holder": ""},
+    )
+    result = detect_major_risk_events("000651.SZ")
+    assert result["observe_count"] == 1
+    assert any(e["rule_id"] == "reduce_hold" for e in result["observe_events"])

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from app.analysis.base import AnalysisLevel, BaseAnalyzer, IndicatorResult, ModuleResult, format_report_period, score_to_level
-from app.analysis.config.company_profiles import get_company_profile
+from app.analysis.config.company_profiles import get_company_profile, get_merger_consolidation
 
 
 class GrowthAnalyzer(BaseAnalyzer):
@@ -169,6 +169,14 @@ class GrowthAnalyzer(BaseAnalyzer):
                 f"；加速因子+{acceleration_bonus:.0f}（前瞻{fwd_growth:.1f}%>历史{profit_cagr_3y:.1f}%×1.5）"
                 if acceleration_bonus > 0 else ""
             )
+            # 极端同比（基期接近0 / 并表 / 非经常性损益）只影响计分上限，不改写展示值
+            extreme_note = ""
+            if abs(float(fwd_growth)) > 300:
+                extreme_note = "；⚠️ 属极端增速，仅按±300%上限计分，不可线性外推"
+                warnings.append(
+                    f"净利同比{fwd_growth:.1f}% 为极端值（低基数/并表/非经常性损益），"
+                    f"评分已按 300% 上限计分，不可按此线性外推下一年"
+                )
             indicators.append(
                 IndicatorResult(
                     name="前瞻成长性(%)",
@@ -181,7 +189,7 @@ class GrowthAnalyzer(BaseAnalyzer):
                     comment=(
                         f"历史3年CAGR {profit_cagr_3y:.1f}%（权重40%）+"
                         f"前瞻 {fwd_growth:.1f}%（权重60%，{fwd_source}）"
-                        f"= 综合{combined:.0f}分{accel_note}{cyclical_note}"
+                        f"= 综合{combined:.0f}分{accel_note}{cyclical_note}{extreme_note}"
                     ),
                 )
             )
@@ -489,6 +497,52 @@ class GrowthAnalyzer(BaseAnalyzer):
                 )
             for _aw in _asset_inj.get("warnings", []):
                 warnings.append(_aw)
+
+        # ── 并购并表调整因子：区分「有机增长」与「并表增长」 ──────────────
+        # 增速里含并表贡献时，直接按披露同比给成长性高分，会把一次性规模跃升
+        # 当成可持续成长。配置了 consolidation_contribution_pct 就折减出有机增速；
+        # 未配置则不臆造数字，只做定性标注 + 单独风险提示（可审计）。
+        _merger = get_merger_consolidation(name, symbol)
+        if _merger and not profit_illusion and yoy_p is not None:
+            _target = str(_merger.get("target") or "被并表标的")
+            _since = str(_merger.get("since") or "本期")
+            _contrib = _merger.get("consolidation_contribution_pct")
+            _organic = None
+            if _contrib is not None:
+                _c = max(0.0, min(90.0, float(_contrib)))
+                _organic = round(yoy_p * (1 - _c / 100.0), 2)
+                _m_score, _m_level = self._score_by_range(_organic, (15, 300), (0, 15), (-12, 0))
+                _m_value = _organic
+                _m_comment = (
+                    f"并表标的：{_target}（{_since} 起纳入合并）；"
+                    f"披露净利同比{yoy_p:+.1f}%，按并表贡献{_c:.0f}%折减后"
+                    f"有机增速约{_organic:+.1f}%；成长性按有机增速计分"
+                )
+            else:
+                _m_score, _m_level = 68.0, AnalysisLevel.NEUTRAL
+                _m_value = yoy_p
+                _m_comment = (
+                    f"并表标的：{_target}（{_since} 起纳入合并）；"
+                    f"披露净利同比{yoy_p:+.1f}% 中含并表贡献但未拆分，"
+                    f"按中性计分，待公司披露有机/并表口径后再校准"
+                )
+            indicators.append(
+                IndicatorResult(
+                    name="并购并表调整因子",
+                    value=round(float(_m_value), 2),
+                    score=_m_score,
+                    level=_m_level,
+                    trend="flat",
+                    weight=1.5,
+                    period=f"{_since} 起并表",
+                    comment=_m_comment,
+                )
+            )
+            warnings.append(
+                f"增速含并表贡献：{_target} 自 {_since} 年起纳入合并报表，"
+                f"{'已按并表贡献折减' if _organic is not None else '并表与有机贡献未拆分'}，"
+                f"非纯有机增长，需跟踪并表后内生增速与原业务协同"
+            )
 
         # 业务结构转型 / 成长包容度：高毛利 + 利润高增 → 新品类放量窗口加分
         from app.analysis.growth_quality import classify_high_growth_quality

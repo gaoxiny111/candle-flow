@@ -21,6 +21,14 @@
 
     # ── 盈利模块 (profitability) ──
     cyclical            : bool         — 盈利能力评分按周期股权重
+
+    # ── 商业模式 (跨模块) ──
+    business_model      : str          — "distribution"(分销/贸易) 等，
+                                         影响 WACC 口径、ROIC 归一化与可比公司
+    cashflow_profile    : str          — 现金流评判档位，如 "distribution"
+                                         （低净利率高周转、扩张期经营现金流为负是常态）
+    merger_consolidation: dict         — 并购并表事件（增速含并表贡献，非纯有机增长）
+    comps_peers         : list[str]    — 显式可比公司清单（覆盖按行业字符串的自动筛选）
 """
 
 from __future__ import annotations
@@ -191,7 +199,213 @@ _PROFILES: dict[str, dict[str, Any]] = {
         "match_symbols": ["600519"],
         "industry_tags": ["baijiu"],
     },
+
+    # ═══════════════════════════════════════════════════════════════
+    # 商络电子 (300975) — 被动元件分销，2026 起并表广州立功电子
+    # ═══════════════════════════════════════════════════════════════
+    "商络电子": {
+        "match_names": ["商络电子"],
+        "match_symbols": ["300975"],
+
+        # 商业模式：电子元器件分销 —— 低净利率、高周转、营运资本占用大
+        "business_model": "distribution",
+        "cashflow_profile": "distribution",
+
+        # 并购并表：折减因子只做「定性标注 + 风险提示」。
+        # 若掌握并表贡献占比，填 consolidation_contribution_pct（0~100）即可自动折减增速；
+        # 未填时不臆造数字，仅提示「增速含并表贡献，非纯有机增长」。
+        "merger_consolidation": {
+            "target": "广州立功电子科技有限公司",
+            "since": "2026",
+            "note": (
+                "自 2026 年起纳入合并报表。2026 中报归母净利同比大幅增长中，"
+                "并表贡献与有机增长未拆分，直接按披露同比外推会高估可持续增速"
+            ),
+            "keyword": "并表",
+        },
+
+        # 可比公司：分销同行（与自身商业模式一致），
+        # 避免拿法拉电子/顺络电子等被动元件制造商来锚定分销商估值
+        "comps_peers": [
+            "300184",  # 力源信息
+            "001298",  # 好上好
+            "301099",  # 雅创电子
+            "300131",  # 英唐智控
+            "300493",  # 润欣科技
+            "000062",  # 深圳华强
+            "001287",  # 中电港
+            "300475",  # 香农芯创
+        ],
+    },
 }
+
+
+# ── 商业模式识别（跨模块复用） ────────────────────────────────────
+
+# 分销/贸易/经销：低净利率、高周转，营运资本（应收+存货）随规模同比例扩张
+DISTRIBUTION_INDUSTRY_KEYS = ("分销", "贸易", "经销", "商贸", "供应链", "批发")
+
+# A 股电子元器件分销同业（供 comps 在无显式清单时使用）
+ELECTRONIC_DISTRIBUTION_PEERS = [
+    "000062",  # 深圳华强
+    "001287",  # 中电港
+    "001298",  # 好上好
+    "300131",  # 英唐智控
+    "300184",  # 力源信息
+    "300475",  # 香农芯创
+    "300493",  # 润欣科技
+    "301099",  # 雅创电子
+]
+ELECTRONIC_DISTRIBUTION_PEERS_NORM = frozenset(ELECTRONIC_DISTRIBUTION_PEERS)
+
+# ═══════════════════════════════════════════════════════════════════════
+# 分销/贸易同业基准（相对评分锚点）
+#
+# 为什么需要：分销是「低净利率、高周转」模式，用制造业绝对阈值衡量会
+# 把整个行业判成不合格 —— 实测 7 家 A 股电子元器件分销商 2026 中报，
+# ROIC 三年均值全部落在 1.5%~3.8%，无一达到 WACC≈10%；经营现金流/净利
+# 7 家中 6 家为负。这是商业模式使然，不是个体经营失败。
+#
+# 因此分销模式改用「同业中位数」为锚点：达到行业中位 ≈ 中性（55~60 分），
+# 领先加分、落后扣分。这样既尊重行业特性，又保留区分度
+# （行业最差的中电港 ROIC 1.89% 仍会被判低分，不会被一并豁免）。
+#
+# 样本（2026 中报）：
+#   深圳华强 000062 / 中电港 001287 / 力源信息 300184 / 润欣科技 300493
+#   好上好 001298 / 雅创电子 301099 / 商络电子 300975
+#
+#   指标        同业原始分布                                      中位数
+#   ROIC 单期   1.89 2.92 4.23 4.33 4.92 5.08 6.36               4.33
+#   ROIC 3年均  1.50 2.46 2.75 3.32 3.67 3.78 3.78               3.32
+#   净利率      0.43 0.91 1.86 1.91 1.91 1.94 3.54               1.91
+#   ROE         4.34 4.71 4.76 5.35 6.66 9.51 13.20              5.35
+#   毛利率      2.85 5.28 7.71 9.58 10.35 12.30 15.21            9.58
+#   OCF/净利    -5.20 -4.17 -3.66 -2.25 -2.14 -0.53 1.42         -2.25
+#   资产负债率  39.69 44.43 61.42 70.29 72.55 75.76 88.65         61.42
+# ═══════════════════════════════════════════════════════════════════════
+DISTRIBUTION_BENCHMARKS: dict[str, float | str] = {
+    "sampled_period": "2026H1",
+    "sample_size": 7,
+    "roic_ttm_pct": 4.33,
+    "roic_3y_pct": 3.32,
+    "net_margin_pct": 1.91,
+    "roe_pct": 5.35,
+    "gross_margin_pct": 9.58,
+    "ocf_to_profit": -2.25,
+    "debt_ratio_pct": 61.42,
+}
+
+
+def distribution_benchmarks() -> dict[str, float | str]:
+    """分销/贸易同业基准（相对评分锚点），返回副本以免调用方误改。"""
+    return dict(DISTRIBUTION_BENCHMARKS)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 银行同业基准（偿债口径锚点）
+#
+# 为什么需要：银行的负债主要是客户存款，资产负债率天然落在 90%~94%，
+# 而流动比率/速动比率对存款类机构也没有制造业含义。套用制造业/轻资产
+# 阈值（>75% 即判危险）会把整个银行业判成 E 级——实测招商银行 90.18%
+# 被打 25 分并提示「资产负债率偏高，偿债压力较大」，而它恰恰是样本里
+# 杠杆最低的一家。
+#
+# 样本（2026 中报，20 家 A 股银行）：
+#   招商 / 工商 / 建设 / 农业 / 中国 / 浦发 / 兴业 / 交通 / 宁波 / 光大 /
+#   民生 / 中信 / 江苏 / 邮储 / 上海 / 南京 / 江阴 / 杭州 / 常熟 / 张家港
+#
+#   资产负债率%      90.18  91.62  91.94  92.96  93.95   (min/p25/中位/p75/max)
+#   权益占比%(=100-)  9.82   8.38   8.06   7.04   6.05
+#
+# 银行偿债评分改用「权益/总资产（资本缓冲）」相对同业中位为锚：
+# 达到中位 ≈ 中性偏保守，缓冲更厚的加分、更薄的扣分。保留区分度
+# （样本内缓冲最薄的邮储银行仍会被判低分，不会被一并豁免）。
+#
+# 注意：本数据源不提供不良贷款率 / 拨备覆盖率 / 资本充足率，
+# 因此银行偿债评分只反映杠杆水平，不等同于资产质量结论。
+# ═══════════════════════════════════════════════════════════════════════
+BANK_INDUSTRY_KEYS = ("银行",)
+
+BANK_BENCHMARKS: dict[str, float | str] = {
+    "sampled_period": "2026H1",
+    "sample_size": 20,
+    "debt_ratio_pct": 91.94,
+    "equity_ratio_pct": 8.06,
+}
+
+
+def bank_benchmarks() -> dict[str, float | str]:
+    """银行同业基准（杠杆锚点），返回副本以免调用方误改。"""
+    return dict(BANK_BENCHMARKS)
+
+
+def _norm_code(symbol: str) -> str:
+    """归一化代码：'000062.SZ' / 'sz000062' / '000062' → '000062'。"""
+    s = str(symbol or "").strip().upper()
+    for suf in (".SH", ".SZ", ".BJ", ".SS"):
+        if s.endswith(suf):
+            s = s[: -len(suf)]
+    for pre in ("SH", "SZ", "BJ", "SS"):
+        if s.startswith(pre) and len(s) > len(pre):
+            s = s[len(pre):]
+    digits = "".join(ch for ch in s if ch.isdigit())
+    return digits.zfill(6) if digits and len(digits) <= 6 else digits
+
+
+def business_model_of(name: str = "", symbol: str = "", industry: str = "") -> str:
+    """识别商业模式：profile 显式声明 > 显式同业名单 > 行业关键词推断。"""
+    profile = get_company_profile(name, symbol)
+    explicit = str(profile.get("business_model") or "")
+    if explicit:
+        return explicit
+    # 显式列入电子元器件分销同业名单的公司，本身就是分销商。
+    # 东财行业分类把它们归入「其他电子Ⅱ」「元件」等泛行业，
+    # 靠行业关键词匹配不到，会出现「同是分销商却套用制造业阈值」的不一致
+    # （例：商络电子 OCF/净利 -289.7% 得 52 分，深圳华强 -204.0% 却只有 34 分）。
+    code = _norm_code(symbol)
+    if code and code in ELECTRONIC_DISTRIBUTION_PEERS_NORM:
+        return "distribution"
+    ind = str(industry or "")
+    if any(k in ind for k in DISTRIBUTION_INDUSTRY_KEYS):
+        return "distribution"
+    if any(k in ind for k in BANK_INDUSTRY_KEYS):
+        return "bank"
+    return ""
+
+
+def is_bank(name: str = "", symbol: str = "", industry: str = "") -> bool:
+    """是否银行（存款类金融机构）。
+
+    只认「银行」，不含证券/保险/多元金融/非银金融：它们没有不良贷款率
+    与拨备覆盖率，套用银行监管口径会把原本正常的偿债评分（实测中信证券
+    63.1 C、中国平安 72.2 B）压成无信息量的常数（~52 分），是比现状更差
+    的结果。券商的负债主要来自卖出回购与客户保证金，与存款类机构不同源。
+    """
+    return business_model_of(name, symbol, industry) == "bank"
+
+
+def is_distribution(name: str = "", symbol: str = "", industry: str = "") -> bool:
+    """是否分销/贸易类商业模式（用于现金流阈值、WACC、ROIC 归一化）。"""
+    return business_model_of(name, symbol, industry) == "distribution"
+
+
+def peers_for(name: str = "", symbol: str = "", industry: str = "") -> list[str]:
+    """显式可比公司清单；无配置时，分销类公司回退到电子元器件分销同业。"""
+    profile = get_company_profile(name, symbol)
+    explicit = profile.get("comps_peers")
+    if explicit:
+        return [str(s) for s in explicit]
+    if business_model_of(name, symbol, industry) == "distribution":
+        code = _norm_code(symbol)
+        return [s for s in ELECTRONIC_DISTRIBUTION_PEERS if s != code]
+    return []
+
+
+def get_merger_consolidation(name: str = "", symbol: str = "") -> dict[str, Any]:
+    """并购并表事件配置（无则空 dict）。"""
+    profile = get_company_profile(name, symbol)
+    conf = profile.get("merger_consolidation")
+    return conf if isinstance(conf, dict) else {}
 
 
 # ── 公开接口 ──────────────────────────────────────────────────────

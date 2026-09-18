@@ -11,6 +11,12 @@ MODULE_WEIGHTS = {
 }
 
 RISK_THRESHOLD = 60  # below this, composite score is penalized
+# 风险扣分上限（占综合分的比例）。
+# 风险模块的扣分项（应收恶化、利润含金量低、存贷双高…）与 cashflow/solvency
+# 模块高度重叠，若再无上限地整体相乘，等于同一批风险被扣三次并用乘法复利放大
+# （risk=44 → ×0.44，直接把 32.8 分砍到 14.4，把"盈利偏弱+现金流紧张"的
+# 标的打成 E 级危险股）。故限幅为最大 -25%，生存级风险仍由 compliance_veto 兜底。
+RISK_MAX_PENALTY = 0.25
 
 # 维度得分 < 此值视为 E 档，加权贡献再乘惩罚系数
 E_GRADE_SCORE = 40

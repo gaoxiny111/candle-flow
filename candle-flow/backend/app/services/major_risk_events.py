@@ -130,6 +130,25 @@ RISK_RELEASE_KEYWORDS = (
     "承诺不减持", "自愿承诺锁定", "延长锁定期", "承诺延长",
 )
 
+# 组合释放规则：标题同时含「减持」与「届满/到期」即视为减持计划已结束。
+# 枚举式关键词穷举不了标题写法——同一语义在实务中至少有「减持计划届满」
+# 「减持计划期限届满」「减持期限届满」「减持计划时间届满」等多种表述。
+# 曾因此漏判格力电器 2026-06-22「关于大股东减持计划期限届满暨减持结果的
+# 公告」：计划已到期结束，却仍按新增观察级风险扣 8 分。注意组合条件必须
+# 同时满足，避免「限售期届满」这类不含减持语义的标题被误释放。
+_RELEASE_SUBJECT_HINTS = ("减持",)
+_RELEASE_END_HINTS = ("届满", "到期")
+
+
+def _is_release_title(title: str) -> bool:
+    """标题是否构成风险释放信号（减持完毕/计划届满、承诺不减持等）。"""
+    if any(kw in title for kw in RISK_RELEASE_KEYWORDS):
+        return True
+    return any(s in title for s in _RELEASE_SUBJECT_HINTS) and any(
+        e in title for e in _RELEASE_END_HINTS
+    )
+
+
 SEVERITY_BY_ID = {str(r["id"]): str(r["severity"]) for r in RISK_RULES}
 
 _cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -291,16 +310,15 @@ def scan_risk_release(notices: list[dict[str, str]]) -> dict[str, Any]:
 
     for n in notices:
         title = n.get("title") or ""
-        for kw in RISK_RELEASE_KEYWORDS:
-            if kw in title:
-                released = True
-                release_date = n.get("notice_date") or ""
-                if "承诺" in title or "锁定" in title:
-                    lock_commitment = True
-                    release_type = "commitment"
-                elif not release_type:
-                    release_type = "completed"
-                break
+        if not _is_release_title(title):
+            continue
+        released = True
+        release_date = n.get("notice_date") or ""
+        if "承诺" in title or "锁定" in title:
+            lock_commitment = True
+            release_type = "commitment"
+        elif not release_type:
+            release_type = "completed"
         if released and lock_commitment:
             break  # 已找到最强信号
 

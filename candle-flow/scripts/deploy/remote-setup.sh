@@ -62,7 +62,12 @@ if [ ! -x /usr/local/bin/cloudflared ]; then
   chmod +x /usr/local/bin/cloudflared
 fi
 
-/usr/local/bin/cloudflared service install --config /etc/cloudflared/config.yml || true
+# cloudflared 2025.8.1 起 `service install` 不再接受 --config 子命令参数
+# （会打印整段 usage 并以非 0 退出）；--config 是全局 flag，必须放在子命令之前。
+# 服务单元已存在时跳过安装，保证重复部署幂等。写法与 install-cloudflared.sh 保持一致。
+if [ ! -f /etc/systemd/system/cloudflared.service ]; then
+  /usr/local/bin/cloudflared --config /etc/cloudflared/config.yml service install || true
+fi
 systemctl enable --now cloudflared
 systemctl restart candle-flow
 systemctl restart cloudflared || true

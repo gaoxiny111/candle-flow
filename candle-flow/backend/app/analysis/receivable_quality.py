@@ -49,11 +49,32 @@ def ar_turnover_warning(
     *,
     quality_context: bool,
     severe_wc_spike: bool = False,
+    distribution: bool = False,
 ) -> tuple[str, float]:
     """
     返回 (提示文案, 风险扣分)。
     quality_context 下仅效率提示、轻扣或不扣。
+
+    distribution：分销/贸易商业模式的判定口径与央企长协客户不同——
+    其模式本身就是「上游预付 + 下游长账期」，营收扩张期应收必然同步放大，
+    属营运资本占用而非回款危机（回款危机应看账龄结构是否恶化，而非应收增速）。
+    实测 7 家 A 股电子元器件分销商，应收周转天数普遍 90~110 天，
+    若沿用制造业口径会一律输出「回款极其困难」，与本模块「分销模式观察项」
+    依据同一批数据得出的「账期基本稳定」结论自相矛盾。
+    故此处保留营运资本占用提示与轻扣，但不作回款危机定性。
     """
+    if distribution and not quality_context:
+        if severe_wc_spike:
+            return (
+                "应收账款与存货增速显著超营收，营运资本占用加大；"
+                "分销模式账期偏长，需跟踪应收账龄结构与下游客户集中度",
+                8.0,
+            )
+        return (
+            "应收账款增速快于营收，营运资本占用加大（分销模式账期特性），"
+            "需跟踪账龄结构与回款节奏",
+            6.0,
+        )
     if severe_wc_spike:
         if quality_context:
             return (

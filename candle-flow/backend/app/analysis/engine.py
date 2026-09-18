@@ -17,6 +17,7 @@ from app.analysis.config import (
     E_GRADE_PENALTY,
     E_GRADE_SCORE,
     MODULE_WEIGHTS,
+    RISK_MAX_PENALTY,
     RISK_THRESHOLD,
 )
 from app.analysis.dividend_profile import (
@@ -202,8 +203,12 @@ class FundamentalEngine:
         ctx = {
             "debt_ratio": meta.get("debt_ratio"),
             "debt_ratio_estimated": meta.get("debt_ratio_estimated", False),
+            "debt_ratio_period": meta.get("debt_ratio_period"),
+            "debt_ratio_scope": meta.get("debt_ratio_scope"),
             "revenue_yoy": meta.get("revenue_yoy"),
             "profit_yoy": meta.get("profit_yoy"),
+            "profit_yoy_forward": meta.get("profit_yoy_forward"),
+            "profit_yoy_extreme": bool(meta.get("profit_yoy_extreme")),
             "ocf_per_share": meta.get("ocf_per_share"),
             "latest_roe": meta.get("latest_roe"),
             "latest_report": meta.get("latest_report"),
@@ -215,6 +220,10 @@ class FundamentalEngine:
             "current_ratio": meta.get("current_ratio"),
             "quick_ratio": meta.get("quick_ratio"),
             "symbol_roe": symbol_roe,
+            # 各模块依赖 symbol 做公司画像/商业模式/同业匹配，此前漏传导致
+            # 只能靠「名称」命中画像（商络电子有画像所以正常），
+            # 而无画像的同类公司（深圳华强等）一律识别不到分销模式。
+            "symbol": sym,
             "industry": meta.get("industry") or "",
             "name": meta.get("name") or market.get("name") or "",
             "audit_opinion": major_risks.get("audit_opinion_hint") or "标准无保留",
@@ -226,6 +235,7 @@ class FundamentalEngine:
             "risk_lock_commitment": bool(major_risks.get("risk_lock_commitment")),
             "risk_release_type": major_risks.get("risk_release_type") or "",
             "latest_cash_ratio": meta.get("latest_cash_ratio"),
+            "latest_cash_ratio_source": meta.get("latest_cash_ratio_source"),
             "eps": meta.get("eps"),
             "deducted_net_profit": meta.get("deducted_net_profit"),
             "parent_net_profit": meta.get("parent_net_profit"),
@@ -247,6 +257,16 @@ class FundamentalEngine:
             module_results[name] = analyzer.analyze(fin_df, **ctx)
 
         cf = module_results.get("cashflow")
+        # 成长模块已算出规范的 3 年净利 CAGR 与 V 型拐点标记，预先写回 meta，
+        # 供估值模块复用。否则估值模块自行用 pct_change(3) 粗算（把「3 年累计
+        # 变动」当 CAGR，且基期为负时得出无意义的负值），会与引擎后文
+        # classify_growth_stock 的结论互相矛盾——表现为估值 rationale 声称
+        # 「以 PEG/PS 为主」但 PEG 从未进入构成（深圳华强即如此）。
+        _gm = module_results.get("growth")
+        if _gm is not None:
+            meta["_growth_cagr_3y"] = _gm.metadata.get("profit_cagr_3y")
+            meta["_growth_v_shape"] = bool(_gm.metadata.get("v_shape"))
+            meta["_growth_marginal_recovery"] = bool(_gm.metadata.get("marginal_recovery"))
         valuation = self._run_valuation(
             fin_df,
             market,
@@ -275,7 +295,12 @@ class FundamentalEngine:
                 composite /= weight_sum
             risk = module_results["risk"]
             if risk.score < RISK_THRESHOLD:
-                composite *= risk.score / 100.0
+                # 风险越低扣得越多，但限幅 RISK_MAX_PENALTY（默认 -25%）。
+                # 原实现是无上限的 composite *= risk/100：风险模块的扣分项
+                # （应收恶化/利润含金量低/存贷双高）在 cashflow、solvency 模块
+                # 已各自扣过一次，再做整体乘法等于三重计数 + 复利放大。
+                risk_gap = (RISK_THRESHOLD - risk.score) / RISK_THRESHOLD
+                composite *= 1.0 - RISK_MAX_PENALTY * max(0.0, min(1.0, risk_gap))
             return round(max(0.0, min(100.0, composite)), 1)
 
         composite = _compose(val_score)
@@ -675,11 +700,20 @@ class FundamentalEngine:
             gross_margin_pct=meta.get("latest_gross_margin"),
             revenue_yoy=meta.get("revenue_yoy"),
             profit_yoy=meta.get("profit_yoy"),
-            profit_cagr_3y=float(
-                fin_df["net_profit"].pct_change(3).dropna().iloc[-1] * 100
-            )
-            if len(fin_df) >= 4 and "net_profit" in fin_df.columns
-            else None,
+            # 优先复用成长模块算好的规范 CAGR / V 型拐点，保证与引擎后文
+            # 的判定完全一致（否则估值侧会漏掉「CAGR 为负但拐点已确认」的反转股，
+            # is_growth 判 False，PEG 核心锚与动态PE 都进不了估值构成）。
+            profit_cagr_3y=(
+                meta.get("_growth_cagr_3y")
+                if meta.get("_growth_cagr_3y") is not None
+                else (
+                    float(fin_df["net_profit"].pct_change(3).dropna().iloc[-1] * 100)
+                    if len(fin_df) >= 4 and "net_profit" in fin_df.columns
+                    else None
+                )
+            ),
+            is_v_shape=bool(meta.get("_growth_v_shape")),
+            is_marginal_recovery=bool(meta.get("_growth_marginal_recovery")),
             pe_ttm=pe,
             is_high_growth_quality=bool(result.get("is_high_growth_quality")),
             is_dividend_asset=is_div,
@@ -932,17 +966,27 @@ class FundamentalEngine:
                         if "PEG" in b.get("factor", ""):
                             # 从 PEG breakdown 取 growth_rate
                             break
-                    # 回退：用 profit_yoy 或 CAGR 估算前瞻PE
-                    profit_yoy_val = meta.get("profit_yoy")
+                    # 回退：用前瞻口径同比或 CAGR 估算前瞻PE。
+                    # 必须用 profit_yoy_forward（已抑制基期接近0/并表暴增的极值），
+                    # 直接用真实同比会把 +493% 当成可持续增速，算出 4x 的前瞻PE。
+                    profit_yoy_val = meta.get("profit_yoy_forward")
+                    if profit_yoy_val is None:
+                        profit_yoy_val = meta.get("profit_yoy")
                     if profit_yoy_val is not None and float(profit_yoy_val) > 10:
                         fwd_growth = float(profit_yoy_val) / 100.0
                         fwd_pe = float(pe) / (1.0 + fwd_growth)
+                        _ext_note = (
+                            f"（实际披露同比+{float(meta.get('profit_yoy') or 0):.0f}%"
+                            f"已按+{float(profit_yoy_val):.0f}%折减）"
+                            if meta.get("profit_yoy_extreme")
+                            else f"（基于净利同比+{float(profit_yoy_val):.0f}%）"
+                        )
                         if fwd_pe < 20:
-                            _add_points("动态PE(1Y)", 82, f"前瞻PE={fwd_pe:.1f}x（基于净利同比+{float(profit_yoy_val):.0f}%）")
+                            _add_points("动态PE(1Y)", 82, f"前瞻PE={fwd_pe:.1f}x{_ext_note}")
                         elif fwd_pe < 30:
-                            _add_points("动态PE(1Y)", 72, f"前瞻PE={fwd_pe:.1f}x（基于净利同比+{float(profit_yoy_val):.0f}%）")
+                            _add_points("动态PE(1Y)", 72, f"前瞻PE={fwd_pe:.1f}x{_ext_note}")
                         elif fwd_pe < 45:
-                            _add_points("动态PE(1Y)", 60, f"前瞻PE={fwd_pe:.1f}x（基于净利同比+{float(profit_yoy_val):.0f}%）")
+                            _add_points("动态PE(1Y)", 60, f"前瞻PE={fwd_pe:.1f}x{_ext_note}")
                     # PEG<1 成长股核心定价锚：额外强调
                     peg_val = rel.get("PEG", {}).get("value")
                     if peg_val is not None and float(peg_val) > 0 and float(peg_val) < 1:
@@ -1033,9 +1077,18 @@ class FundamentalEngine:
                 if final_score < 55:
                     final_score = 60.0
                     result["composite_valuation_score"] = final_score
+                    # 只有当 PEG/成长补充因子真的进入了估值构成时才这么写，
+                    # 否则文案会声称「以 PEG/PS 为主」而构成里根本没有 PEG。
+                    _bd = result.get("valuation_score_breakdown") or []
+                    _has_peg = any("PEG" in str(b.get("factor") or "") for b in _bd)
+                    _note = "；高成长科技股 DCF 权重降至 10%"
+                    _note += (
+                        "，以 PEG/PS/可比公司为主"
+                        if _has_peg
+                        else "（PEG 未纳入本次构成：成长口径未确认，按核心三因子定价）"
+                    )
                     result["valuation_rationale"] = (
-                        (result.get("valuation_rationale") or "")
-                        + "；高成长科技股 DCF 权重降至 10%，以 PEG/PS/可比公司为主"
+                        (result.get("valuation_rationale") or "") + _note
                     )
 
         # 红利资产：DDM（股利贴现）作为核心参考估值，替代 DCF
@@ -1214,13 +1267,23 @@ class FundamentalEngine:
                     cagr = ((end / start) ** (1 / span) - 1) * 100
                     if cagr > 0:
                         return round(cagr, 2), f"{span}年净利CAGR"
-        yoy = meta.get("profit_yoy")
+        # 无足够年报序列时才回退同比，且必须用「前瞻口径」：
+        # 493% 这类并表/低基数暴增直接做 PEG 分母会把 PEG 压到 0.05，
+        # 变成完全失真的"极度低估"信号。E 侧统一用 profit_yoy_forward（±300% 上限）。
+        yoy = meta.get("profit_yoy_forward")
+        if yoy is None:
+            yoy = meta.get("profit_yoy")
         if yoy is not None and float(yoy) > 0:
-            return round(float(yoy), 2), "最新净利同比"
+            src = "最新净利同比（前瞻口径）" if meta.get("profit_yoy_extreme") else "最新净利同比"
+            return round(float(yoy), 2), src
         return None, "净利增速"
+
     @staticmethod
     def _growth_rate(meta: dict) -> float:
-        raw = meta.get("profit_yoy")
+        # 前瞻外推场景统一取折减口径，避免把一次性暴增当作长期增速
+        raw = meta.get("profit_yoy_forward")
+        if raw is None:
+            raw = meta.get("profit_yoy")
         if raw is None:
             return 0.05
         raw_f = float(raw)

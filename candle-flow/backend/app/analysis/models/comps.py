@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from app.core.bull_tactics import is_st_name
+from app.analysis.config.company_profiles import peers_for
 from app.services.fundamental_screen import _fetch_yjbb, _num, _to_symbol
 from app.services.valuation import get_valuations
 from app.utils.symbol import is_etf_symbol, is_index_symbol
@@ -231,14 +232,36 @@ def select_comparables(
     db: Any = None,
     limit: int = DEFAULT_LIMIT,
     cap_diff_max: float = CAP_DIFF_MAX,
+    peer_symbols: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     步骤2：筛选可比公司。
     条件：同行业（可软匹配）、非 ST/亏损、市值偏离限制，按市值接近度取前 limit 家。
+    peer_symbols 提供时（公司画像的显式同业清单）直接使用，
+    避免「分销商被拿去和被动元件制造商比」这类商业模式错配。
     """
-    peers = _industry_peer_rows(industry, report_date, exclude=stock_code)
-    if not peers:
-        return []
+    # 清单可能写成 6 位代码（"001287"）也可能带后缀（"001287.SZ"），
+    # 这里保留原始形式作为 key，改由 _rank 做多形式查找兜底：
+    # 曾因清单是 6 位、而行情返回的 key 带后缀，quotes.get() 全部落空，
+    # 可比公司静默变成 0 家（peer_count=0），估值分位与相对估值随即失效。
+    _target = str(stock_code or "").strip().upper()
+    _target_digits = "".join(ch for ch in _target if ch.isdigit())
+    explicit: list[str] = []
+    for _s in peer_symbols or []:
+        _raw = str(_s).strip().upper()
+        if not _raw:
+            continue
+        _raw_digits = "".join(ch for ch in _raw if ch.isdigit())
+        # 排除目标自身（无论写成 6 位还是带后缀）
+        if _raw == _target or (_raw_digits and _raw_digits == _target_digits):
+            continue
+        if _raw not in explicit:
+            explicit.append(_raw)
+    peers: list[dict[str, Any]] = []
+    if not explicit:
+        peers = _industry_peer_rows(industry, report_date, exclude=stock_code)
+        if not peers:
+            return []
 
     # 先按利润规模接近度缩小名单，再拉行情（避免对 60+ 同行全市场报价）
     quote_n = max(limit * 2, MIN_PEER_SAMPLE + 4)
@@ -249,14 +272,30 @@ def select_comparables(
             return 1e18
         return -abs(float(np_))
 
-    shortlist = sorted(peers, key=_size_key)[:quote_n]
+    shortlist = (
+        [{"symbol": s} for s in explicit]
+        if explicit
+        else sorted(peers, key=_size_key)[:quote_n]
+    )
 
     quotes = _batch_quotes([p["symbol"] for p in shortlist], db=db)
 
     def _rank(max_dist: float, pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ranked: list[tuple[float, dict[str, Any]]] = []
         for peer in pool:
-            q = quotes.get(peer["symbol"].upper()) or {}
+            _sym = str(peer.get("symbol") or "").upper()
+            _sym_digits = "".join(ch for ch in _sym if ch.isdigit())
+            # 多形式兜底：6 位 / 带后缀两种写法都能命中行情返回的 key
+            q = (
+                quotes.get(_sym)
+                or quotes.get((_to_symbol(_sym) or "").upper())
+                or (quotes.get(_sym_digits) if len(_sym_digits) == 6 else None)
+                or {}
+            )
+            _pname = str(q.get("name") or peer.get("name") or "")
+            # 显式清单是人工维护的同业名单，仍需剔除 ST/退市，与行业路径口径一致
+            if is_st_name(_pname) or "退" in _pname:
+                continue
             pe = q.get("pe_ttm")
             pb = q.get("pb")
             mcap = q.get("market_cap")
@@ -325,6 +364,13 @@ def calculate_comparable_valuation(
     report_date = meta.get("latest_report") or (
         str(fin_df.index[-1]) if fin_df is not None and not fin_df.empty else None
     )
+    # 商业模式优先：有画像/行业映射的显式同业清单时，不再按「所处行业」字符串
+    # 自动筛（东财行业分类会把分销商和被动元件制造商放在一起）
+    peer_symbols = peers_for(
+        str(meta.get("name") or market.get("name") or target.get("name") or ""),
+        str(stock_code or ""),
+        industry,
+    )
     comparables = select_comparables(
         stock_code,
         industry=industry,
@@ -332,6 +378,7 @@ def calculate_comparable_valuation(
         target_market_cap=target.get("market_cap") or market.get("market_cap"),
         db=db,
         limit=limit,
+        peer_symbols=peer_symbols or None,
     )
 
     valid_pe = [m["pe"] for m in comparables if m.get("pe") is not None and 0 < float(m["pe"]) < PE_MAX]
@@ -411,5 +458,8 @@ def calculate_comparable_valuation(
         "signal": signal,
         "warning": warning,
         "peer_count": peer_n,
+        "peer_source": (
+            "公司画像显式同业清单（商业模式一致）" if peer_symbols else "按所处行业自动筛选"
+        ),
         "insufficient_sample": insufficient,
     }

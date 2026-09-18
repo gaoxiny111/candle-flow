@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from app.analysis.base import AnalysisLevel, BaseAnalyzer, ModuleResult, score_to_level
-from app.analysis.config.company_profiles import get_company_profile
+from app.analysis.config.company_profiles import get_company_profile, is_distribution
 from app.analysis.dividend_profile import classify_dividend_asset
 from app.analysis.receivable_quality import ar_turnover_warning, is_quality_receivable_context
 
@@ -28,6 +28,10 @@ class RiskAnalyzer(BaseAnalyzer):
 
         name = str(kwargs.get("name") or "")
         industry = str(kwargs.get("industry") or "")
+        # 分销/贸易：下游长账期是模式本身，应收随营收扩张放大属营运资本占用，
+        # 与 cashflow 模块「分销模式观察项」的账龄结论保持同口径，
+        # 避免同一批应收数据在两个模块得出相反定性。
+        is_dist_biz = is_distribution(name, str(kwargs.get("symbol") or ""), industry)
         delist_risk = False
         if "ST" in name.upper() or "退" in name:
             warnings.append(f"名称含风险标识（{name}），存在退市/重整风险")
@@ -64,15 +68,21 @@ class RiskAnalyzer(BaseAnalyzer):
             ar_growth = ar1 / ar0 - 1
             rev_growth = rev1 / rev0 - 1
             if rev_growth >= 0.20 and ar_growth > rev_growth * 2 and ar_growth > 0.2:
-                msg, deduct = ar_turnover_warning(quality_context=quality_ar, severe_wc_spike=True)
+                msg, deduct = ar_turnover_warning(
+                    quality_context=quality_ar, severe_wc_spike=True, distribution=is_dist_biz
+                )
                 warnings.append(msg)
                 risk_score -= deduct
             elif rev_growth < 0 and ar_growth > rev_growth:
-                msg, deduct = ar_turnover_warning(quality_context=quality_ar)
+                msg, deduct = ar_turnover_warning(
+                    quality_context=quality_ar, distribution=is_dist_biz
+                )
                 warnings.append(msg)
                 risk_score -= deduct
             elif rev_growth >= 0 and ar_growth > rev_growth + 0.10:
-                msg, deduct = ar_turnover_warning(quality_context=quality_ar)
+                msg, deduct = ar_turnover_warning(
+                    quality_context=quality_ar, distribution=is_dist_biz
+                )
                 warnings.append(msg)
                 risk_score -= deduct
 
