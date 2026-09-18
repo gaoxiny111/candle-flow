@@ -189,6 +189,8 @@ export interface MarketConfluenceItem {
   fundamental_weight?: number
   kline_score_normalized?: number
   peg?: number | null
+  industry?: string
+  price?: number | null
   buy_signal?: {
     signal: string
     label: string
@@ -282,7 +284,7 @@ export const scanMarketConfluence = async (
     '/signals/scan/market',
     null,
     {
-      timeout: 60000,
+      timeout: 120000,
       params: {
         force: opts?.force ?? false,
         recent_bars: opts?.recent_bars ?? 2,
@@ -299,7 +301,7 @@ export const scanMarketConfluence = async (
         if (onProgress && res.data.data) onProgress(res.data.data)
         return res
       },
-      { timeoutMs: 300000 },
+      { timeoutMs: 600000 },
     )
     if (job.status === 'error') throw new Error(job.error || job.message || '市场扫描失败')
     return { data: { code: 200, message: 'success', data: job.result as MarketConfluenceScanResult, meta: null } }

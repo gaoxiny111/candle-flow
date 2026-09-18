@@ -225,25 +225,46 @@ def _detect_buy_signal(
     }
 
 
-def _compute_fundamental_score(symbol: str) -> dict[str, Any]:
-    """对单只股票运行完整基本面分析，返回 composite_score 及关键指标。"""
-    try:
-        from app.analysis.engine import FundamentalEngine
+def _extract_fundamental_fields(result: dict[str, Any]) -> dict[str, Any]:
+    """从 run_full_analysis 返回 dict 中提取扫描所需字段。"""
+    composite = result.get("composite_score")
+    if composite is None:
+        return {"score": None, "error": result.get("error", "no_composite_score")}
+    modules = result.get("modules") or {}
+    market = result.get("market") or {}
+    return {
+        "score": float(composite),
+        "profitability": (modules.get("profitability") or {}).get("score"),
+        "growth": (modules.get("growth") or {}).get("score"),
+        "cashflow": (modules.get("cashflow") or {}).get("score"),
+        "valuation_score": (modules.get("valuation") or {}).get("score"),
+        "pe_ttm": market.get("pe_ttm"),
+        "industry": result.get("industry") or "",
+        "price": market.get("price"),
+    }
 
-        engine = FundamentalEngine()
-        result = engine.run_full_analysis(symbol, db=None)
-        composite = result.get("composite_score")
-        if composite is None:
-            return {"score": None, "error": result.get("error", "no_composite_score")}
-        return {
-            "score": float(composite),
-            "profitability": result.get("modules", {}).get("profitability", {}).get("score"),
-            "growth": result.get("modules", {}).get("growth", {}).get("score"),
-            "cashflow": result.get("modules", {}).get("cashflow", {}).get("score"),
-            "valuation_score": result.get("modules", {}).get("valuation", {}).get("score"),
-            "pe_ttm": result.get("market", {}).get("pe_ttm"),
-            "profit_yoy": result.get("meta", {}).get("profit_yoy"),
-        }
+
+def _compute_fundamental_score(symbol: str) -> dict[str, Any]:
+    """对单只股票运行完整基本面分析，返回 composite_score 及关键指标。
+
+    优先读因子库（毫秒级），miss/stale 时回退到 analyze_symbol_full（6h TTL 缓存）。
+    """
+    # 优先读因子库
+    try:
+        from app.services.factor_db import get, is_stale
+
+        if not is_stale(symbol):
+            cached = get(symbol)
+            if cached:
+                return _extract_fundamental_fields(cached)
+    except Exception:
+        pass
+    # 回退：实时分析路径
+    try:
+        from app.analysis.engine import analyze_symbol_full
+
+        result = analyze_symbol_full(db=None, symbol=symbol, use_cache=True)
+        return _extract_fundamental_fields(result)
     except Exception as exc:
         logger.debug("fundamental analysis failed for %s: %s", symbol, exc)
         return {"score": None, "error": str(exc)}
@@ -594,10 +615,15 @@ class MarketConfluenceService:
         fund_scores: dict[str, dict[str, Any]] = {}
         fund_symbols = [sym for sym, _ in qualified_universe]
         total = len(fund_symbols)
+        fund_start = time.time()
         if progress:
             progress(0, total, "fundamentals")
         if fund_symbols:
             fund_workers = min(FUND_WORKERS, max(1, len(fund_symbols)))
+            # per-stock timeout：单只超时视为 error 跳过，不让慢股票拖死整批
+            per_stock_timeout = 15.0
+            # batch deadline：冷启动网络抖动时，不让整批超过 180s（前端 poll 上限 600s）
+            batch_deadline = 180.0
             with ThreadPoolExecutor(max_workers=fund_workers) as pool:
                 fund_futures = {
                     pool.submit(_compute_fundamental_score, sym): sym
@@ -605,14 +631,33 @@ class MarketConfluenceService:
                 }
                 done = 0
                 for fut in as_completed(fund_futures):
+                    # 批级 deadline：超时则取消剩余任务，用已完成的部分继续
+                    if time.time() - fund_start > batch_deadline:
+                        remaining = sum(1 for f in fund_futures if not f.done())
+                        if remaining:
+                            logger.warning(
+                                "market scan fundamentals BATCH DEADLINE %.1fs reached, cancelling %d remaining",
+                                batch_deadline, remaining,
+                            )
+                            for f in fund_futures:
+                                if not f.done():
+                                    f.cancel()
+                        break
                     sym = fund_futures[fut]
                     try:
-                        fund_scores[sym] = fut.result()
+                        fund_scores[sym] = fut.result(timeout=per_stock_timeout)
+                    except TimeoutError:
+                        logger.warning("fundamental analysis TIMEOUT for %s (>%.1fs), skipping", sym, per_stock_timeout)
+                        fund_scores[sym] = {"score": None, "error": "timeout"}
                     except Exception:
                         fund_scores[sym] = {"score": None, "error": "unknown"}
                     done += 1
                     if progress:
                         progress(done, total, "fundamentals")
+            logger.info(
+                "market scan fundamentals: %d/%d symbols in %.1fs (workers=%d)",
+                len(fund_scores), total, time.time() - fund_start, fund_workers,
+            )
 
         # ── 第三层：构建展示数据 + 分层 ──
         enriched_items: list[dict] = []
@@ -631,11 +676,13 @@ class MarketConfluenceService:
             enriched = {
                 "symbol": sym,
                 "name": name,
+                "industry": fund.get("industry") or "",
                 "fundamental_score": round(fund_score, 1),
                 "fundamental_level": _fund_level(fund_score),
                 "combined_score": round(fund_score, 1),
                 "peg": peg,
                 "pe_ttm": pe,
+                "price": fund.get("price"),
                 "profit_yoy": profit_yoy,
                 "roe": fund.get("roe"),
                 "debt_ratio": fund.get("debt_ratio"),

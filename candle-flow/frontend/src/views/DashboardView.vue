@@ -6,7 +6,7 @@ import { usePatternStore } from '@/stores/pattern'
 import { useSignalStore } from '@/stores/signal'
 import { useConfigStore } from '@/stores/config'
 import { useWatchlistStore } from '@/stores/watchlist'
-import { apiErrorText, analyzeFundamentalsBatch, fetchValuations, resolveSymbolQuery, scanMarketConfluence } from '@/api'
+import { apiErrorText, analyzeFundamentalsBatch, fetchMarketConfluenceScan, fetchValuations, resolveSymbolQuery, scanMarketConfluence } from '@/api'
 import type { FundamentalAnalysisReport, JobProgress, MarketConfluenceItem, SymbolValuation } from '@/api'
 import { directionZh, patternNameZh } from '@/utils/labels'
 import { isEtfSymbol, rememberSymbol, symbolName, tryNormalizeSymbol } from '@/utils/symbol'
@@ -214,6 +214,25 @@ const filteredMarketItems = computed(() => {
   return marketItems.value.filter((i) => i.tier === marketTierFilter.value)
 })
 
+// 按行业分组：在 tier 筛选后，再按 industry 聚合，每组内按基本面评分降序
+const industryGroupedItems = computed(() => {
+  const items = filteredMarketItems.value
+  const groups: { industry: string; items: typeof items }[] = []
+  const map = new Map<string, typeof items>()
+  for (const item of items) {
+    const ind = item.industry || '未分类'
+    if (!map.has(ind)) map.set(ind, [])
+    map.get(ind)!.push(item)
+  }
+  for (const [industry, groupItems] of map) {
+    groupItems.sort((a, b) => (b.fundamental_score ?? 0) - (a.fundamental_score ?? 0))
+    groups.push({ industry, items: groupItems })
+  }
+  // 组间按数量降序，数量相同按行业名
+  groups.sort((a, b) => b.items.length - a.items.length || a.industry.localeCompare(b.industry, 'zh-CN'))
+  return groups
+})
+
 function tierLabel(tier?: string) {
   const labels: Record<string, string> = {
     A: 'A · 优质（≥85）',
@@ -352,6 +371,35 @@ function openDetail(sym: string) {
 }
 
 async function loadMarketScan(force = false) {
+  // 非强制时先 GET 读缓存，有缓存直接展示，不走后台扫描流程
+  if (!force) {
+    try {
+      const { data: cacheRes } = await fetchMarketConfluenceScan()
+      const cachePayload = cacheRes.data
+      if (cachePayload && !cachePayload.empty) {
+        marketItems.value = cachePayload.items || []
+        marketTierFilter.value = 'all'
+        marketStats.value = {
+          scanned: cachePayload.scanned,
+          universe_size: cachePayload.universe_size,
+          count: cachePayload.count,
+          cached: cachePayload.cached,
+          raw_hit_count: cachePayload.raw_hit_count,
+          bullish_count: cachePayload.bullish_count,
+          fund_analyzed: cachePayload.fund_analyzed,
+          fund_no_score: cachePayload.fund_no_score,
+          tier_counts: cachePayload.tier_counts,
+        }
+        marketLoaded = true
+        const tc = cachePayload.tier_counts
+        const age = cachePayload.cache_age_sec
+        marketScanHint.value = `缓存结果（${age ?? 0}s 前）：基本面合格 ${cachePayload.prescreen?.qualified ?? '—'} → 展示 ${cachePayload.count} 只（A ${tc?.A ?? 0} / B ${tc?.B ?? 0} / C ${tc?.C ?? 0} / D ${tc?.D ?? 0} / E ${tc?.E ?? 0}）`
+        return
+      }
+    } catch {
+      // GET 失败则走 POST 扫描
+    }
+  }
   marketScanning.value = true
   marketScanError.value = ''
   marketProgress.value = { status: 'running', message: force ? '正在重新扫描…' : '扫描启动中…', pct: 0 }
@@ -649,6 +697,7 @@ async function switchBoardTab(tab: 'watch' | 'market') {
                   <th>等级</th>
                   <th>股票</th>
                   <th>代码</th>
+                  <th>股价</th>
                   <th>基本面评分</th>
                   <th>PEG</th>
                   <th>PE</th>
@@ -657,9 +706,15 @@ async function switchBoardTab(tab: 'watch' | 'market') {
                   <th>操作</th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody v-for="group in industryGroupedItems" :key="group.industry">
+                <tr class="industry-group-header">
+                  <td colspan="10">
+                    <span class="industry-group-name">{{ group.industry }}</span>
+                    <span class="industry-group-count">{{ group.items.length }}只</span>
+                  </td>
+                </tr>
                 <tr
-                  v-for="item in filteredMarketItems"
+                  v-for="item in group.items"
                   :key="item.symbol"
                   class="watch-row market-hit"
                   :class="'tier-row-' + (item.tier || '').toLowerCase()"
@@ -671,6 +726,7 @@ async function switchBoardTab(tab: 'watch' | 'market') {
                   </td>
                   <td class="symbol-name">{{ item.name || '—' }}</td>
                   <td class="symbol-code">{{ item.symbol.split('.')[0] }}</td>
+                  <td class="symbol-price">{{ item.price != null ? item.price.toFixed(2) : '—' }}</td>
                   <td>
                     <span class="fund-score" :class="fundScoreClass(item.fundamental_score)">
                       {{ item.fundamental_score?.toFixed(1) ?? '—' }}
@@ -691,36 +747,40 @@ async function switchBoardTab(tab: 'watch' | 'market') {
             </table>
           </div>
           <div class="watch-cards market-cards">
-            <article
-              v-for="item in filteredMarketItems"
-              :key="'mkt-' + item.symbol"
-              class="watch-card market-card"
-              :class="'tier-row-' + (item.tier || '').toLowerCase()"
-              @click="openChart(item.symbol)"
-            >
-              <div class="watch-card-head">
-                <div>
-                  <div class="watch-card-name">{{ item.name || '—' }}</div>
-                  <div class="symbol-code">{{ item.symbol.split('.')[0] }}</div>
+            <template v-for="group in industryGroupedItems" :key="'card-' + group.industry">
+              <div class="industry-cards-header">{{ group.industry }}（{{ group.items.length }}）</div>
+              <article
+                v-for="item in group.items"
+                :key="'mkt-' + item.symbol"
+                class="watch-card market-card"
+                :class="'tier-row-' + (item.tier || '').toLowerCase()"
+                @click="openChart(item.symbol)"
+              >
+                <div class="watch-card-head">
+                  <div>
+                    <div class="watch-card-name">{{ item.name || '—' }}</div>
+                    <div class="symbol-code">{{ item.symbol.split('.')[0] }}</div>
+                  </div>
+                  <span class="tier-badge" :class="'tier-' + (item.tier || '').toLowerCase()">
+                    {{ tierLabel(item.tier) }}
+                  </span>
                 </div>
-                <span class="tier-badge" :class="'tier-' + (item.tier || '').toLowerCase()">
-                  {{ tierLabel(item.tier) }}
-                </span>
-              </div>
-              <div class="watch-card-quote">
+                <div class="watch-card-quote">
                 <span>基本面 {{ item.fundamental_score?.toFixed(1) ?? '—' }}</span>
+                <span v-if="item.price != null" class="card-price">{{ item.price.toFixed(2) }}</span>
                 <span v-if="item.peg != null" :class="pegClass(item.peg)">PEG {{ item.peg.toFixed(2) }}</span>
               </div>
-              <div class="watch-card-metrics">
-                <div><span class="k">PE</span><span>{{ item.pe_ttm?.toFixed(1) ?? '—' }}</span></div>
-                <div><span class="k">ROE</span><span>{{ item.roe?.toFixed(1) ?? '—' }}%</span></div>
-                <div><span class="k">负债率</span><span>{{ item.debt_ratio?.toFixed(1) ?? '—' }}%</span></div>
-              </div>
-              <div class="watch-card-head market-card-foot">
-                <span class="muted">点按查看图表</span>
-                <button type="button" class="link-btn" @click.stop="openChart(item.symbol)">图表</button>
-              </div>
-            </article>
+                <div class="watch-card-metrics">
+                  <div><span class="k">PE</span><span>{{ item.pe_ttm?.toFixed(1) ?? '—' }}</span></div>
+                  <div><span class="k">ROE</span><span>{{ item.roe?.toFixed(1) ?? '—' }}%</span></div>
+                  <div><span class="k">负债率</span><span>{{ item.debt_ratio?.toFixed(1) ?? '—' }}%</span></div>
+                </div>
+                <div class="watch-card-head market-card-foot">
+                  <span class="muted">点按查看图表</span>
+                  <button type="button" class="link-btn" @click.stop="openChart(item.symbol)">图表</button>
+                </div>
+              </article>
+            </template>
           </div>
         </template>
         <div v-else-if="marketItems.length" class="empty">当前等级下暂无股票，可切换筛选。</div>
@@ -878,11 +938,11 @@ th { color: var(--text-secondary); font-weight: 500; }
   cursor: pointer;
 }
 .tier-chip.active { color: var(--text-primary); border-color: var(--color-primary); background: rgba(24, 144, 255, 0.08); }
-.tier-chip.tier-a.active { border-color: #389e0d; background: rgba(82, 196, 26, 0.12); color: #389e0d; }
+.tier-chip.tier-a.active { border-color: #cf1322; background: rgba(245, 34, 45, 0.12); color: #cf1322; }
 .tier-chip.tier-b.active { border-color: #1677ff; background: rgba(24, 144, 255, 0.10); color: #1677ff; }
 .tier-chip.tier-c.active { border-color: #d48806; background: rgba(250, 173, 20, 0.12); color: #ad6800; }
 .tier-chip.tier-d.active { border-color: #d46b08; background: rgba(255, 120, 50, 0.10); color: #d46b08; }
-.tier-chip.tier-e.active { border-color: #cf1322; background: rgba(245, 34, 45, 0.10); color: #cf1322; }
+.tier-chip.tier-e.active { border-color: #389e0d; background: rgba(82, 196, 26, 0.10); color: #389e0d; }
 .tier-badge {
   display: inline-block;
   font-size: 12px;
@@ -892,43 +952,80 @@ th { color: var(--text-secondary); font-weight: 500; }
   white-space: nowrap;
 }
 .tier-badge.tier-s { background: rgba(250, 173, 20, 0.18); color: #ad6800; }
-.tier-badge.tier-a { background: rgba(82, 196, 26, 0.15); color: #389e0d; }
+.tier-badge.tier-a { background: rgba(245, 34, 45, 0.15); color: #cf1322; }
 .tier-badge.tier-b { background: rgba(24, 144, 255, 0.12); color: #1677ff; }
 .tier-badge.tier-c { background: rgba(250, 173, 20, 0.15); color: #ad6800; }
 .tier-badge.tier-d { background: rgba(255, 120, 50, 0.12); color: #d46b08; }
-.tier-badge.tier-e { background: rgba(245, 34, 45, 0.12); color: #cf1322; }
-.tier-row-a { background: rgba(82, 196, 26, 0.04); }
+.tier-badge.tier-e { background: rgba(82, 196, 26, 0.12); color: #389e0d; }
+.tier-row-a { background: rgba(245, 34, 45, 0.04); }
 .tier-row-b { background: rgba(24, 144, 255, 0.03); }
 .tier-row-c { background: rgba(250, 173, 20, 0.03); }
 .tier-row-d { background: rgba(255, 120, 50, 0.03); }
-.tier-row-e { background: rgba(245, 34, 45, 0.03); }
-.market-hit { background: rgba(82, 196, 26, 0.04); }
+.tier-row-e { background: rgba(82, 196, 26, 0.03); }
+.industry-group-header td {
+  padding: 8px 12px;
+  background: rgba(24, 144, 255, 0.06);
+  border-top: 2px solid rgba(24, 144, 255, 0.15);
+  border-bottom: 1px solid rgba(24, 144, 255, 0.1);
+}
+.industry-group-name {
+  font-weight: 650;
+  font-size: 13px;
+  color: #1d39c4;
+}
+.industry-group-count {
+  margin-left: 8px;
+  font-size: 11px;
+  color: #8c8c8c;
+}
+.industry-cards-header {
+  width: 100%;
+  padding: 6px 10px;
+  margin: 8px 0 4px;
+  font-weight: 650;
+  font-size: 13px;
+  color: #1d39c4;
+  background: rgba(24, 144, 255, 0.06);
+  border-radius: 6px;
+}
+.symbol-price {
+  font-weight: 600;
+  font-size: 13px;
+  color: #cf1322;
+  font-variant-numeric: tabular-nums;
+}
+.card-price {
+  font-weight: 650;
+  color: #cf1322;
+  font-variant-numeric: tabular-nums;
+}
+.market-hit { background: rgba(245, 34, 45, 0.04); }
 .market-hit:hover { background: rgba(24, 144, 255, 0.06); }
-.confluence-highlight { font-weight: 650; color: #389e0d; }
+.confluence-highlight { font-weight: 650; color: #cf1322; }
 .hit-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 .hit-tag {
   font-size: 11px;
   padding: 1px 6px;
   border-radius: 4px;
-  background: rgba(82, 196, 26, 0.12);
-  color: #389e0d;
+  background: rgba(245, 34, 45, 0.12);
+  color: #cf1322;
 }
 .pattern-cell { font-weight: 600; }
 .muted { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
-.score-cell.strong { color: #389e0d; }
+.score-cell.strong { color: #cf1322; }
 /* 动态权重 & 买点信号样式 */
 .fund-score { font-weight: 700; font-size: 14px; }
-.fund-good { color: #389e0d; }
+.fund-good { color: #cf1322; }
 .fund-mid { color: #d48806; }
-.fund-bad { color: #cf1322; }
+.fund-bad { color: #389e0d; }
 .weight-badge {
   font-size: 12px; font-weight: 600;
   padding: 2px 6px; border-radius: 4px;
   background: rgba(24, 144, 255, 0.08); color: #1677ff;
 }
-.peg-good { color: #389e0d; font-weight: 600; }
+.peg-good { color: #cf1322; font-weight: 600; }
 .peg-mid { color: #d48806; font-weight: 600; }
-.peg-bad { color: #cf1322; font-weight: 600; }
+.peg-bad { color: #389e0d; font-weight: 600; }
 .buy-signal-tag {
   display: inline-block; font-size: 12px; font-weight: 600;
   padding: 2px 8px; border-radius: 4px; white-space: nowrap;

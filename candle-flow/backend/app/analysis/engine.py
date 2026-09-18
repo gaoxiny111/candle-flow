@@ -795,15 +795,17 @@ class FundamentalEngine:
         result["relative"] = rel
 
         scores: list[float] = []
+        weights_list: list[float] = []
         breakdown: list[dict[str, Any]] = []
 
-        def _add_points(factor: str, points: float, detail: str) -> None:
+        def _add_points(factor: str, points: float, detail: str, weight: float = 1.0) -> None:
             scores.append(points)
+            weights_list.append(weight)
             breakdown.append({"factor": factor, "points": round(points, 1), "detail": detail})
 
         if is_div:
-            # 红利股估值框架：股息率利差 35% + 分红确定性 30%
-            # + 分红现金覆盖 20% + PE/PB 历史分位 15%（弱化历史分位噪音）
+            # 红利股估值框架：股息率利差 40% + 分红确定性 30%
+            # + 自由现金流覆盖 20% + PE历史分位 10%（弱化历史分位噪音）
             div_factors = self._dividend_valuation_factors(
                 fin_df=fin_df,
                 meta=meta,
@@ -812,7 +814,7 @@ class FundamentalEngine:
                 pb_pct=pb_pct,
                 cashflow_score=cashflow_score,
             )
-            weights = {"股息率利差": 0.35, "分红确定性": 0.30, "分红现金覆盖": 0.20, "PE/PB分位": 0.15}
+            weights = {"股息率利差": 0.40, "分红确定性": 0.30, "分红现金覆盖": 0.20, "PE/PB分位": 0.10}
             for name, item in div_factors.items():
                 _add_points(name, float(item["score"]), str(item.get("detail") or ""))
             base_score = round(
@@ -843,24 +845,60 @@ class FundamentalEngine:
                 if premium_boost > 0:
                     base_score = min(95.0, base_score + premium_boost)
         else:
-            for key, item in rel.items():
-                sig = item.get("signal")
-                if sig == "低估":
-                    _add_points(key, 85.0, f"信号={sig}")
-                elif sig == "合理":
-                    _add_points(key, 65.0, f"信号={sig}")
-                elif sig in ("高估", "偏贵"):
-                    _add_points(key, 35, f"信号={sig}")
-            if pe is not None and 0 < float(pe) < 10:
-                _add_points("绝对PE", 88, f"PE={float(pe):.1f}<10")
-            elif pe is not None and 0 < float(pe) < 15:
-                _add_points("绝对PE", 75, f"PE={float(pe):.1f}<15")
-            if div is not None and float(div) >= 6:
-                _add_points("高股息", 90, f"股息率={float(div):.1f}%")
-            if comps_signal == "低估":
-                _add_points("可比公司", 82, "相对可比低估")
-            elif comps_signal == "高估":
-                _add_points("可比公司", 40, "相对可比高估")
+            # ── 估值评分：历史分位50% + 相对估值30% + 股息率20% ──
+            # 1. PE历史分位（权重50%）
+            pe_pct_val = rel.get("PE_TTM", {}).get("percentile_5y")
+            if pe_pct_val is not None:
+                pp = float(pe_pct_val)
+                if pp < 10:
+                    pe_pct_score = 90.0
+                elif pp < 30:
+                    pe_pct_score = 70.0
+                elif pp < 70:
+                    pe_pct_score = 50.0
+                elif pp < 90:
+                    pe_pct_score = 30.0
+                else:
+                    pe_pct_score = 10.0
+                _add_points("PE历史分位", pe_pct_score, f"分位{pp:.0f}%", weight=0.50)
+            elif pe is not None and 0 < float(pe):
+                # 无历史分位时用绝对PE回退
+                pv = float(pe)
+                if pv < 12:
+                    _add_points("绝对PE", 88, f"PE={pv:.1f}<12（无分位数据）")
+                elif pv < 20:
+                    _add_points("绝对PE", 65, f"PE={pv:.1f}（无分位数据）")
+                else:
+                    _add_points("绝对PE", 40, f"PE={pv:.1f}（无分位数据）")
+            # 2. 相对估值（权重30%）：PE / 同行中位数
+            peer_pe = comps.get("avg_pe") if sample_ok else None
+            if pe is not None and peer_pe is not None and float(peer_pe) > 0:
+                relative_pe = float(pe) / float(peer_pe)
+                if relative_pe < 0.8:
+                    rel_score = 80.0
+                elif relative_pe < 1.2:
+                    rel_score = 50.0
+                else:
+                    rel_score = 20.0
+                _add_points("相对PE", rel_score, f"PE/同行中位={relative_pe:.2f}", weight=0.30)
+            elif comps_signal:
+                # 无可比中位数时用信号回退
+                if comps_signal == "低估":
+                    _add_points("可比公司", 82, "相对可比低估")
+                elif comps_signal == "高估":
+                    _add_points("可比公司", 30, "相对可比高估")
+            # 3. 股息率（权重20%）
+            if div is not None:
+                dy = float(div)
+                if dy > 4:
+                    div_score = 90.0
+                elif dy > 3:
+                    div_score = 70.0
+                elif dy > 2:
+                    div_score = 50.0
+                else:
+                    div_score = 30.0
+                _add_points("股息率", div_score, f"股息率={dy:.1f}%", weight=0.20)
             # ── 成长股估值框架补充 ─────────────────────────────────────────
             if is_growth:
                 # 毛利率溢价（技术壁垒代理）
@@ -925,7 +963,9 @@ class FundamentalEngine:
                             scores[i] = 55.0
                             breakdown[i]["points"] = 55.0
                             breakdown[i]["detail"] += "；成长股PB软化"
-            base_score = sum(scores) / len(scores) if scores else 55.0
+            # 加权平均：核心三因子（分位50%+相对30%+股息20%）+ 成长补充因子（等权bonus）
+            total_w = sum(weights_list)
+            base_score = sum(s * w for s, w in zip(scores, weights_list)) / total_w if total_w > 0 else 55.0
         rationale_parts: list[str] = []
         if is_div:
             rationale_parts.append(
@@ -999,8 +1039,52 @@ class FundamentalEngine:
                     )
 
         # 红利资产：DDM（股利贴现）作为核心参考估值，替代 DCF
-        if is_div and not fin_df.empty:
+        # 扩展：分红率>60% 的非红利股也构建 DDM 用于多模型交叉
+        payout_ratio_pct = meta.get("payout_ratio_pct")
+        is_high_payout = (
+            payout_ratio_pct is not None and float(payout_ratio_pct) >= 60
+        )
+        if (is_div or is_high_payout) and not fin_df.empty:
             result["ddm"] = self._build_ddm(market, meta)
+
+        # ── 多模型交叉内在价值：DCF 40% + DDM 40% + 机构目标价 20% ──
+        dcf_for_combo = result.get("dcf") or {}
+        ddm_for_combo = result.get("ddm") or {}
+        dcf_iv = dcf_for_combo.get("intrinsic_value_per_share")
+        # 取 DDM 中性情景
+        ddm_iv = None
+        for sc in ddm_for_combo.get("scenarios", []):
+            if sc.get("name") == "中性":
+                ddm_iv = sc.get("intrinsic_value_per_share")
+                break
+        # 机构目标价（当前无数据源，预留接口），无则用 DCF 替代
+        target_iv = meta.get("consensus_target_price") or market.get("target_price")
+        if target_iv is not None:
+            target_iv = float(target_iv)
+
+        components: list[tuple[str, float, float]] = []  # (name, value, weight)
+        if dcf_iv is not None and float(dcf_iv) > 0:
+            components.append(("DCF", float(dcf_iv), 0.4))
+        if ddm_iv is not None and float(ddm_iv) > 0:
+            components.append(("DDM", float(ddm_iv), 0.4))
+        if target_iv is not None and target_iv > 0:
+            components.append(("机构目标价", target_iv, 0.2))
+
+        # 若某模型缺失，用 DCF 替代其权重（保持总权重=1）
+        if components:
+            total_w = sum(w for _, _, w in components)
+            combo_iv = sum(v * w for _, v, w in components) / total_w
+            combo_note = " + ".join(
+                f"{n}={v:.2f}×{w/total_w:.0%}" for n, v, w in components
+            )
+            result["combined_intrinsic_value"] = {
+                "intrinsic_value_per_share": round(combo_iv, 2),
+                "components": [
+                    {"model": n, "value": round(v, 2), "weight": round(w / total_w, 3)}
+                    for n, v, w in components
+                ],
+                "note": f"多模型交叉内在价值：{combo_note} = {combo_iv:.2f}元",
+            }
 
         # 无相对估值信号时：仅用「可信」DCF 的安全边际粗估，避免默认 55 / 爆表估值污染分数
         dcf = result.get("dcf") or {}
@@ -1250,7 +1334,7 @@ class FundamentalEngine:
     ) -> dict[str, dict[str, Any]]:
         """
         红利股估值四因子加权框架（替代 PE/PB 分位均值）：
-        股息率利差 35% + 分红确定性 30% + 分红现金覆盖 20% + PE/PB 分位 15%
+        股息率利差 40% + 分红确定性 30% + 自由现金流覆盖 20% + PE 分位 10%
         """
         div_info = meta.get("dividend") or {}
         # 1. 股息率利差（当前股息率 - 10Y 国债）
@@ -1258,19 +1342,19 @@ class FundamentalEngine:
         bond = div_profile.get("bond_yield_pct") or CN_10Y_BOND_YIELD_PCT
         spread = (float(dy) - float(bond)) if dy is not None else None
         if spread is not None:
-            spread_bps = spread * 100
-            if spread_bps >= 300:
+            spread_pct = spread  # 百分点
+            if spread_pct >= 2.5:
                 spread_score = 88.0
-                spread_detail = f"股息率{dy:.1f}%−国债{bond:.1f}%={spread:.1f}pct（{spread_bps:.0f}BP），利差极宽"
-            elif spread_bps >= 200:
-                spread_score = 85.0
-                spread_detail = f"股息率{dy:.1f}%−国债{bond:.1f}%={spread:.1f}pct（{spread_bps:.0f}BP），利差充足"
-            elif spread_bps >= 100:
-                spread_score = 72.0
-                spread_detail = f"股息率{dy:.1f}%−国债{bond:.1f}%={spread:.1f}pct（{spread_bps:.0f}BP），利差尚可"
+                spread_detail = f"股息率{dy:.1f}%−国债{bond:.1f}%={spread_pct:.1f}pct，利差极宽（≥2.5%）"
+            elif spread_pct >= 1.5:
+                spread_score = 78.0
+                spread_detail = f"股息率{dy:.1f}%−国债{bond:.1f}%={spread_pct:.1f}pct，利差充足（≥1.5%）"
+            elif spread_pct >= 0.5:
+                spread_score = 65.0
+                spread_detail = f"股息率{dy:.1f}%−国债{bond:.1f}%={spread_pct:.1f}pct，利差尚可（≥0.5%）"
             else:
-                spread_score = 50.0
-                spread_detail = f"股息率{dy:.1f}%−国债{bond:.1f}%={spread:.1f}pct，利差偏薄"
+                spread_score = 45.0
+                spread_detail = f"股息率{dy:.1f}%−国债{bond:.1f}%={spread_pct:.1f}pct，利差偏薄（<0.5%）"
         else:
             spread_score = 60.0
             spread_detail = "股息率数据缺失，利差无法计算"
@@ -1313,22 +1397,41 @@ class FundamentalEngine:
             det_parts.append("分红数据有限")
         certainty_detail = "；".join(det_parts)
 
-        # 3. 分红现金覆盖（OCF/净利 + FCF 覆盖分红缺口）
+        # 3. 自由现金流覆盖（FCF/分红倍数 + OCF/净利辅助）
         ocf_np = meta.get("latest_cash_ratio")  # OCF/净利
         fcf_div_gap = div_info.get("fcf_dividend_gap")
         fcf = div_info.get("fcf")
         cash_total = div_info.get("cash_total")
         cover_score = 50.0
         cover_parts: list[str] = []
-        if ocf_np is not None and float(ocf_np) >= 1.5:
-            cover_score += 35
-            cover_parts.append(f"OCF/净利={float(ocf_np):.2f}，造血充裕")
-        elif ocf_np is not None and float(ocf_np) >= 1.0:
-            cover_score += 25
-            cover_parts.append(f"OCF/净利={float(ocf_np):.2f}，覆盖无压力")
-        elif ocf_np is not None and float(ocf_np) >= 0.7:
-            cover_score += 12
-            cover_parts.append(f"OCF/净利={float(ocf_np):.2f}，覆盖偏紧")
+        # 核心指标：FCF / 现金分红 覆盖倍数
+        fcf_coverage = None
+        if fcf is not None and cash_total is not None and float(cash_total) > 0:
+            fcf_coverage = float(fcf) / float(cash_total)
+        if fcf_coverage is not None:
+            if fcf_coverage >= 1.5:
+                cover_score += 35
+                cover_parts.append(f"FCF/分红={fcf_coverage:.1f}x，覆盖充裕")
+            elif fcf_coverage >= 1.0:
+                cover_score += 25
+                cover_parts.append(f"FCF/分红={fcf_coverage:.1f}x，覆盖无压力")
+            elif fcf_coverage >= 0.8:
+                cover_score += 12
+                cover_parts.append(f"FCF/分红={fcf_coverage:.1f}x，覆盖偏紧")
+            else:
+                cover_score -= 5
+                cover_parts.append(f"FCF/分红={fcf_coverage:.1f}x<1，需消耗存量现金")
+        else:
+            # 回退：用 OCF/净利代理
+            if ocf_np is not None and float(ocf_np) >= 1.5:
+                cover_score += 30
+                cover_parts.append(f"OCF/净利={float(ocf_np):.2f}，造血充裕")
+            elif ocf_np is not None and float(ocf_np) >= 1.0:
+                cover_score += 20
+                cover_parts.append(f"OCF/净利={float(ocf_np):.2f}，覆盖无压力")
+            elif ocf_np is not None and float(ocf_np) >= 0.7:
+                cover_score += 10
+                cover_parts.append(f"OCF/净利={float(ocf_np):.2f}，覆盖偏紧")
         if cashflow_score is not None and float(cashflow_score) >= 70:
             cover_score += 8
             cover_parts.append(f"现金流质量{float(cashflow_score):.0f}分")
@@ -1340,49 +1443,38 @@ class FundamentalEngine:
             gap = float(fcf_div_gap)
             if gap < 0:
                 cover_score -= 6
-                # 转换为亿显示
                 fcf_yi = float(fcf) / 1e8 if fcf and float(fcf) > 1e6 else float(fcf or 0)
                 cash_yi = float(cash_total) / 1e8 if cash_total and float(cash_total) > 1e6 else float(cash_total or 0)
                 gap_yi = abs(gap) / 1e8 if abs(gap) > 1e6 else abs(gap)
                 cover_parts.append(
-                    f"FCF {fcf_yi:.0f}亿 < 现金分红 {cash_yi:.0f}亿，缺口{gap_yi:.0f}亿，"
-                    f"需消耗存量现金"
+                    f"FCF {fcf_yi:.0f}亿 < 现金分红 {cash_yi:.0f}亿，缺口{gap_yi:.0f}亿"
                 )
-            elif gap > 0:
+            elif gap > 0 and fcf_coverage is None:
                 cover_score += 5
                 cover_parts.append(f"FCF覆盖分红有余")
         cover_score = max(30.0, min(cover_score, 95.0))
         cover_detail = "；".join(cover_parts) if cover_parts else "现金流覆盖数据不足"
 
-        # 4. PE/PB 历史分位（弱权重 15%）
-        pct_avg = None
+        # 4. PE 历史分位（弱权重 10%，红利框架不作主锚）
         pct_parts: list[str] = []
         if pe_pct is not None:
-            pct_parts.append(f"PE分位{float(pe_pct):.0f}%")
-        if pb_pct is not None:
-            pct_parts.append(f"PB分位{float(pb_pct):.0f}%")
-        if pe_pct is not None and pb_pct is not None:
-            pct_avg = (float(pe_pct) + float(pb_pct)) / 2
-        elif pe_pct is not None:
-            pct_avg = float(pe_pct)
-        elif pb_pct is not None:
-            pct_avg = float(pb_pct)
-        if pct_avg is not None:
-            if pct_avg >= 95:
-                pct_score = 40.0
-            elif pct_avg >= 90:
+            pp = float(pe_pct)
+            pct_parts.append(f"PE分位{pp:.0f}%")
+            if pp >= 90:
                 pct_score = 42.0
-            elif pct_avg >= 75:
-                pct_score = 45.0
-            elif pct_avg >= 50:
+            elif pp >= 75:
+                pct_score = 50.0
+            elif pp >= 50:
                 pct_score = 58.0
-            elif pct_avg >= 25:
-                pct_score = 75.0
+            elif pp >= 30:
+                pct_score = 70.0
+            elif pp <= 10:
+                pct_score = 90.0
             else:
-                pct_score = 88.0
+                pct_score = 75.0
         else:
             pct_score = 55.0
-        pct_detail = "、".join(pct_parts) + "（弱权重，红利框架不作主锚）" if pct_parts else "分位数据缺失（弱权重）"
+        pct_detail = "、".join(pct_parts) + "（弱权重，红利框架不作主锚）" if pct_parts else "PE分位数据缺失（弱权重）"
 
         return {
             "股息率利差": {"score": spread_score, "detail": spread_detail},

@@ -391,8 +391,7 @@ def test_observe_pledge_does_not_force_e(monkeypatch):
     # 不应因观察级质押触发价值陷阱文案
     assert "生存" not in (report.get("valuation", {}).get("value_trap_message") or "")
     cf = report["modules"]["cashflow"]
-    cr = next(i for i in cf["indicators"] if i["name"] == "经营现金流/净利润")
-    assert cr["value"] == 0.13 or abs(cr["value"] - 0.132) < 0.01
-    # 年报修正锚：上年年报OCF/NP健康(>0.7) + 利润高增(+80%) → 阶段性占用，非结构性恶化
-    # 新文案应包含"偏低"和"健康"关键词，而非旧的"当期现金流恶化"
-    assert any("偏低" in w and "健康" in w for w in report["warnings"])
+    cr = next(i for i in cf["indicators"] if i["name"].startswith("经营现金流/净利润"))
+    # 5年均值评分：年报OCF/NP健康(>0.7) + 利润高增(+80%) → 短期扰动，按均值评分
+    assert cr["value"] > 0.8  # 5年均值在1.0左右，而非当期0.13
+    assert "短期扰动" in (cr.get("comment") or "")

@@ -276,6 +276,14 @@ def _scheduled_sync():
         run_daily_bull_tactics_scan(refresh_list=False, sync_klines=False)
     except Exception:
         logger.exception("scheduled daily bull tactics scan failed")
+    # 因子库构建：盘后预构建，盘中扫描零 API 调用
+    try:
+        from app.services.factor_db import build_all
+
+        stats = build_all()
+        logger.info("scheduled factor build: %s", stats)
+    except Exception:
+        logger.exception("scheduled factor build failed")
 
 
 def start_kline_sync_scheduler() -> None:

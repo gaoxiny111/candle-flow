@@ -543,16 +543,16 @@ function bullBearTone(view: string | undefined) {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   background: var(--bg-secondary, #f5f5f5);
 }
-.hero-score.good { background: #f6ffed; color: #389e0d; }
+.hero-score.good { background: #fff1f0; color: #cf1322; }
 .hero-score.mid { background: #fffbe6; color: #d48806; }
-.hero-score.bad { background: #fff1f0; color: #cf1322; }
+.hero-score.bad { background: #f6ffed; color: #389e0d; }
 .hero-score .num { font-size: 28px; font-weight: 700; line-height: 1; }
 .hero-score .lbl { font-size: 12px; margin-top: 4px; }
 .hero-meta .title { font-size: 18px; font-weight: 600; }
 .hero-meta .sub { font-size: 13px; color: var(--text-secondary); margin-top: 4px; }
 .rating { margin-top: 8px; font-size: 14px; }
-.rating strong.good { color: #389e0d; }
-.rating strong.bad { color: #cf1322; }
+.rating strong.good { color: #cf1322; }
+.rating strong.bad { color: #389e0d; }
 .market { font-size: 13px; color: var(--text-secondary); margin-top: 4px; }
 
 /* ── 五维雷达 + 多空 ─────────────────────────────── */
@@ -573,9 +573,9 @@ function bullBearTone(view: string | undefined) {
 [data-theme='dark'] .bull-card { background: var(--bg-secondary, #1a1a1a); }
 .bull-label { font-size: 12px; color: var(--text-secondary); font-weight: 600; }
 .bull-view { font-size: 20px; font-weight: 700; margin: 2px 0; }
-.bull-view.good { color: #389e0d; }
+.bull-view.good { color: #cf1322; }
 .bull-view.mid { color: #d48806; }
-.bull-view.bad { color: #cf1322; }
+.bull-view.bad { color: #389e0d; }
 .bull-score { font-size: 11px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
 .bull-signals { margin: 6px 0 0; padding-left: 16px; font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
 .bull-signals li { margin: 2px 0; }
@@ -664,9 +664,9 @@ function bullBearTone(view: string | undefined) {
 }
 .module-head { display: flex; justify-content: space-between; font-weight: 600; font-size: 14px; margin-bottom: 6px; }
 .module-score { font-weight: 600; font-size: 13px; }
-.module-score.good { color: #389e0d; }
+.module-score.good { color: #cf1322; }
 .module-score.mid { color: #d48806; }
-.module-score.bad { color: #cf1322; }
+.module-score.bad { color: #389e0d; }
 .module-score.na, .na { color: #8c8c8c; font-weight: 600; }
 .indicators { list-style: none; margin: 0; padding: 0; font-size: 13px; }
 .indicators li {
@@ -677,16 +677,16 @@ function bullBearTone(view: string | undefined) {
 .ind-period { font-size: 11px; color: var(--text-secondary); opacity: 0.85; font-weight: 400; }
 .ind-val { font-variant-numeric: tabular-nums; }
 .ind-score { font-weight: 600; min-width: 28px; text-align: right; }
-.ind-score.good { color: #389e0d; }
+.ind-score.good { color: #cf1322; }
 .ind-score.mid { color: #d48806; }
-.ind-score.bad { color: #cf1322; }
+.ind-score.bad { color: #389e0d; }
 .ind-comment { grid-column: 1 / -1; font-size: 12px; color: var(--text-secondary); }
 .valuation { margin-top: 10px; padding: 10px 0; border-top: 1px solid var(--border-color); }
 .valuation h4 { margin: 0 0 8px; font-size: 14px; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
 .val-score { font-size: 13px; font-weight: 600; }
-.val-score.good { color: #389e0d; }
+.val-score.good { color: #cf1322; }
 .val-score.mid { color: #d48806; }
-.val-score.bad { color: #cf1322; }
+.val-score.bad { color: #389e0d; }
 .val-rationale {
   font-size: 12px; color: var(--text-secondary); margin: 0 0 10px; line-height: 1.5;
   padding: 8px 10px; background: var(--bg-secondary, #fafafa); border-radius: 6px;
@@ -701,8 +701,8 @@ function bullBearTone(view: string | undefined) {
 .val-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
 .val-item { font-size: 13px; padding: 8px; background: var(--bg-secondary, #fafafa); border-radius: 6px; }
 .val-key { display: block; font-weight: 600; }
-.val-signal.good { color: #389e0d; }
-.val-signal.bad { color: #cf1322; }
+.val-signal.good { color: #cf1322; }
+.val-signal.bad { color: #389e0d; }
 .val-num { display: block; margin-top: 2px; }
 .val-sub { font-size: 12px; color: var(--text-secondary); }
 .comps-summary {

@@ -80,8 +80,70 @@ class GrowthAnalyzer(BaseAnalyzer):
             )
         )
 
+        # ── 前瞻成长性：历史40% + 前瞻60%（无机构预期时用最新同比代理） ──
         yoy_rev = kwargs.get("revenue_yoy")
         yoy_profit = kwargs.get("profit_yoy")
+        fwd_growth = None
+        fwd_source = ""
+        # 优先机构一致预期（当前无数据源，预留接口）
+        consensus_cagr = kwargs.get("consensus_net_profit_cagr_3y")
+        if consensus_cagr is not None and float(consensus_cagr) > 0:
+            fwd_growth = float(consensus_cagr)
+            fwd_source = "机构一致预期未来3年CAGR"
+        elif yoy_profit is not None:
+            fwd_growth = float(yoy_profit)
+            fwd_source = f"最新报告期净利同比（{yoy_period}）代理前瞻"
+
+        if fwd_growth is not None:
+            # 评分标准：>15%=A, 10-15%=B+, 5-10%=B, 0-5%=C, <0%=D
+            def _growth_score(cagr: float) -> tuple[float, AnalysisLevel]:
+                if cagr > 15:
+                    return 88.0, AnalysisLevel.EXCELLENT
+                elif cagr > 10:
+                    return 80.0, AnalysisLevel.GOOD
+                elif cagr > 5:
+                    return 72.0, AnalysisLevel.GOOD
+                elif cagr > 0:
+                    return 55.0, AnalysisLevel.NEUTRAL
+                else:
+                    return 35.0, AnalysisLevel.POOR
+
+            hist_score, _ = _growth_score(profit_cagr_3y)
+            fwd_score, fwd_level = _growth_score(fwd_growth)
+            # 加权：历史40% + 前瞻60%
+            combined = hist_score * 0.4 + fwd_score * 0.6
+            # 加速因子：前瞻 > 历史×1.5，加5分
+            acceleration_bonus = 0.0
+            if fwd_growth > profit_cagr_3y * 1.5 and profit_cagr_3y > 0:
+                acceleration_bonus = 5.0
+                combined = min(95.0, combined + acceleration_bonus)
+            combined = round(combined, 1)
+            combined_level = (
+                AnalysisLevel.EXCELLENT if combined >= 85
+                else AnalysisLevel.GOOD if combined >= 70
+                else AnalysisLevel.NEUTRAL if combined >= 55
+                else AnalysisLevel.POOR
+            )
+            accel_note = (
+                f"；加速因子+{acceleration_bonus:.0f}（前瞻{fwd_growth:.1f}%>历史{profit_cagr_3y:.1f}%×1.5）"
+                if acceleration_bonus > 0 else ""
+            )
+            indicators.append(
+                IndicatorResult(
+                    name="前瞻成长性(%)",
+                    value=round(fwd_growth, 2),
+                    score=combined,
+                    level=combined_level,
+                    trend="up" if fwd_growth > profit_cagr_3y else "flat",
+                    weight=1.5,
+                    period=yoy_period,
+                    comment=(
+                        f"历史3年CAGR {profit_cagr_3y:.1f}%（权重40%）+"
+                        f"前瞻 {fwd_growth:.1f}%（权重60%，{fwd_source}）"
+                        f"= 综合{combined:.0f}分{accel_note}"
+                    ),
+                )
+            )
         # 最新同比权重高于 CAGR，避免周期回落掩盖边际企稳
         yoy_weight = 3.5
         # 蓝筹温和复苏（0%~+10%）给良好档，不要求高增长

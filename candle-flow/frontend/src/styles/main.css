@@ -2,6 +2,9 @@
   --color-primary: #1890ff;
   --color-up: #f5222d;
   --color-down: #52c41a;
+  /* A 股配色：红=涨/看多/利好，绿=跌/看空/利空 */
+  --color-bullish: #cf1322;
+  --color-bearish: #389e0d;
   --bg-dark: #1a1a2e;
   --bg-light: #ffffff;
   --bg-page: #f5f7fa;

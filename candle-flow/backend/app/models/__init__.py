@@ -1,3 +1,4 @@
+from app.models.factor_snapshot import FactorSnapshot
 from app.models.fundamental import FundamentalCandidate
 from app.models.indicator import Indicator
 from app.models.kline import KlineData
@@ -20,4 +21,5 @@ __all__ = [
     "PaymentOrder",
     "PaymentClaim",
     "FundamentalCandidate",
+    "FactorSnapshot",
 ]

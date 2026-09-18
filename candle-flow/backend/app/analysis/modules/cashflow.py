@@ -51,9 +51,17 @@ class CashflowAnalyzer(BaseAnalyzer):
 
         cash_ratio_series = pd.Series(dtype=float)
         annual_cash_ratio: float | None = None
+        # 5年趋势值：均值与标准差
+        cash_ratio_5y_avg: float | None = None
+        cash_ratio_5y_std: float | None = None
         if len(ocf.dropna()) and len(net_profit.dropna()):
             cash_ratio_series = (ocf / net_profit).replace([np.inf, -np.inf], np.nan).dropna()
             annual_cash_ratio = float(cash_ratio_series.iloc[-1]) if len(cash_ratio_series) else None
+            # 取最近5期（含年报+可能的季报）计算均值与标准差
+            if len(cash_ratio_series) >= 2:
+                _recent = cash_ratio_series.tail(5)
+                cash_ratio_5y_avg = float(_recent.mean())
+                cash_ratio_5y_std = float(_recent.std(ddof=0)) if len(_recent) >= 2 else 0.0
 
         latest_cr = kwargs.get("latest_cash_ratio")
         use_latest = bool(
@@ -76,13 +84,57 @@ class CashflowAnalyzer(BaseAnalyzer):
             profit_for_sign = float(profit_clean.iloc[-1]) if len(profit_clean) else 0.0
             if use_latest and kwargs.get("eps") is not None and float(kwargs.get("eps") or 0) < 0:
                 profit_for_sign = -1.0
+            score_ratio = cash_ratio  # 默认用当期值，后续按趋势逻辑覆盖
             if profit_for_sign < 0:
                 score, level = 35.0, AnalysisLevel.POOR
                 cr_comment = "净利为负时该比率失真，不按利润含金量解读"
             else:
-                score, level = self._score_by_range(cash_ratio, (1.0, 5.0), (0.7, 1.0), (0.4, 0.7))
-                cr_comment = ">1 利润含金量高，<0.5 警惕利润注水"
-                if use_latest and cash_ratio < 0.4:
+                # ── 优先用5年均值评分，避免单期扰动（如所得税集中支付） ──
+                # 判断当期是否偏离均值超过2个标准差
+                is_anomaly = False
+                if (cash_ratio_5y_avg is not None and cash_ratio_5y_std is not None
+                        and cash_ratio_5y_std > 1e-6):
+                    if abs(cash_ratio - cash_ratio_5y_avg) > 2 * cash_ratio_5y_std:
+                        is_anomaly = True
+
+                if is_anomaly and cash_ratio_5y_avg is not None:
+                    # 当期偏离大：判断是否为短期扰动（所得税/汇兑/备货占用）
+                    annual_ok = annual_cash_ratio is not None and float(annual_cash_ratio) >= 0.7
+                    yoy_p_v = kwargs.get("profit_yoy")
+                    profit_growing = yoy_p_v is not None and float(yoy_p_v) >= 15
+                    # 短期扰动：年报健康 + (利润高增 或 当期值非崩盘性低)
+                    is_temporary = annual_ok and (profit_growing or cash_ratio > 0.3)
+                    if is_temporary:
+                        # 短期扰动（所得税集中支付/战略备货/汇兑），不降级，按5年均值评分
+                        score_ratio = cash_ratio_5y_avg
+                        reason = "利润高增+战略备货" if profit_growing else "所得税/汇兑等"
+                        cr_comment = (
+                            f"当期经营现金流/净利={cash_ratio:.2f}偏离5年均值{cash_ratio_5y_avg:.2f}"
+                            f"（{cash_ratio_5y_std:.2f}σ），但年报健康，"
+                            f"疑为{reason}短期扰动，按5年均值评分"
+                        )
+                    else:
+                        # 结构性恶化，按当期值评分
+                        score_ratio = cash_ratio
+                        reason2 = "年报不健康" if not annual_ok else "利润无增长"
+                        cr_comment = (
+                            f"当期经营现金流/净利={cash_ratio:.2f}显著偏离5年均值{cash_ratio_5y_avg:.2f}"
+                            f"且{reason2}，疑似结构性恶化"
+                        )
+                elif cash_ratio_5y_avg is not None:
+                    # 当期正常，按5年均值评分
+                    score_ratio = cash_ratio_5y_avg
+                    cr_comment = (
+                        f"5年均值{score_ratio:.2f}（当期{cash_ratio:.2f}），"
+                        f"避免单期扰动，按趋势值评分"
+                    )
+                else:
+                    score_ratio = cash_ratio
+                    cr_comment = ">1 利润含金量高，<0.5 警惕利润注水"
+
+                # 评分标准：>0.8=A档, 0.5-0.8=B档, 0.3-0.5=C档, <0.3=D档
+                score, level = self._score_by_range(score_ratio, (0.8, 5.0), (0.5, 0.8), (0.3, 0.5))
+                if use_latest and cash_ratio < 0.4 and not is_anomaly:
                     # ── 年报修正锚：上年年报健康时，中报/季报低比值可能是阶段性现象 ──
                     # 战略备货（存货↑）+ 订单饱满（应收↑）导致现金流占用，≠利润注水
                     annual_ok = annual_cash_ratio is not None and float(annual_cash_ratio) >= 0.7
@@ -115,12 +167,12 @@ class CashflowAnalyzer(BaseAnalyzer):
                         )
             indicators.append(
                 IndicatorResult(
-                    name="经营现金流/净利润",
-                    value=round(cash_ratio, 2),
+                    name="经营现金流/净利润(5年均值)",
+                    value=round(score_ratio, 2),
                     score=score,
                     level=level,
                     trend=self._calc_trend(cash_ratio_series) if len(cash_ratio_series) else "flat",
-                    weight=3.5 if use_latest and cash_ratio < 0.4 else 3.0,
+                    weight=3.5 if use_latest and cash_ratio < 0.4 and not is_anomaly else 3.0,
                     comment=cr_comment,
                     period=period_for_cr,
                 )

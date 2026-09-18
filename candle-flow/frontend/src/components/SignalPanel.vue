@@ -462,10 +462,10 @@ function isActive(item: DisplayItem) {
   line-height: 1.5;
 }
 .hit.penalty {
-  background: rgba(245, 34, 45, 0.1);
-  color: #cf1322;
+  background: rgba(82, 196, 26, 0.1);
+  color: #389e0d;
 }
-.hit-detail.penalty { color: #cf1322; }
+.hit-detail.penalty { color: #389e0d; }
 .asof-mismatch {
   margin: 0 0 var(--space-sm);
   font-size: 12px;
@@ -500,16 +500,16 @@ function isActive(item: DisplayItem) {
   color: var(--text-primary, #1f1f1f);
   line-height: 1.3;
 }
-.price-cell.stop strong { color: #cf1322; }
+.price-cell.stop strong { color: #389e0d; }
 .price-cell.inv strong { color: #d48806; }
-.price-cell.tp strong { color: #389e0d; }
+.price-cell.tp strong { color: #cf1322; }
 .price-cell.pos .sub {
   font-size: 11px;
   color: var(--text-secondary);
   font-weight: 500;
 }
 .live-rr strong { color: #d48806; }
-.live-rr.bad strong { color: #cf1322; }
+.live-rr.bad strong { color: #389e0d; }
 [data-theme='dark'] .signal-detail { background: rgba(255, 255, 255, 0.04); }
 .chase-warn {
   margin: 0 0 var(--space-sm);

@@ -170,3 +170,12 @@ def run_screen(body: ScreenRequest, db: Session = Depends(get_db)):
             "items": pool_items_out(saved, db),
         }
     )
+
+
+@router.post("/fundamentals/factors/rebuild")
+def rebuild_factors(force: bool = False, db: Session = Depends(get_db)):
+    """手动触发因子库重建。force=True 时全量重建。"""
+    from app.services.factor_db import build_all
+
+    stats = build_all(force=force)
+    return ApiResponse(data=stats)

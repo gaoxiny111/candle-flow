@@ -778,8 +778,8 @@ onMounted(async () => {
   white-space: nowrap;
 }
 .scorecard tr.picked td { background: rgba(24, 144, 255, 0.06); }
-.scorecard .ok { color: var(--color-bullish, #389e0d); font-weight: 700; }
-.scorecard .bad { color: var(--color-bearish, #cf1322); font-weight: 700; }
+.scorecard .ok { color: var(--color-bullish, #cf1322); font-weight: 700; }
+.scorecard .bad { color: var(--color-bearish, #389e0d); font-weight: 700; }
 .scorecard .mini { font-size: 11px; color: var(--text-secondary); margin-top: 2px; font-weight: 400; }
 .chip {
   border: 1px solid var(--border-color);
@@ -823,7 +823,7 @@ onMounted(async () => {
   margin-left: auto;
 }
 
-.error { color: var(--color-bearish, #cf1322); margin: 12px 0 0; }
+.error { color: var(--color-bearish, #389e0d); margin: 12px 0 0; }
 .message { color: var(--color-primary); margin: 12px 0 0; }
 
 .results-head {
@@ -1003,8 +1003,8 @@ onMounted(async () => {
   font-size: 11px;
   font-weight: 500;
 }
-.metric dd.up { color: var(--color-bullish, #389e0d); }
-.metric dd.down { color: var(--color-bearish, #cf1322); }
+.metric dd.up { color: var(--color-bullish, #cf1322); }
+.metric dd.down { color: var(--color-bearish, #389e0d); }
 
 .card-foot {
   display: flex;
@@ -1050,8 +1050,8 @@ onMounted(async () => {
   font-size: 12px;
 }
 .checks li span { color: var(--text-secondary); }
-.checks li.ok strong { color: var(--color-bullish, #389e0d); }
-.checks li.bad strong { color: var(--color-bearish, #cf1322); }
+.checks li.ok strong { color: var(--color-bullish, #cf1322); }
+.checks li.bad strong { color: var(--color-bearish, #389e0d); }
 .notes {
   margin: 10px 0 0;
   font-size: 12px;
@@ -1130,9 +1130,9 @@ onMounted(async () => {
 }
 .zone-badge.ready,
 .zone-badge.add {
-  border-color: rgba(56, 158, 13, 0.4);
-  color: #389e0d;
-  background: rgba(56, 158, 13, 0.1);
+  border-color: rgba(207, 19, 34, 0.4);
+  color: #cf1322;
+  background: rgba(207, 19, 34, 0.1);
 }
 .zone-badge.wait_confirm,
 .zone-badge.wait_pullback,
@@ -1146,9 +1146,9 @@ onMounted(async () => {
 .zone-badge.reduce,
 .zone-badge.not_eligible,
 .zone-badge.no_signal {
-  border-color: rgba(207, 19, 34, 0.35);
-  color: #cf1322;
-  background: rgba(207, 19, 34, 0.08);
+  border-color: rgba(56, 158, 13, 0.35);
+  color: #389e0d;
+  background: rgba(56, 158, 13, 0.08);
 }
 .regime-banner {
   margin-bottom: var(--space-md);

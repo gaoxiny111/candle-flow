@@ -58,13 +58,12 @@ def list_signals(
 
 @router.get("/signals/market-scan")
 def get_market_confluence_scan(db: Session = Depends(get_db)):
-    """返回最近一次全市场强共振扫描缓存（若无则触发一次扫描）。"""
+    """返回最近一次市场扫描缓存。无缓存返回 empty 标记，前端按需触发 POST 扫描。"""
     svc = MarketConfluenceService(db)
     cached = svc.latest()
     if cached is not None:
         return ApiResponse(data=cached)
-    data = svc.scan_market(force=False)
-    return ApiResponse(data=data)
+    return ApiResponse(data={"empty": True})
 
 
 @router.get("/signals/scan/market/progress")
