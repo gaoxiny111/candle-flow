@@ -112,6 +112,47 @@ class GrowthAnalyzer(BaseAnalyzer):
             fwd_score, fwd_level = _growth_score(fwd_growth)
             # 加权：历史40% + 前瞻60%
             combined = hist_score * 0.4 + fwd_score * 0.6
+
+            # ===== 周期底部修正：识别非经常性损益扰动 + 主动收缩 =====
+            cyclical_note = ""
+            deducted_yoy = kwargs.get("deducted_yoy_pct")
+            sq = kwargs.get("single_quarter") or {}
+            q2_qoq = sq.get("qoq_pct")
+            rev_yoy_val = kwargs.get("revenue_yoy")
+            # 毛利率环比变化
+            gm_qoq_val = None
+            if "gross_margin" in financial_data.columns:
+                gm_series = financial_data["gross_margin"].dropna()
+                if len(gm_series) >= 2:
+                    gm_qoq_val = float(gm_series.iloc[-1]) - float(gm_series.iloc[-2])
+
+            is_cyclical_recovery = (
+                fwd_growth < 0  # 归母同比为负
+                and deducted_yoy is not None  # 有扣非数据
+                and abs(float(deducted_yoy) - fwd_growth) > 10  # 扣非与归母差距>10pct
+                and q2_qoq is not None and float(q2_qoq) > 0  # Q2环比为正
+                and rev_yoy_val is not None and float(rev_yoy_val) < 0  # 营收下滑
+            )
+
+            if is_cyclical_recovery:
+                # 1) 用扣非增速替代归母增速（权重 70/30）
+                adjusted_fwd = float(deducted_yoy) * 0.7 + fwd_growth * 0.3
+                adj_fwd_score, _ = _growth_score(adjusted_fwd)
+                combined = hist_score * 0.4 + adj_fwd_score * 0.6
+                # 2) Q2 环比改善加分（边际修复奖励，最多+10）
+                q2_bonus = min(float(q2_qoq) * 0.5, 10.0)
+                combined = min(95.0, combined + q2_bonus)
+                # 3) 主动收缩优化结构加分（营收降但毛利率升，+5）
+                quality_bonus = 0.0
+                if gm_qoq_val is not None and gm_qoq_val > 0.01:
+                    quality_bonus = 5.0
+                    combined = min(95.0, combined + quality_bonus)
+                cyclical_note = (
+                    f"；周期底部修正：扣非{float(deducted_yoy):.1f}%与归母{fwd_growth:.1f}%差距>10pct，"
+                    f"用扣非替代归母（权重70/30），Q2环比+{float(q2_qoq):.0f}%奖励+{q2_bonus:.1f}"
+                    + (f"，主动收缩毛利率升奖励+{quality_bonus:.0f}" if quality_bonus > 0 else "")
+                )
+
             # 加速因子：前瞻 > 历史×1.5，加5分
             acceleration_bonus = 0.0
             if fwd_growth > profit_cagr_3y * 1.5 and profit_cagr_3y > 0:
@@ -140,7 +181,7 @@ class GrowthAnalyzer(BaseAnalyzer):
                     comment=(
                         f"历史3年CAGR {profit_cagr_3y:.1f}%（权重40%）+"
                         f"前瞻 {fwd_growth:.1f}%（权重60%，{fwd_source}）"
-                        f"= 综合{combined:.0f}分{accel_note}"
+                        f"= 综合{combined:.0f}分{accel_note}{cyclical_note}"
                     ),
                 )
             )
