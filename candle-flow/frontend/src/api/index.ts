@@ -1247,6 +1247,159 @@ export const scanHoldings = async (body: { symbols?: string[]; guest_symbols?: s
   return { data: checkApi(res) }
 }
 
+/** 因子库覆盖率：已构建快照 / SH·SZ 股票总数。全市场排序只在已覆盖样本内成立。 */
+export interface MarketScanCoverage {
+  covered: number
+  universe: number
+  remaining: number
+  coverage_pct: number
+  latest_built_at: string | null
+  stale_days: number | null
+  complete: boolean
+}
+
+/**
+ * 榜单一行。`composite_score` 沿用个股分析的权威综合分（模块权重 + E 档打折 +
+ * 风险乘数 + 事件扣分 + 各类 veto），扫描层**不重算**，故与个股页数值逐位一致。
+ */
+export interface MarketScanItem {
+  symbol: string
+  name: string
+  industry: string
+  composite_score: number | null
+  final_rating: string | null
+  risk_level_label: string | null
+  pe_ttm: number | null
+  pb: number | null
+  market_cap_yi: number | null
+  dividend_yield: number | null
+  /** 五维模块分，键为中文：盈利能力/成长性/现金流质量/偿债能力/估值合理性 */
+  dim_scores: Record<string, number | null>
+  /** 横截面分位（0~100，越高越好）。仅展示，不参与排序；缺失为 null（不赋中性分） */
+  market_pct: number | null
+  /** 行业内分位（0~100）。仅展示，不参与排序 */
+  industry_pct: number | null
+}
+
+export type MarketScanSort =
+  | 'composite_score'
+  | 'profitability'
+  | 'growth'
+  | 'cashflow'
+  | 'solvency'
+  | 'valuation'
+
+export interface MarketScanQuery {
+  top?: number
+  /** 综合分下限（与个股分析同一 0~100 口径） */
+  min_composite?: number
+  /** 总市值下限，单位亿元 */
+  min_market_cap_yi?: number
+  exclude_st?: boolean
+  /** 行业名包含匹配，如「银行」「煤炭」 */
+  industry?: string
+  sort_by?: MarketScanSort
+}
+
+export interface MarketScanData {
+  coverage: MarketScanCoverage
+  /** 分位基准样本数（=已覆盖且综合分非空的标的数），分位只在基准内成立 */
+  percentile_base: number
+  count: number
+  matched: number
+  sort_by: string
+  filters: {
+    min_composite: number | null
+    min_market_cap_yi: number | null
+    exclude_st: boolean
+    industry: string | null
+  }
+  items: MarketScanItem[]
+  notes: string[]
+}
+
+export const fetchMarketScan = async (query: MarketScanQuery = {}) => {
+  const res = await api.get<ApiResponse<MarketScanData>>('/fundamentals/market-scan', {
+    params: {
+      top: query.top,
+      min_composite: query.min_composite,
+      min_market_cap_yi: query.min_market_cap_yi,
+      exclude_st: query.exclude_st,
+      industry: query.industry,
+      sort_by: query.sort_by,
+    },
+    timeout: 90000,
+  })
+  return { data: checkApi(res) }
+}
+
+export const fetchMarketCoverage = async () => {
+  const res = await api.get<ApiResponse<MarketScanCoverage>>('/fundamentals/market-coverage')
+  return { data: checkApi(res) }
+}
+
+/** 榜单技术共振叠加：在 MarketScanItem 之上多出的第二、三层字段。 */
+export interface MarketScanOverlayFields {
+  /** 本地K线根数；0 = 无K线（非主板同步范围） */
+  kline_bars: number
+  /** strong_buy / watch / short_term / neutral / insufficient_data */
+  buy_signal: string | null
+  buy_label: string | null
+  buy_reasons: string[]
+  buy_note?: string | null
+  peg: number | null
+  /** 达标 bullish 形态（PatternEngine + evaluate_confluence），无共振为 null */
+  pattern_name: string | null
+  pattern_score: number | null
+  /** 有效共振数（维度正交加权，含周线趋势多周期确认） */
+  confluence_effective: number | null
+  confluence_hits: string | null
+  /** 形态分 + 有效共振数×6（与「主板战法 / 信号页」同源，非第二套权重） */
+  combined_score: number | null
+  pattern_date?: string | null
+}
+
+export type MarketScanOverlayItem = MarketScanItem & MarketScanOverlayFields
+
+export interface MarketScanOverlayData {
+  count: number
+  items: MarketScanOverlayItem[]
+  signal_counts: Record<string, number>
+  /** 板块效应：同行业 ≥2 只出现买点信号才列出 */
+  industry_confluence: { industry: string; total: number; strong_buy: number; signaled: number }[]
+  stats: {
+    kline_ok: number
+    pattern_hits: number
+    peg_available: number
+    peg_note: string
+  }
+  filters: MarketScanData['filters']
+  sort_by: string
+  coverage: MarketScanCoverage
+  cached: boolean
+  notes: string[]
+}
+
+export const fetchMarketScanOverlay = async (query: MarketScanQuery & { force?: boolean } = {}) => {
+  const res = await api.get<ApiResponse<MarketScanOverlayData>>(
+    '/fundamentals/market-scan/technical-overlay',
+    {
+      params: {
+        top: query.top,
+        min_composite: query.min_composite,
+        min_market_cap_yi: query.min_market_cap_yi,
+        exclude_st: query.exclude_st,
+        industry: query.industry,
+        sort_by: query.sort_by,
+        force: query.force,
+      },
+      // 首次调用需逐票跑 K线形态+共振（本地K线库并发，通常数秒）；给足余量
+      timeout: 180000,
+    },
+  )
+  return { data: checkApi(res) }
+}
+
 export const fetchHealth = () => api.get<ApiResponse<{ status: string; db: string; akshare: string }>>('/health')
 
 export interface FlowPoint {

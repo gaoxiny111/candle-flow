@@ -1851,3 +1851,61 @@ def test_cycle_dividend_premium_block_removed(monkeypatch):
     # 红利四因子框架本身不受影响，仍正常工作
     assert "dividend_valuation_factors" in val
     assert val["composite_valuation_score"] > 0
+
+
+def test_dividend_yield_fallback_shared_across_modules(monkeypatch):
+    """东财估值接口失败（无 dividend_yield）时，股息率回退必须在 ctx 构建前完成。
+
+    此前回退只写在 _run_valuation 里：盈利/风险/现金流模块经 ctx 拿到 None
+    → 判「非红利」→ WACC 7%、ROIC<WACC 成立；估值模块自己回退算出股息率
+    → 判「红利」→ 四因子框架高分 + 长线信号「红利龙头底仓」——同一批数据
+    两处各判（铁律 9），并连带触发价值陷阱一票否决锁 28
+    （海螺水泥 600585 2026-09-20 线上事故：同代码本地 73.4 B / 线上 60.7 C）。
+    """
+    engine = FundamentalEngine()
+
+    def fake_build(symbol: str, years: int = 5):
+        fd = _sample_financials().copy()
+        return fd, {
+            "name": "测试水泥",
+            "industry": "水泥",
+            "symbol": "600585.SH",
+            "report_dates": list(fd.index),
+            "annual_dates": list(fd.index),
+            "revenue_yoy": -5.0,
+            "profit_yoy": -8.0,
+            "debt_ratio": 25.0,
+            "latest_report": "20250630",
+            "payout_ratio_pct": 65.0,
+            "dividend": {"d0": 0.80, "payout_ratio_pct": 65.0, "consecutive_years": 15},
+        }
+
+    def fake_valuations(*a, **k):
+        # 模拟东财估值接口失败：估值字段缺失 dividend_yield，仅有价格
+        return [{
+            "symbol": "600585.SH", "name": "测试水泥", "price": 12.0,
+            "pe_ttm": 9.0, "pb": 0.9, "market_cap": 6e10, "total_shares": 5e9,
+        }]
+
+    monkeypatch.setattr("app.analysis.engine.build_financial_dataframe", fake_build)
+    monkeypatch.setattr("app.analysis.engine.industry_averages", lambda *a, **k: {})
+    monkeypatch.setattr("app.analysis.engine.get_valuations", fake_valuations)
+    monkeypatch.setattr(
+        "app.analysis.engine.calculate_comparable_valuation",
+        lambda *a, **k: {
+            "stock_code": "600585.SH", "comparables": [], "avg_pe": None,
+            "avg_pb": None, "valuation_range": {}, "peer_count": 0,
+            "insufficient_sample": True,
+        },
+    )
+
+    report = engine.run_full_analysis("600585.SH", db=None)
+    prof = report["modules"]["profitability"]["metadata"]
+    val = report["valuation"]
+    # 回退股息率 0.80/12.0 = 6.67%（≥5% 且分红率 65%≥60%）→ 全模块必须同判红利
+    assert val.get("is_dividend_asset") is True
+    assert prof.get("is_dividend_asset") is True
+    # 盈利模块 WACC 必须走红利资产口径 4.5%，而非普通公司分档 7%
+    assert prof.get("wacc_pct") == pytest.approx(4.5)
+    # 红利资产不得因 ROIC<WACC 触发价值陷阱一票否决（豁免 ：1198-1204）
+    assert not val.get("value_trap_veto")

@@ -41,6 +41,12 @@ const router = createRouter({
       meta: { title: '主板战法', requiresAuth: false },
     },
     {
+      path: '/market-scan',
+      name: 'market-scan',
+      component: () => import('@/views/MarketScanView.vue'),
+      meta: { title: '基本面榜单', requiresAuth: false },
+    },
+    {
       path: '/fundamentals',
       redirect: '/',
     },

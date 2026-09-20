@@ -198,6 +198,24 @@ class FundamentalEngine:
 
         meta["symbol"] = sym
 
+        # 股息率单一来源（铁律 9：同一判定不得两处各算）：东财估值接口失败时
+        # 用真实分红/股价回退，必须在 ctx 构建前完成。盈利/风险/现金流模块经
+        # ctx 拿 dividend_yield，估值模块经 market 拿；若回退只写在 _run_valuation
+        # 里，东财失败时会出现三方矛盾——盈利模块判「非红利」（WACC 7%、
+        # ROIC<WACC 成立）+ 估值模块判「红利」（四因子框架高分）+ 长线信号
+        # 「红利龙头底仓」，并连带触发价值陷阱一票否决锁 28
+        # （海螺水泥 600585 2026-09-20 线上实测事故：同代码本地 73.4 B / 线上 60.7 C）。
+        if market.get("dividend_yield") is None:
+            div_meta = meta.get("dividend") or {}
+            d0 = div_meta.get("d0")
+            price = market.get("price")
+            if d0 and price and float(price) > 0:
+                market["dividend_yield"] = round(float(d0) / float(price) * 100, 2)
+                logger.info(
+                    "[%s] 股息率回退计算: D0=%.2f/股价=%.2f=%.2f%%",
+                    sym, float(d0), float(price), float(market["dividend_yield"]),
+                )
+
         symbol_roe = meta.get("latest_roe")
         if symbol_roe is None and not fin_df.empty and "roe" in fin_df.columns:
             symbol_roe = float(fin_df["roe"].iloc[-1])
@@ -529,6 +547,9 @@ class FundamentalEngine:
             "industry": meta.get("industry") or "",
             "report_dates": meta.get("report_dates") or [],
             "latest_report": meta.get("latest_report"),
+            # 净利同比随快照落库（factor_db.upsert 存整个 result），供扫描层 PEG / 买点信号使用。
+            # 此前只写进内部 ctx，confluence 服务的 PEG 恒为 None → 强买入信号永不可达。
+            "profit_yoy": meta.get("profit_yoy"),
             "composite_score": composite,
             "final_rating": letter,
             "final_rating_letter": letter,
@@ -580,16 +601,8 @@ class FundamentalEngine:
         pb_pct = market.get("pb_percentile")
         div = market.get("dividend_yield")
 
-        # 股息率回退：东财估值接口失败时用真实分红/股价计算
-        if div is None:
-            div_meta = meta.get("dividend") or {}
-            d0 = div_meta.get("d0")
-            price = market.get("price")
-            if d0 and price and float(price) > 0:
-                div = round(float(d0) / float(price) * 100, 2)
-                market["dividend_yield"] = div
-                logger.info("[%s] 股息率回退计算: D0=%.2f/股价=%.2f=%.2f%%",
-                           meta.get("symbol"), float(d0), float(price), div)
+        # 股息率回退已上移到 run_full_analysis（ctx 构建前）——保证盈利/风险/
+        # 现金流/估值各模块的红利资产分类同源（铁律 9），此处不再重复计算。
 
         growth_rate, growth_label = self._growth_for_peg(fin_df, meta)
         current = {

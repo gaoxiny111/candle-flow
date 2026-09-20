@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -22,7 +23,10 @@ _DISCLOSURE_TTL_DAYS = 3
 # 批量构建参数
 _BUILD_WORKERS = 8
 _BUILD_PER_STOCK_TIMEOUT = 20.0
-_BUILD_BATCH_DEADLINE = 1800.0  # 夜间批跑允许 30 分钟
+# 单次批跑时间预算：全市场 ≈5400 只、单只 ≈13s、8 并发 ≈2.4h，
+# 默认 1800s 会在 ~1100 只处截断（非披露期只补缺失，故可多日渐进补齐）。
+# 需一次性补齐时可用环境变量放宽，或调 /fundamentals/factors/rebuild?budget_sec=。
+_BUILD_BATCH_DEADLINE = float(os.environ.get("FACTOR_BUILD_DEADLINE_SEC", "1800"))
 
 
 def _is_in_disclosure_window(now: datetime | None = None) -> bool:
@@ -148,14 +152,24 @@ def _get_stale_symbols(existing_symbols: set[str], all_symbols: list[str]) -> li
     return [s for s in all_symbols if s not in existing_symbols]
 
 
-def build_all(*, force: bool = False) -> dict[str, Any]:
+def build_all(
+    *,
+    force: bool = False,
+    budget_sec: float | None = None,
+    max_symbols: int | None = None,
+) -> dict[str, Any]:
     """批量构建全市场因子库。
 
     Args:
         force: True 时无视披露窗口判断，全量重建。
+        budget_sec: 本次批处理时间预算（秒）。缺省用 _BUILD_BATCH_DEADLINE。
+            全市场约 5400 只、单只 ≈13s、8 并发 → 跑满约需 2.5h，
+            默认 1800s 会在 ~1100 只处截断（非披露期只补缺失，故可多日渐进补齐）。
+        max_symbols: 本次最多构建多少只（配合 budget_sec 做可控增量补齐）。
 
     Returns:
-        {"built": int, "failed": int, "skipped": int, "duration_sec": float}
+        {"built","failed","skipped","duration_sec","budget_sec",
+         "truncated","coverage":{covered,universe,remaining,coverage_pct}}
     """
     from app.analysis.engine import analyze_symbol_full
 
@@ -163,7 +177,15 @@ def build_all(*, force: bool = False) -> dict[str, Any]:
     all_symbols = _get_all_symbols()
     if not all_symbols:
         logger.warning("factor_db.build_all: no symbols found in StockInfo")
-        return {"built": 0, "failed": 0, "skipped": 0, "duration_sec": 0.0}
+        return {
+            "built": 0,
+            "failed": 0,
+            "skipped": 0,
+            "duration_sec": 0.0,
+            "budget_sec": budget_sec or _BUILD_BATCH_DEADLINE,
+            "truncated": False,
+            "coverage": _coverage(len(all_symbols)),
+        }
 
     # 确定需要构建的股票列表
     if force:
@@ -177,15 +199,35 @@ def build_all(*, force: bool = False) -> dict[str, Any]:
             db.close()
         to_build = _get_stale_symbols(existing, set(all_symbols))
 
+    if max_symbols is not None and max_symbols > 0:
+        to_build = to_build[: int(max_symbols)]
+
+    deadline = float(budget_sec) if budget_sec is not None else _BUILD_BATCH_DEADLINE
     total = len(to_build)
     skipped = len(all_symbols) - total
-    logger.info("factor_db.build_all: %d to build, %d skipped (force=%s)", total, skipped, force)
+    logger.info(
+        "factor_db.build_all: %d to build, %d skipped (force=%s, budget=%.0fs)",
+        total,
+        skipped,
+        force,
+        deadline,
+    )
 
     if not to_build:
-        return {"built": 0, "failed": 0, "skipped": skipped, "duration_sec": time.time() - t0}
+        coverage = _coverage(len(all_symbols))
+        return {
+            "built": 0,
+            "failed": 0,
+            "skipped": skipped,
+            "duration_sec": time.time() - t0,
+            "budget_sec": deadline,
+            "truncated": False,
+            "coverage": coverage,
+        }
 
     built = 0
     failed = 0
+    truncated = False
     batch_start = time.time()
 
     def _process_one(sym: str) -> bool:
@@ -204,13 +246,15 @@ def build_all(*, force: bool = False) -> dict[str, Any]:
         futures = {pool.submit(_process_one, sym): sym for sym in to_build}
         for fut in as_completed(futures):
             # 批级 deadline
-            if time.time() - batch_start > _BUILD_BATCH_DEADLINE:
+            if time.time() - batch_start > deadline:
                 remaining = sum(1 for f in futures if not f.done())
                 if remaining:
                     logger.warning(
                         "factor build BATCH DEADLINE %.0fs reached, %d remaining",
-                        _BUILD_BATCH_DEADLINE, remaining,
+                        deadline,
+                        remaining,
                     )
+                    truncated = True
                     for f in futures:
                         if not f.done():
                             f.cancel()
@@ -226,6 +270,43 @@ def build_all(*, force: bool = False) -> dict[str, Any]:
                 logger.debug("factor build timeout/error for %s", sym)
 
     duration = time.time() - t0
-    stats = {"built": built, "failed": failed, "skipped": skipped, "duration_sec": round(duration, 1)}
-    logger.info("factor_db.build_all done: %s", stats)
+    coverage = _coverage(len(all_symbols))
+    stats = {
+        "built": built,
+        "failed": failed,
+        "skipped": skipped,
+        "duration_sec": round(duration, 1),
+        "budget_sec": deadline,
+        "truncated": truncated,
+        "coverage": coverage,
+    }
+    logger.info(
+        "factor_db.build_all done: %s | coverage %s/%s (%.1f%%)",
+        stats,
+        coverage["covered"],
+        coverage["universe"],
+        coverage["coverage_pct"],
+    )
     return stats
+
+
+def _coverage(universe: int) -> dict[str, Any]:
+    """覆盖率自证：已构建快照数 / SH·SZ 股票总数。"""
+    db = SessionLocal()
+    try:
+        covered = int(
+            db.query(FactorSnapshot)
+            .filter(FactorSnapshot.composite_score.isnot(None))
+            .count()
+        )
+    except Exception:
+        logger.debug("coverage count failed", exc_info=True)
+        covered = 0
+    finally:
+        db.close()
+    return {
+        "covered": covered,
+        "universe": universe,
+        "remaining": max(0, universe - covered),
+        "coverage_pct": round(covered / universe * 100.0, 1) if universe else 0.0,
+    }

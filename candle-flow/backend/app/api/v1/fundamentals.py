@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -14,6 +14,7 @@ from app.services.fundamental_screen import (
     screen_fundamentals,
     themes_catalog,
 )
+from app.services.market_scan import DEFAULT_TOP, MAX_TOP
 
 router = APIRouter()
 
@@ -172,10 +173,103 @@ def run_screen(body: ScreenRequest, db: Session = Depends(get_db)):
     )
 
 
+@router.get("/fundamentals/market-coverage")
+def get_market_coverage(db: Session = Depends(get_db)):
+    """因子库覆盖率：已构建快照 / SH·SZ 股票总数。
+
+    全市场排序只在已覆盖样本内成立，故单列一个接口让前端先看覆盖率。
+    """
+    from app.services.market_scan import market_coverage
+
+    return ApiResponse(data=market_coverage(db))
+
+
+@router.get("/fundamentals/market-scan")
+def run_market_scan(
+    top: int = Query(default=DEFAULT_TOP, ge=1, le=MAX_TOP),
+    min_composite: float | None = Query(default=None),
+    min_market_cap_yi: float | None = Query(default=None, description="总市值下限（亿元）"),
+    exclude_st: bool = Query(default=True),
+    industry: str | None = Query(default=None, description="行业名包含匹配"),
+    sort_by: str = Query(
+        default="composite_score",
+        description="composite_score 或五个维度键：profitability/growth/cashflow/solvency/valuation",
+    ),
+    db: Session = Depends(get_db),
+):
+    """全市场基本面排序（只读因子库，沿用个股分析综合分，不重算分数）。"""
+    from app.services.market_scan import scan_market
+
+    try:
+        data = scan_market(
+            db,
+            top=top,
+            min_composite=min_composite,
+            min_market_cap_yi=min_market_cap_yi,
+            exclude_st=exclude_st,
+            industry=industry,
+            sort_by=sort_by,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"全市场扫描失败：{e}") from e
+    return ApiResponse(data=data)
+
+
+@router.get("/fundamentals/market-scan/technical-overlay")
+def run_market_scan_technical_overlay(
+    top: int = Query(default=60, ge=1, le=120),
+    min_composite: float | None = Query(default=None),
+    min_market_cap_yi: float | None = Query(default=None, description="总市值下限（亿元）"),
+    exclude_st: bool = Query(default=True),
+    industry: str | None = Query(default=None, description="行业名包含匹配"),
+    sort_by: str = Query(
+        default="composite_score",
+        description="composite_score 或五个维度键：profitability/growth/cashflow/solvency/valuation",
+    ),
+    force: bool = Query(default=False, description="跳过 10 分钟缓存"),
+    db: Session = Depends(get_db),
+):
+    """榜单技术共振叠加：基本面榜单 × K线买点信号 × 形态共振（含周线多周期确认）。
+
+    形态共振与买点信号口径与「主板战法 / 信号页」同源；本端点内部复用
+    /fundamentals/market-scan 的榜单结果，不重算基本面分。
+    首次调用需对 top 只票逐票跑 K线形态 + 共振评估（本地K线库，通常数秒内）。
+    """
+    from app.services.market_scan import technical_overlay
+
+    try:
+        data = technical_overlay(
+            db,
+            top=top,
+            min_composite=min_composite,
+            min_market_cap_yi=min_market_cap_yi,
+            exclude_st=exclude_st,
+            industry=industry,
+            sort_by=sort_by,
+            force=force,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"技术共振叠加失败：{e}") from e
+    return ApiResponse(data=data)
+
+
 @router.post("/fundamentals/factors/rebuild")
-def rebuild_factors(force: bool = False, db: Session = Depends(get_db)):
-    """手动触发因子库重建。force=True 时全量重建。"""
+def rebuild_factors(
+    force: bool = False,
+    budget_sec: float | None = None,
+    max_symbols: int | None = None,
+    db: Session = Depends(get_db),
+):
+    """手动触发因子库重建。
+
+    force=True 全量重建；budget_sec / max_symbols 用于可控增量补齐
+    （全市场约 5400 只、单只 ≈13s，默认 1800s 预算约只能建 1100 只）。
+    """
     from app.services.factor_db import build_all
 
-    stats = build_all(force=force)
+    stats = build_all(force=force, budget_sec=budget_sec, max_symbols=max_symbols)
     return ApiResponse(data=stats)
