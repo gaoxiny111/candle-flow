@@ -1,6 +1,7 @@
 """Tests for fundamental analysis engine."""
 
 import pandas as pd
+import pytest
 
 from app.analysis.base import AnalysisLevel
 from app.analysis.engine import FundamentalEngine
@@ -1708,3 +1709,145 @@ def test_missing_liquidity_ratio_not_scored_as_zero():
     names = [i.name for i in res.indicators]
     assert "流动比率" not in names and "速动比率" not in names
     assert all(i.score > 0 for i in res.indicators), [i.name for i in res.indicators]
+
+
+# ── ROIC 投入资本口径（现金奶牛分母坍缩）与 DCF WACC 单一口径 ─────────────
+# 宁德时代 2025 实测：权益 2899 + 有息 1169 − 货币资金 3335 = 732 亿
+# （仅占总资产 7.5%）→ ROIC 算出 91.7%（2024 曾 113%），而官方披露口径
+# 投入资本回报率 2026H1 为 8.37%（年化约 16.7%）。根因是把货币资金全额
+# 当作超额现金扣除且无下限保护，现金越充裕分母越小、ROIC 越爆炸。
+
+
+def test_invested_capital_caps_excess_cash_deduction():
+    from app.analysis.modules.profitability import _invested_capital_series
+
+    # 现金奶牛：现金占有息资本 82% → 抵扣上限 50% 生效（宁德 2025 实测数）
+    fd = pd.DataFrame(
+        {
+            "equity": [2898.5e8],
+            "interest_bearing_debt": [1168.5e8],
+            "monetary_funds": [3335.1e8],
+            "total_assets": [9748.3e8],
+            "current_liabilities": [2081.5e8],
+        }
+    )
+    invested = float(_invested_capital_series(fd).iloc[-1])
+    assert invested == pytest.approx(0.5 * (2898.5e8 + 1168.5e8))
+
+    # 普通公司（现金 < 有息资本一半）：口径完全不变
+    fd_normal = pd.DataFrame(
+        {
+            "equity": [100.0],
+            "interest_bearing_debt": [50.0],
+            "monetary_funds": [30.0],
+            "total_assets": [500.0],
+            "current_liabilities": [200.0],
+        }
+    )
+    assert float(_invested_capital_series(fd_normal).iloc[-1]) == pytest.approx(120.0)
+
+    # 权益缺失 → 仍回退 总资产−流动负债
+    fd_no_equity = pd.DataFrame(
+        {"monetary_funds": [10.0], "total_assets": [500.0], "current_liabilities": [200.0]}
+    )
+    assert float(_invested_capital_series(fd_no_equity).iloc[-1]) == pytest.approx(300.0)
+
+
+def test_roic_metadata_for_cash_rich_company_has_gross_capital_reference():
+    """现金充裕公司：ROIC 不再爆炸，且 metadata 提供全资本口径（不扣现金）参照值。"""
+    fd = _sample_financials().copy()
+    # 构造现金奶牛：权益 50 / 有息 10 / 现金 40（现金占有息资本 67%）
+    fd["equity"] = [50e8, 50e8, 50e8]
+    fd["interest_bearing_debt"] = [10e8, 10e8, 10e8]
+    fd["monetary_funds"] = [40e8, 40e8, 40e8]
+    result = ProfitabilityAnalyzer().analyze(
+        fd,
+        name="宁德时代",
+        symbol="300750",
+        industry="电池",
+        debt_ratio=63.65,
+        latest_roe=24.91,
+    )
+    md = result.metadata
+    # 修前：invested = 50+10−40 = 20 亿 → ROIC = 14×0.75/20 = 52.5%（爆炸）
+    # 修后：抵扣上限 = 0.5×60 = 30 亿 → ROIC = 10.5/30 = 35.0%
+    assert abs(float(md.get("roic")) - 35.0) < 0.6
+    # 全资本口径（与官方披露的投入资本回报率同口径）：10.5/60 = 17.5%
+    gross = md.get("roic_gross_capital_pct")
+    assert gross is not None and abs(float(gross) - 17.5) < 0.6
+    assert float(gross) < float(md.get("roic"))
+
+
+def test_dcf_wacc_single_source_with_profitability():
+    """DCF 折现率必须与盈利模块同源（有息负债率口径）。
+
+    此前 DCF 用含应付的资产负债率独立分档：宁德时代 DR 63.65% → 12%，
+    而盈利模块按有息负债率 12.79% 给 7%——同一公司两个 WACC。
+    """
+    from app.analysis.modules.profitability import _estimate_wacc_pct
+
+    w = FundamentalEngine._dynamic_wacc(63.65, interest_bearing_ratio=12.79)
+    assert w == pytest.approx(0.07)
+    assert w == _estimate_wacc_pct(63.65, interest_bearing_ratio=12.79) / 100.0
+    # 无有息负债率时回退含应付口径（向后兼容，行为与旧版一致）
+    assert FundamentalEngine._dynamic_wacc(63.65) == pytest.approx(0.12)
+    # 分销模式仍受 10% 上限约束
+    assert (
+        FundamentalEngine._dynamic_wacc(75.76, business_model="distribution")
+        == pytest.approx(0.10)
+    )
+
+
+def test_cycle_dividend_premium_block_removed(monkeypatch):
+    """红利框架外的周期/资源股溢价（资源壁垒溢价+4 / 红利定价锚+2）必须移除。
+
+    「红利定价锚」对股息率利差 ≥2.8% 再 +2，而利差本身已是 40% 权重的
+    「股息率利差」因子（≥2.5% 已得 88 分）——同一事实重复计分；
+    「资源壁垒溢价」按绝对 PE<12 加分，与 PE/PB 分位因子重复计入「便宜」
+    这一维度，且关键词（矿/磷/农化）对煤炭等行业名不生效，实测六只
+    周期/红利股（神华/陕煤/兖矿/中煤/云天化/淮北矿业）无一触发。
+    """
+    engine = FundamentalEngine()
+    monkeypatch.setattr(
+        "app.analysis.engine.calculate_comparable_valuation",
+        lambda *a, **k: {
+            "stock_code": "600096.SH",
+            "comparables": [],
+            "avg_pe": None,
+            "avg_pb": None,
+            "valuation_range": {},
+            "peer_count": 0,
+        },
+    )
+    fin_df = _sample_financials()
+    market = {
+        "price": 25.0,
+        "pe_ttm": 10.0,
+        "pb": 2.0,
+        "pe_percentile": 30.0,
+        "pb_percentile": 40.0,
+        # 股息率 7% → 利差 ≈ 5.3 个百分点，远超旧「红利定价锚」的 2.8 阈值
+        "dividend_yield": 7.0,
+        "market_cap": 5e10,
+        "total_shares": 2e9,
+    }
+    meta = {
+        "symbol": "600096.SH",
+        "name": "测试磷化工",
+        "industry": "磷化工及磷肥",  # 含「磷」→ is_cycle_val=True
+        "payout_ratio_pct": 70.0,
+        "dividend": {"payout_ratio_pct": 70.0, "consecutive_years": 15,
+                     "cash_total": 20e8, "fcf": 50e8},
+        "latest_report": "20250630",
+        "debt_ratio": 50.0,
+    }
+    val = engine._run_valuation(fin_df, market, meta, db=None, cashflow_score=70.0)
+    factors = [
+        b.get("factor")
+        for b in (val.get("valuation_score_breakdown") or val.get("breakdown") or [])
+    ]
+    assert "资源壁垒溢价" not in factors
+    assert "红利定价锚" not in factors
+    # 红利四因子框架本身不受影响，仍正常工作
+    assert "dividend_valuation_factors" in val
+    assert val["composite_valuation_score"] > 0

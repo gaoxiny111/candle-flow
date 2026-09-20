@@ -87,8 +87,15 @@ def _estimate_wacc_pct(
 
 def _invested_capital_series(fd: pd.DataFrame) -> pd.Series:
     """
-    投入资本优先：权益 + 有息负债 − 货币资金；
+    投入资本优先：权益 + 有息负债 − 超额现金（抵扣上限 = 有息资本的 50%）；
     其次权益+有息债；再回退 总资产−流动负债。
+
+    抵扣上限的原因：现金奶牛公司（货币资金 ≈ 甚至超过 权益+有息负债）若把
+    货币资金全额当作超额现金扣除，投入资本会坍缩到总资产的个位数百分比，
+    ROIC 数值爆炸——宁德时代 2025 实测：权益 2899 + 有息 1169 − 现金 3335
+    = 732 亿（仅占总资产 7.5%）→ ROIC 算出 91.7%（2024 曾 113%），而官方
+    口径投入资本回报率年化约 16.7%。上限保留「现金充裕获部分信用」的本意，
+    同时保证分母不失真；全资本口径（不扣现金）另见 metadata.roic_gross_capital_pct。
     """
     equity = fd["equity"] if "equity" in fd.columns else pd.Series(pd.NA, index=fd.index)
     ibd = (
@@ -101,7 +108,11 @@ def _invested_capital_series(fd: pd.DataFrame) -> pd.Series:
         if "monetary_funds" in fd.columns
         else pd.Series(0.0, index=fd.index)
     )
-    invested = equity + ibd.fillna(0) - cash.fillna(0)
+    capital = equity + ibd.fillna(0)
+    invested = capital - cash.fillna(0)
+    # ── 超额现金抵扣上限：最多抵掉有息资本的一半 ──
+    floor = capital * 0.5
+    invested = invested.where(invested >= floor, floor)
     # 权益缺失或结果非正时回退
     ta = fd["total_assets"] if "total_assets" in fd.columns else pd.Series(pd.NA, index=fd.index)
     cl = (
@@ -316,6 +327,7 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
         roic_below_wacc = False
         roic_value: float | None = None
         roic_normalized: float | None = None
+        roic_gross_value: float | None = None
 
         if "operating_profit" in fd.columns and (
             "total_assets" in fd.columns or "equity" in fd.columns
@@ -325,6 +337,22 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
             roic_series = (nopat / invested * 100).dropna()
             roic = float(roic_series.iloc[-1]) if len(roic_series) else 0.0
             roic_value = round(roic, 2)
+            # ── 全资本口径（不扣现金）：与官方披露的「投入资本回报率」同口径的
+            # 参照值。宁德时代 2026H1 官方 8.37%（年化≈16.7%），对应本口径 2025 年
+            # 16.5%；与上面的经营口径（扣超额现金）一起写入 metadata 供对照。 ──
+            _cap = (
+                pd.to_numeric(fd["equity"], errors="coerce")
+                if "equity" in fd.columns
+                else pd.Series(pd.NA, index=fd.index)
+            )
+            if "interest_bearing_debt" in fd.columns:
+                _cap = _cap + pd.to_numeric(
+                    fd["interest_bearing_debt"], errors="coerce"
+                ).fillna(0)
+            _gross_series = (nopat / _cap.where(_cap > 0) * 100).dropna()
+            roic_gross_value = (
+                round(float(_gross_series.iloc[-1]), 2) if len(_gross_series) else None
+            )
             # ── 归一化 ROIC：单期 ROIC 受周期位置/扩张节奏扰动（周期底部刚恢复、
             # 或分销类当年大量备货），用最近 3 年均值做判定锚更稳健 ──
             normalized_used = False
@@ -556,6 +584,7 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
                 },
                 "wacc_pct": wacc_pct,
                 "roic": roic_value,
+                "roic_gross_capital_pct": roic_gross_value,
                 "roic_3y_avg": roic_normalized,
                 "roic_below_wacc": roic_below_wacc,
                 "business_model": biz_model or None,

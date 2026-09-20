@@ -34,6 +34,8 @@ from app.analysis.models.dcf import DCFModel
 from app.analysis.models.ddm import DDMModel
 from app.analysis.models.relative import RelativeValuation
 from app.analysis.models.comps import calculate_comparable_valuation
+from app.analysis.modules.profitability import _estimate_wacc_pct
+from app.analysis.config.company_profiles import business_model_of
 from app.analysis.modules.cashflow import CashflowAnalyzer
 from app.analysis.modules.efficiency import EfficiencyAnalyzer
 from app.analysis.modules.growth import GrowthAnalyzer
@@ -858,26 +860,16 @@ class FundamentalEngine:
                 n: {"score": it["score"], "weight": weights[n], "detail": it.get("detail")}
                 for n, it in div_factors.items()
             }
-            # ── 周期/资源股在红利框架上的溢价因子 ─────────────────────
-            if is_cycle_val:
-                ind_cycle = str(meta.get("industry") or "")
-                # 资源壁垒溢价：仅 PE<12 的深度资源垄断才加（避免对高PE周期股过度加分）
-                pe_v = float(pe) if pe is not None else 99
-                premium_boost = 0.0
-                if pe_v < 12 and ("矿" in ind_cycle or "磷" in ind_cycle or "农化" in ind_cycle):
-                    premium_boost += 4.0
-                    _add_points("资源壁垒溢价", 88, f"PE {pe_v:.1f}x<12 + {ind_cycle}资源垄断")
-                # 红利定价锚：仅利差>2.8%才加（严格阈值避免普遍加分）
-                spread_val = div_profile.get("div_bond_spread_pct")
-                if spread_val is not None and float(spread_val) >= 2.8:
-                    premium_boost += 2.0
-                    _add_points(
-                        "红利定价锚", 85,
-                        f"股息率利差{float(spread_val):.1f}%>2.8%，降息周期红利资产重定价"
-                    )
-                # 溢价因子直接加在加权 base_score 上（上限+6分）
-                if premium_boost > 0:
-                    base_score = min(95.0, base_score + premium_boost)
+            # 周期/资源股溢价因子（原「资源壁垒溢价 +4 / 红利定价锚 +2」）已移除：
+            # 1) 红利定价锚对「股息率利差≥2.8%」再 +2，而利差本身就是 40% 权重的
+            #    「股息率利差」因子（≥2.5% 已得 88 分）——同一事实重复计分；
+            # 2) 资源壁垒溢价按绝对 PE<12 加分，与 10% 权重的 PE/PB 分位因子重复
+            #    计入「便宜」这一维度，且关键词（矿/磷/农化）对煤炭等行业名不生效，
+            #    实测中国神华/陕西煤业/兖矿能源/中煤能源/云天化/淮北矿业六只样本
+            #    无一触发，属近乎死代码；
+            # 3) 原 _add_points 展示的 88/85 分与实际贡献（+4/+2 且不进加权）口径不符。
+            # 周期股的分红承诺已有独立加分（_dividend_valuation_factors 内
+            # 「周期股分红承诺≥45% +5」），无需外部再溢价。
         else:
             # ── 估值评分：历史分位50% + 相对估值30% + 股息率20% ──
             # 1. PE历史分位（权重50%）
@@ -1311,22 +1303,23 @@ class FundamentalEngine:
         *,
         is_dividend_asset: bool = False,
         is_high_growth_quality: bool = False,
+        interest_bearing_ratio: float | None = None,
+        business_model: str = "",
     ) -> float:
-        """低负债现金奶牛略降 WACC；高杠杆抬升；红利/高成长赛道用更低口径。"""
-        if is_dividend_asset:
-            return DIVIDEND_ASSET_WACC_PCT / 100.0
-        if is_high_growth_quality:
-            return HIGH_GROWTH_WACC_PCT / 100.0
-        if debt_ratio is None:
-            return 0.10
-        dr = float(debt_ratio)
-        if dr < 20:
-            return 0.07
-        if dr <= 30:
-            return 0.08
-        if dr > 60:
-            return 0.12
-        return 0.10
+        """DCF 折现率。统一委托 `_estimate_wacc_pct`（有息负债率口径），保证全系统单一 WACC。
+
+        此前本函数用「含应付的资产负债率」独立分档：宁德时代 DR 63.65%（含应付
+        账款/合同负债）→ 12%，而盈利模块按有息负债率 12.79% 给 7%——同一公司
+        两个 WACC。应付账款/合同负债等经营性负债不构成资本成本，
+        见 `_estimate_wacc_pct` docstring。
+        """
+        return _estimate_wacc_pct(
+            debt_ratio,
+            is_dividend_asset=is_dividend_asset,
+            is_high_growth_quality=is_high_growth_quality,
+            interest_bearing_ratio=interest_bearing_ratio,
+            business_model=business_model,
+        ) / 100.0
 
     @staticmethod
     def _resolve_shares(fin_df: pd.DataFrame, market: dict, meta: dict) -> tuple[float, str]:
@@ -1672,6 +1665,16 @@ class FundamentalEngine:
             debt_ratio,
             is_dividend_asset=False,
             is_high_growth_quality=is_hgq,
+            interest_bearing_ratio=(
+                float(meta["interest_bearing_ratio"])
+                if meta.get("interest_bearing_ratio") is not None
+                else None
+            ),
+            business_model=business_model_of(
+                str(meta.get("name") or market.get("name") or ""),
+                symbol,
+                str(meta.get("industry") or ""),
+            ),
         )
         # ── 高成长科技股（营收增速>30%）：DCF参数适配 ──
         # 半导体等行业用更高WACC（8-10%），永续增速3-5%（原2%）
