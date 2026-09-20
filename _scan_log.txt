@@ -1,0 +1,80 @@
+﻿=== market scan ??????????????? ===
+Sep 20 15:24:59 iZuf65meyit9uj12xqp3yzZ uvicorn[2925]: INFO:     1.180.195.37:0 - "GET /api/v1/fundamentals/market-coverage HTTP/1.1" 200 OK
+Sep 20 15:25:01 iZuf65meyit9uj12xqp3yzZ uvicorn[2925]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan/technical-overlay?top=3 HTTP/1.1" 200 OK
+Sep 20 15:35:03 iZuf65meyit9uj12xqp3yzZ uvicorn[3949]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan?top=50&exclude_st=true&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 15:35:39 iZuf65meyit9uj12xqp3yzZ uvicorn[3949]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan/technical-overlay?top=50&exclude_st=true&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 15:36:44 iZuf65meyit9uj12xqp3yzZ uvicorn[3949]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan?top=50&exclude_st=true&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 15:38:07 iZuf65meyit9uj12xqp3yzZ uvicorn[3949]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan?top=50&exclude_st=true&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 15:38:14 iZuf65meyit9uj12xqp3yzZ uvicorn[3949]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan/technical-overlay?top=50&exclude_st=true&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 15:49:23 iZuf65meyit9uj12xqp3yzZ uvicorn[3949]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan?top=50&exclude_st=true&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 15:51:07 iZuf65meyit9uj12xqp3yzZ uvicorn[3949]: INFO:     1.180.195.37:0 - "GET /api/v1/fundamentals/market-scan/technical-overlay?top=50&exclude_st=true&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 15:52:34 iZuf65meyit9uj12xqp3yzZ uvicorn[3949]: INFO:     1.180.195.37:0 - "GET /api/v1/fundamentals/market-scan?top=500&exclude_st=true&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 15:53:01 iZuf65meyit9uj12xqp3yzZ uvicorn[3949]: INFO:     1.180.195.37:0 - "GET /api/v1/fundamentals/market-scan?top=500&exclude_st=true&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 16:00:06 iZuf65meyit9uj12xqp3yzZ uvicorn[8159]: INFO:     127.0.0.1:50910 - "GET /api/v1/fundamentals/market-scan?keyword=%E8%8C%85%E5%8F%B0&top=3 HTTP/1.1" 200 OK
+Sep 20 16:00:06 iZuf65meyit9uj12xqp3yzZ uvicorn[8159]: INFO:     127.0.0.1:50922 - "GET /api/v1/fundamentals/market-scan?top=500 HTTP/1.1" 200 OK
+Sep 20 16:00:07 iZuf65meyit9uj12xqp3yzZ uvicorn[8159]: INFO:     127.0.0.1:50930 - "GET /api/v1/fundamentals/market-scan?top=500&include_gem=true HTTP/1.1" 200 OK
+Sep 20 16:01:07 iZuf65meyit9uj12xqp3yzZ uvicorn[8159]: INFO:     127.0.0.1:44686 - "GET /api/v1/fundamentals/market-scan HTTP/1.1" 200 OK
+Sep 20 16:04:00 iZuf65meyit9uj12xqp3yzZ uvicorn[8159]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan?top=50&exclude_st=true&include_gem=false&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 16:04:30 iZuf65meyit9uj12xqp3yzZ uvicorn[8159]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan?top=50&exclude_st=true&include_gem=false&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 16:05:13 iZuf65meyit9uj12xqp3yzZ uvicorn[8159]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan/technical-overlay?top=50&exclude_st=true&include_gem=false&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 16:06:12 iZuf65meyit9uj12xqp3yzZ uvicorn[8159]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan?top=200&exclude_st=true&include_gem=false&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 16:13:59 iZuf65meyit9uj12xqp3yzZ uvicorn[8159]: INFO:     127.0.0.1:34274 - "GET /api/v1/fundamentals/market-scan/technical-overlay?top=50&force=true HTTP/1.1" 200 OK
+Sep 20 16:14:40 iZuf65meyit9uj12xqp3yzZ uvicorn[8159]: INFO:     127.0.0.1:39420 - "GET /api/v1/fundamentals/market-scan/technical-overlay?top=120&force=true HTTP/1.1" 200 OK
+Sep 20 16:19:45 iZuf65meyit9uj12xqp3yzZ uvicorn[11491]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan?top=50&offset=0&exclude_st=true&include_gem=false&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 16:19:47 iZuf65meyit9uj12xqp3yzZ uvicorn[11491]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan?top=50&exclude_st=true&include_gem=false&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 16:20:00 iZuf65meyit9uj12xqp3yzZ uvicorn[11491]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan?top=200&offset=0&exclude_st=true&include_gem=false&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 16:20:22 iZuf65meyit9uj12xqp3yzZ uvicorn[11491]: INFO:     127.0.0.1:46472 - "GET /api/v1/fundamentals/market-scan?top=3&offset=0 HTTP/1.1" 200 OK
+Sep 20 16:20:29 iZuf65meyit9uj12xqp3yzZ uvicorn[11491]: INFO:     127.0.0.1:48380 - "GET /api/v1/fundamentals/market-scan?top=3&offset=3 HTTP/1.1" 200 OK
+Sep 20 16:20:33 iZuf65meyit9uj12xqp3yzZ uvicorn[11491]: INFO:     127.0.0.1:58842 - "GET /api/v1/fundamentals/market-scan?top=3&offset=3000 HTTP/1.1" 200 OK
+Sep 20 16:23:13 iZuf65meyit9uj12xqp3yzZ uvicorn[11491]: INFO:     127.0.0.1:58858 - "GET /api/v1/fundamentals/market-scan/technical-overlay?top=40&offset=0&force=true HTTP/1.1" 200 OK
+Sep 20 16:23:19 iZuf65meyit9uj12xqp3yzZ uvicorn[11491]: INFO:     127.0.0.1:38960 - "GET /api/v1/fundamentals/market-scan/technical-overlay?top=40&offset=20 HTTP/1.1" 200 OK
+Sep 20 16:23:52 iZuf65meyit9uj12xqp3yzZ uvicorn[11491]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan?top=50&offset=0&exclude_st=true&include_gem=false&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 16:23:59 iZuf65meyit9uj12xqp3yzZ uvicorn[11491]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan/technical-overlay?top=50&offset=0&exclude_st=true&include_gem=false&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 16:24:23 iZuf65meyit9uj12xqp3yzZ uvicorn[11491]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan?top=50&offset=50&exclude_st=true&include_gem=false&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 16:24:29 iZuf65meyit9uj12xqp3yzZ uvicorn[11491]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan/technical-overlay?top=50&offset=50&exclude_st=true&include_gem=false&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 16:25:41 iZuf65meyit9uj12xqp3yzZ uvicorn[11491]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan?top=50&offset=0&exclude_st=true&include_gem=false&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 16:30:54 iZuf65meyit9uj12xqp3yzZ uvicorn[13466]: INFO:     127.0.0.1:41510 - "GET /api/v1/fundamentals/market-scan?top=20&offset=0 HTTP/1.1" 200 OK
+Sep 20 16:31:40 iZuf65meyit9uj12xqp3yzZ uvicorn[13466]: INFO:     127.0.0.1:60306 - "GET /api/v1/fundamentals/market-scan?top=20&offset=20 HTTP/1.1" 200 OK
+Sep 20 16:31:54 iZuf65meyit9uj12xqp3yzZ uvicorn[13466]: INFO:     127.0.0.1:41310 - "GET /api/v1/fundamentals/market-scan/technical-overlay?top=40 HTTP/1.1" 200 OK
+Sep 20 16:32:23 iZuf65meyit9uj12xqp3yzZ uvicorn[13466]: INFO:     127.0.0.1:45032 - "GET /api/v1/fundamentals/market-scan/technical-overlay?top=40 HTTP/1.1" 200 OK
+Sep 20 16:43:14 iZuf65meyit9uj12xqp3yzZ uvicorn[13466]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan?top=50&offset=0&exclude_st=true&include_gem=false&sort_by=composite_score HTTP/1.1" 200 OK
+Sep 20 16:47:34 iZuf65meyit9uj12xqp3yzZ uvicorn[13466]: INFO:     222.74.137.28:0 - "GET /api/v1/fundamentals/market-scan?top=50&offset=0&exclude_st=true&include_gem=false&sort_by=composite_score HTTP/1.1" 200 OK
+
+=== ??????????===
+Sep 20 16:52:42 iZuf65meyit9uj12xqp3yzZ uvicorn[13466]: INFO:     222.74.137.28:0 - "GET /api/v1/signals/scan/market/progress?job_id=a63a5c33b65e HTTP/1.1" 200 OK
+Sep 20 16:52:44 iZuf65meyit9uj12xqp3yzZ uvicorn[13466]: INFO:     222.74.137.28:0 - "GET /api/v1/signals/scan/market/progress?job_id=a63a5c33b65e HTTP/1.1" 200 OK
+Sep 20 16:52:47 iZuf65meyit9uj12xqp3yzZ uvicorn[13466]: INFO:     222.74.137.28:0 - "GET /api/v1/signals/scan/market/progress?job_id=a63a5c33b65e HTTP/1.1" 200 OK
+Sep 20 16:52:49 iZuf65meyit9uj12xqp3yzZ uvicorn[13466]: INFO:     222.74.137.28:0 - "GET /api/v1/signals/scan/market/progress?job_id=a63a5c33b65e HTTP/1.1" 200 OK
+Sep 20 16:52:51 iZuf65meyit9uj12xqp3yzZ uvicorn[13466]: INFO:     222.74.137.28:0 - "GET /api/v1/signals/scan/market/progress?job_id=a63a5c33b65e HTTP/1.1" 200 OK
+Sep 20 16:52:54 iZuf65meyit9uj12xqp3yzZ uvicorn[13466]: INFO:     222.74.137.28:0 - "GET /api/v1/signals/scan/market/progress?job_id=a63a5c33b65e HTTP/1.1" 200 OK
+Sep 20 16:52:56 iZuf65meyit9uj12xqp3yzZ uvicorn[13466]: INFO:     222.74.137.28:0 - "GET /api/v1/signals/scan/market/progress?job_id=a63a5c33b65e HTTP/1.1" 200 OK
+Sep 20 16:52:59 iZuf65meyit9uj12xqp3yzZ uvicorn[13466]: INFO:     222.74.137.28:0 - "GET /api/v1/signals/scan/market/progress?job_id=a63a5c33b65e HTTP/1.1" 200 OK
+Sep 20 16:53:02 iZuf65meyit9uj12xqp3yzZ uvicorn[13466]: INFO:     222.74.137.28:0 - "GET /api/v1/signals/scan/market/progress?job_id=a63a5c33b65e HTTP/1.1" 200 OK
+Sep 20 16:53:04 iZuf65meyit9uj12xqp3yzZ uvicorn[13466]: INFO:     222.74.137.28:0 - "GET /api/v1/signals/scan/market/progress?job_id=a63a5c33b65e HTTP/1.1" 200 OK
+
+=== ??????????? ===
+鈼?candle-flow.service - Candle Flow
+     Loaded: loaded (/etc/systemd/system/candle-flow.service; enabled; preset: enabled)
+     Active: active (running) since Sun 2026-09-20 16:28:11 CST; 24min ago
+   Main PID: 13466 (uvicorn)
+      Tasks: 52 (limit: 1853)
+     Memory: 953.6M (peak: 1.0G)
+        CPU: 38min 20.749s
+     CGroup: /system.slice/candle-flow.service
+               total        used        free      shared  buff/cache   available
+Mem:            1613        1342          78           2         354         270
+Swap:           2047           0        2047
+
+=== ??????????????? ===
+root       13570  0.0  0.6  23760 10368 ?        S    16:28   0:00 curl -s -X POST http://127.0.0.1:8002/api/v1/fundamentals/factors/rebuild?budget_sec=10800
+
+=== ??? job ???????===
+ssh : bash: line 17: $'\r': command not found
+所在位置 行:445 字符: 67
++ ... _check_scan.sh" -Raw | ssh root@47.100.175.214 "bash -s" 2>&1 | Out-F ...
++                            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (bash: line 17: $'\r': command not 
+    found:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+{"code":200,"message":"success","data":{"job_id":"a63a5c33b65e","kind":"market_confluence","status":"running","phase":"fundamentals","message":"鍩烘湰闈㈡帓闆?647/726","done":647,"total":726,"pct":89.1,"result":null,"error":null,"started_at":1789894007.0051336,"updated_at":1789894385.2207875},"meta":null}

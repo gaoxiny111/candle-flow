@@ -1,11 +1,33 @@
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.config import settings
 
-connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
+_is_sqlite = settings.database_url.startswith("sqlite")
+connect_args = {"check_same_thread": False} if _is_sqlite else {}
 engine = create_engine(settings.database_url, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+if _is_sqlite:
+
+    @event.listens_for(engine, "connect")
+    def _sqlite_pragmas(dbapi_conn, _record):  # pragma: no cover - 依赖 sqlite3 驱动
+        """SQLite 并发读调参。
+
+        `journal_mode` 默认 delete：写事务（盘后因子重建、K线同步，均 8 并发）
+        持锁期间**读者会被阻塞**，busy_timeout 5s 一过即报 `database is locked`。
+        表现为「榜单叠加技术面」在批跑期间成片返回「分析失败」。
+        WAL 让读不再等待单个写者；busy_timeout 提到 15s 消化瞬时写竞争。
+        该设置持久化在库文件头，设置一次即生效（-wal/-shm 为伴生文件）。
+        """
+        cur = dbapi_conn.cursor()
+        try:
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA busy_timeout=15000")
+            cur.execute("PRAGMA synchronous=NORMAL")
+        finally:
+            cur.close()
 
 
 class Base(DeclarativeBase):

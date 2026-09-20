@@ -195,6 +195,9 @@ def run_market_scan(
         default="composite_score",
         description="composite_score 或五个维度键：profitability/growth/cashflow/solvency/valuation",
     ),
+    keyword: str | None = Query(default=None, description="名称/代码包含匹配，如「茅台」「600519」"),
+    include_gem: bool = Query(default=False, description="是否纳入创业板/科创板（默认仅沪深主板）"),
+    offset: int = Query(default=0, ge=0, description="分页起始下标（过滤排序后偏移）"),
     db: Session = Depends(get_db),
 ):
     """全市场基本面排序（只读因子库，沿用个股分析综合分，不重算分数）。"""
@@ -209,6 +212,9 @@ def run_market_scan(
             exclude_st=exclude_st,
             industry=industry,
             sort_by=sort_by,
+            keyword=keyword,
+            include_gem=include_gem,
+            offset=offset,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -219,7 +225,7 @@ def run_market_scan(
 
 @router.get("/fundamentals/market-scan/technical-overlay")
 def run_market_scan_technical_overlay(
-    top: int = Query(default=60, ge=1, le=120),
+    top: int = Query(default=60, ge=1, le=MAX_TOP, description="单页标的数（技术分析覆盖本页全部标的）"),
     min_composite: float | None = Query(default=None),
     min_market_cap_yi: float | None = Query(default=None, description="总市值下限（亿元）"),
     exclude_st: bool = Query(default=True),
@@ -229,13 +235,25 @@ def run_market_scan_technical_overlay(
         description="composite_score 或五个维度键：profitability/growth/cashflow/solvency/valuation",
     ),
     force: bool = Query(default=False, description="跳过 10 分钟缓存"),
+    keyword: str | None = Query(default=None, description="名称/代码包含匹配，如「茅台」「600519」"),
+    include_gem: bool = Query(default=False, description="是否纳入创业板/科创板（默认仅沪深主板）"),
+    offset: int = Query(default=0, ge=0, description="分页起始下标（与榜单请求保持一致）"),
+    min_fund: float = Query(default=70.0, description="买入候选：基本面分下限"),
+    min_tech: float = Query(default=70.0, description="买入候选：技术面分下限"),
+    core_score: float = Query(default=85.0, description="核心持仓：基本面与技术面均需达到"),
+    veto_score: float = Query(default=60.0, description="淘汰：任一低于该值"),
     db: Session = Depends(get_db),
 ):
     """榜单技术共振叠加：基本面榜单 × K线买点信号 × 形态共振（含周线多周期确认）。
 
     形态共振与买点信号口径与「主板战法 / 信号页」同源；本端点内部复用
     /fundamentals/market-scan 的榜单结果，不重算基本面分。
-    首次调用需对 top 只票逐票跑 K线形态 + 共振评估（本地K线库，通常数秒内）。
+    **技术分析覆盖本页全部标的**（与榜单同一 offset/top，不按名次截断）；
+    逐票结果带 10 分钟缓存，翻页只计算新出现的标的。
+
+    双阈值决策（共振过滤法）：基本面 ≥min_fund 且 技术面 ≥min_tech → 买入候选；
+    两者均 ≥core_score → 核心持仓；任一 <veto_score → 淘汰；其余为观察。
+    标签只做分类，不改写任何分数。
     """
     from app.services.market_scan import technical_overlay
 
@@ -248,6 +266,13 @@ def run_market_scan_technical_overlay(
             exclude_st=exclude_st,
             industry=industry,
             sort_by=sort_by,
+            keyword=keyword,
+            include_gem=include_gem,
+            offset=offset,
+            min_fund=min_fund,
+            min_tech=min_tech,
+            core_score=core_score,
+            veto_score=veto_score,
             force=force,
         )
     except ValueError as e:
@@ -255,6 +280,116 @@ def run_market_scan_technical_overlay(
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"技术共振叠加失败：{e}") from e
     return ApiResponse(data=data)
+
+
+@router.get("/fundamentals/market-scan/resonance")
+def get_market_scan_resonance(
+    top: int = Query(default=DEFAULT_TOP, ge=1, le=MAX_TOP),
+    min_composite: float | None = Query(default=None),
+    min_market_cap_yi: float | None = Query(default=None, description="总市值下限（亿元）"),
+    exclude_st: bool = Query(default=True),
+    industry: str | None = Query(default=None, description="行业名包含匹配"),
+    keyword: str | None = Query(default=None, description="名称/代码包含匹配"),
+    include_gem: bool = Query(default=False),
+    offset: int = Query(default=0, ge=0),
+    min_fund: float = Query(default=70.0, description="买入候选：基本面分下限"),
+    min_tech: float = Query(default=70.0, description="买入候选：技术面分下限"),
+    core_score: float = Query(default=85.0, description="核心持仓：两者均需达到"),
+    veto_score: float = Query(default=60.0, description="淘汰：任一低于该值"),
+    verdict_filter: str = Query(
+        default="", description="仅看某档：core / candidate_up / eliminated，空为全部"
+    ),
+    db: Session = Depends(get_db),
+):
+    """共振视图（基本面×技术面，按档位全局排序，读层毫秒级）。
+
+    索引未构建时返回 ``{"empty": True, "reason": ...}``，前端据此触发
+    POST /market-scan/resonance/build 后台构建并轮询进度。
+    """
+    from app.services.market_scan import resonance_view
+
+    try:
+        data = resonance_view(
+            db,
+            top=top,
+            offset=offset,
+            min_composite=min_composite,
+            min_market_cap_yi=min_market_cap_yi,
+            exclude_st=exclude_st,
+            industry=industry,
+            keyword=keyword,
+            include_gem=include_gem,
+            min_fund=min_fund,
+            min_tech=min_tech,
+            core_score=core_score,
+            veto_score=veto_score,
+            verdict_filter=verdict_filter,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        return ApiResponse(data={"empty": True, "reason": str(e)})
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"共振视图读取失败：{e}") from e
+    return ApiResponse(data=data)
+
+
+@router.post("/fundamentals/market-scan/resonance/build")
+def build_market_scan_resonance(
+    force: bool = Query(default=False, description="强制重建（忽略 10 分钟索引缓存）"),
+    db: Session = Depends(get_db),
+):
+    """后台构建共振索引（对 fund≥淘汰线的全部标的算技术面），返回 job_id。
+
+    全市场约 2000 只 × ~0.3s，首次需数分钟；索引 10 分钟内复用，
+    重建时单票缓存仍有效的标的不会重算。
+    """
+    from app.services import market_scan as msmod
+    from app.services.job_progress import finish_job, get_job, run_in_background, update_job
+
+    existing = get_job(kind="resonance_index")
+    if existing and existing.get("status") == "running":
+        raise HTTPException(status_code=409, detail="共振索引构建正在进行中")
+
+    if not force:
+        age = msmod.resonance_index_age()
+        if age is not None and age < msmod.RESO_TTL_SEC:
+            return ApiResponse(
+                data={"status": "cached", "age_sec": round(age, 1), **(msmod._reso_cache.get("stats") or {})}
+            )
+
+    def _run(job_id: str) -> None:
+        def progress(done: int, total: int, phase: str) -> None:
+            label = {"tech": "技术面分析"}.get(phase, phase)
+            update_job(
+                job_id,
+                done=done,
+                total=total,
+                phase=phase,
+                message=f"{label} {done}/{total}" if total else label,
+            )
+
+        try:
+            summary = msmod.resonance_index_build(progress=progress, force=force)
+        except Exception as exc:
+            finish_job(job_id, error=str(exc))
+            return
+        finish_job(job_id, summary)
+
+    job_id = run_in_background(
+        "resonance_index", _run, phase="starting", message="共振索引构建已启动"
+    )
+    return ApiResponse(data={"status": "started", "job_id": job_id, "progress": get_job(job_id)})
+
+
+@router.get("/fundamentals/market-scan/resonance/progress")
+def market_scan_resonance_progress(job_id: str | None = Query(None)):
+    from app.services.job_progress import get_job
+
+    job = get_job(job_id, kind="resonance_index")
+    if not job:
+        return ApiResponse(data={"status": "empty"})
+    return ApiResponse(data=job)
 
 
 @router.post("/fundamentals/factors/rebuild")

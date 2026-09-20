@@ -1,0 +1,22 @@
+﻿src/components/FundamentalPanel.vue(429,27): error TS2339: Property 'note' does not exist on type '{ current?: number | undefined; percentile_5y?: number | null | undefined; percentile_na?: string | null | undefined; signal?: string | undefined; value?: number | undefined; industry_median?: number | ... 1 more ... | undefined; growth_rate?: number | undefined; growth_label?: string | undefined; thresholds?: strin...'.
+src/components/FundamentalPanel.vue(429,54): error TS2339: Property 'note' does not exist on type '{ current?: number | undefined; percentile_5y?: number | null | undefined; percentile_na?: string | null | undefined; signal?: string | undefined; value?: number | undefined; industry_median?: number | ... 1 more ... | undefined; growth_rate?: number | undefined; growth_label?: string | undefined; thresholds?: strin...'.
+src/components/FundamentalPanel.vue(501,37): error TS2339: Property 'suppressed' does not exist on type '{ intrinsic_value_per_share?: number | null | undefined; margin_of_safety_pct?: number | undefined; note?: string | undefined; assumptions?: Record<string, number> | undefined; }'.
+src/components/FundamentalPanel.vue(501,72): error TS2339: Property 'role' does not exist on type '{ intrinsic_value_per_share?: number | null | undefined; margin_of_safety_pct?: number | undefined; note?: string | undefined; assumptions?: Record<string, number> | undefined; }'.
+src/components/FundamentalPanel.vue(508,35): error TS2339: Property 'suppressed' does not exist on type '{ intrinsic_value_per_share?: number | null | undefined; margin_of_safety_pct?: number | undefined; note?: string | undefined; assumptions?: Record<string, number> | undefined; }'.
+src/views/DashboardView.vue(379,41): error TS2339: Property 'empty' does not exist on type 'MarketConfluenceScanResult'.
+src/views/DashboardView.vue(396,75): error TS2339: Property 'prescreen' does not exist on type 'MarketConfluenceScanResult'.
+src/views/DashboardView.vue(433,47): error TS2339: Property 'prescreen' does not exist on type 'MarketConfluenceScanResult'.
+src/views/DashboardView.vue(434,23): error TS2339: Property 'prescreen' does not exist on type 'MarketConfluenceScanResult'.
+src/views/DashboardView.vue(434,94): error TS2339: Property 'prescreen' does not exist on type 'MarketConfluenceScanResult'.
+src/views/DashboardView.vue(434,136): error TS2339: Property 'prescreen' does not exist on type 'MarketConfluenceScanResult'.
+src/views/DashboardView.vue(731,69): error TS2345: Argument of type 'number | null | undefined' is not assignable to parameter of type 'number'.
+  Type 'undefined' is not assignable to type 'number'.
+src/views/DashboardView.vue(743,66): error TS2554: Expected 0 arguments, but got 1.
+src/views/DashboardView.vue(757,35): error TS2554: Expected 0 arguments, but got 1.
+src/views/DashboardView.vue(780,81): error TS2554: Expected 0 arguments, but got 1.
+src/views/MarketScanView.vue(813,42): error TS18047: '__VLS_ctx.overlayStats' is possibly 'null'.
+src/views/MarketScanView.vue(814,37): error TS18047: '__VLS_ctx.overlayStats' is possibly 'null'.
+src/views/MarketScanView.vue(815,27): error TS18047: '__VLS_ctx.overlayStats' is possibly 'null'.
+src/views/MarketScanView.vue(815,56): error TS18047: '__VLS_ctx.overlayStats' is possibly 'null'.
+src/views/MarketScanView.vue(817,18): error TS18047: '__VLS_ctx.overlayStats' is possibly 'null'.
+src/views/MarketScanView.vue(818,16): error TS18047: '__VLS_ctx.overlayStats' is possibly 'null'.

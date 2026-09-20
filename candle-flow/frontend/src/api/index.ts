@@ -1269,6 +1269,8 @@ export interface MarketScanItem {
   composite_score: number | null
   final_rating: string | null
   risk_level_label: string | null
+  /** 快照构建时刻的股价（非实时报价） */
+  price: number | null
   pe_ttm: number | null
   pb: number | null
   market_cap_yi: number | null
@@ -1282,6 +1284,7 @@ export interface MarketScanItem {
 }
 
 export type MarketScanSort =
+  | 'resonance'
   | 'composite_score'
   | 'profitability'
   | 'growth'
@@ -1298,6 +1301,12 @@ export interface MarketScanQuery {
   exclude_st?: boolean
   /** 行业名包含匹配，如「银行」「煤炭」 */
   industry?: string
+  /** 名称/代码包含匹配，如「茅台」「600519」 */
+  keyword?: string
+  /** 是否纳入创业板/科创板（默认 false = 仅沪深主板） */
+  include_gem?: boolean
+  /** 分页起始下标（过滤排序后偏移） */
+  offset?: number
   sort_by?: MarketScanSort
 }
 
@@ -1307,12 +1316,18 @@ export interface MarketScanData {
   percentile_base: number
   count: number
   matched: number
+  /** 本页起始下标与单页上限 */
+  offset: number
+  limit: number
+  has_more: boolean
   sort_by: string
   filters: {
     min_composite: number | null
     min_market_cap_yi: number | null
     exclude_st: boolean
     industry: string | null
+    keyword: string | null
+    include_gem: boolean
   }
   items: MarketScanItem[]
   notes: string[]
@@ -1322,10 +1337,13 @@ export const fetchMarketScan = async (query: MarketScanQuery = {}) => {
   const res = await api.get<ApiResponse<MarketScanData>>('/fundamentals/market-scan', {
     params: {
       top: query.top,
+      offset: query.offset,
       min_composite: query.min_composite,
       min_market_cap_yi: query.min_market_cap_yi,
       exclude_st: query.exclude_st,
       industry: query.industry,
+      keyword: query.keyword,
+      include_gem: query.include_gem,
       sort_by: query.sort_by,
     },
     timeout: 90000,
@@ -1356,23 +1374,57 @@ export interface MarketScanOverlayFields {
   confluence_hits: string | null
   /** 形态分 + 有效共振数×6（与「主板战法 / 信号页」同源，非第二套权重） */
   combined_score: number | null
+  /**
+   * 技术面得分 = 共振组合分截断到 0~100；无达标形态共振时为 null（不可评估，
+   * 不赋 0、不赋中性）。系统候选门槛为 80，故有形态共振者天然 ≥80。
+   */
+  tech_score: number | null
+  /** core（核心持仓）/ candidate（买入候选）/ watch（观察）/ eliminated（淘汰） */
+  verdict: MarketScanVerdict
+  verdict_label: string
+  verdict_reasons: string[]
   pattern_date?: string | null
 }
+
+export type MarketScanVerdict = 'core' | 'candidate' | 'watch' | 'eliminated'
+
+/** 前端「本页内仅看」筛选档位：核心持仓 / 候选及以上 / 仅淘汰（纯客户端过滤） */
+export type MarketScanVerdictFilter = 'core' | 'candidate_up' | 'eliminated'
 
 export type MarketScanOverlayItem = MarketScanItem & MarketScanOverlayFields
 
 export interface MarketScanOverlayData {
   count: number
   items: MarketScanOverlayItem[]
+  /** 本页技术分析覆盖数（= stats.analyzed），决策分布的分母 */
+  page_size: number
+  verdict_counts: Record<MarketScanVerdict, number>
+  verdict_thresholds: {
+    min_fund: number
+    min_tech: number
+    core: number
+    veto: number
+  }
   signal_counts: Record<string, number>
   /** 板块效应：同行业 ≥2 只出现买点信号才列出 */
   industry_confluence: { industry: string; total: number; strong_buy: number; signaled: number }[]
   stats: {
+    /** 本页已做技术分析的标的数（= 本页全部标的） */
+    analyzed: number
+    /** 本次实际新计算的标的数（其余命中 10 分钟单票缓存） */
+    computed: number
+    /** 首次失败后串行重试过的标的数 */
+    retried: number
+    /** 重试后仍失败的标的数（失败不写入缓存，下次请求自动重算） */
+    failed: number
     kline_ok: number
     pattern_hits: number
     peg_available: number
     peg_note: string
   }
+  offset: number
+  matched: number
+  has_more: boolean
   filters: MarketScanData['filters']
   sort_by: string
   coverage: MarketScanCoverage
@@ -1380,22 +1432,135 @@ export interface MarketScanOverlayData {
   notes: string[]
 }
 
-export const fetchMarketScanOverlay = async (query: MarketScanQuery & { force?: boolean } = {}) => {
+export const fetchMarketScanOverlay = async (
+  query: MarketScanQuery & {
+    force?: boolean
+    min_fund?: number
+    min_tech?: number
+    core_score?: number
+    veto_score?: number
+  } = {},
+) => {
   const res = await api.get<ApiResponse<MarketScanOverlayData>>(
     '/fundamentals/market-scan/technical-overlay',
     {
       params: {
         top: query.top,
+        offset: query.offset,
         min_composite: query.min_composite,
         min_market_cap_yi: query.min_market_cap_yi,
         exclude_st: query.exclude_st,
         industry: query.industry,
+        keyword: query.keyword,
+        include_gem: query.include_gem,
         sort_by: query.sort_by,
+        min_fund: query.min_fund,
+        min_tech: query.min_tech,
+        core_score: query.core_score,
+        veto_score: query.veto_score,
         force: query.force,
       },
-      // 首次调用需逐票跑 K线形态+共振（本地K线库并发，通常数秒）；给足余量
-      timeout: 180000,
+      // 技术分析覆盖本页全部标的：单页 500 只时给足余量
+      timeout: 600000,
     },
+  )
+  return { data: checkApi(res) }
+}
+
+/** 共振视图条目 = 基础榜单字段 + 技术叠加字段 + 档位判定 */
+export type MarketScanResonanceItem = MarketScanItem & MarketScanOverlayFields
+
+export interface MarketScanResonanceData {
+  count: number
+  matched: number
+  offset: number
+  limit: number
+  has_more: boolean
+  items: MarketScanResonanceItem[]
+  /** 档位分布：基于当前筛选命中的全部标的（非仅本页） */
+  verdict_counts: Record<MarketScanVerdict, number>
+  verdict_thresholds: {
+    min_fund: number
+    min_tech: number
+    core: number
+    veto: number
+  }
+  verdict_filter: MarketScanVerdictFilter | null
+  /** 索引年龄（秒）与是否超过 10 分钟新鲜期（过期仍可读，仅提示可重建） */
+  index_age_sec: number
+  index_stale: boolean
+  index_stats: {
+    total: number
+    tech_needed: number
+    tech_computed: number
+    tech_failed: number
+    retried: number
+    duration_sec: number
+  } | null
+  coverage: MarketScanCoverage
+  filters: MarketScanData['filters']
+  notes: string[]
+}
+
+export interface ResonanceJobStatus {
+  job_id: string
+  kind: string
+  status: 'running' | 'done' | 'error'
+  phase: string
+  message: string
+  done: number
+  total: number
+  pct: number
+  result: Record<string, unknown> | null
+  error: string | null
+}
+
+/** 共振视图读层：按档位全局排序（索引未构建时 data 为 { empty: true }） */
+export const fetchMarketScanResonance = async (
+  query: MarketScanQuery & {
+    min_fund?: number
+    min_tech?: number
+    core_score?: number
+    veto_score?: number
+    verdict_filter?: string
+  } = {},
+) => {
+  const res = await api.get<ApiResponse<MarketScanResonanceData | { empty: boolean; reason?: string }>>(
+    '/fundamentals/market-scan/resonance',
+    {
+      params: {
+        top: query.top,
+        offset: query.offset,
+        min_composite: query.min_composite,
+        min_market_cap_yi: query.min_market_cap_yi,
+        exclude_st: query.exclude_st,
+        industry: query.industry,
+        keyword: query.keyword,
+        include_gem: query.include_gem,
+        min_fund: query.min_fund,
+        min_tech: query.min_tech,
+        core_score: query.core_score,
+        veto_score: query.veto_score,
+        verdict_filter: query.verdict_filter || undefined,
+      },
+      timeout: 60000,
+    },
+  )
+  return { data: checkApi(res) }
+}
+
+/** 触发共振索引后台构建；fresh 索引存在时返回 { status: 'cached' } */
+export const buildMarketScanResonance = async (force = false) => {
+  const res = await api.post<
+    ApiResponse<{ status: string; job_id?: string; age_sec?: number }>
+  >('/fundamentals/market-scan/resonance/build', null, { params: { force }, timeout: 30000 })
+  return { data: checkApi(res) }
+}
+
+export const fetchResonanceProgress = async (jobId?: string) => {
+  const res = await api.get<ApiResponse<ResonanceJobStatus | { status: string }>>(
+    '/fundamentals/market-scan/resonance/progress',
+    { params: { job_id: jobId || undefined }, timeout: 15000 },
   )
   return { data: checkApi(res) }
 }

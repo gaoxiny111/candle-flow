@@ -10,6 +10,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from sqlalchemy import text
+
 from app.database import SessionLocal
 from app.models.factor_snapshot import FactorSnapshot
 from app.models.stock import StockInfo
@@ -142,14 +144,76 @@ def _get_all_symbols() -> list[str]:
         db.close()
 
 
-def _get_stale_symbols(existing_symbols: set[str], all_symbols: list[str]) -> list[str]:
-    """找出缺失或过期的股票（非披露期只补建缺失条目）。"""
+def _get_stale_symbols(
+    existing_symbols: set[str],
+    all_symbols: list[str],
+    outdated_symbols: set[str] | None = None,
+) -> list[str]:
+    """找出缺失、过期或 payload 缺必需字段的股票。
+
+    非披露期只补缺失条目；``outdated_symbols`` 来自 schema 守卫，
+    把「已有行但缺新字段」的存量快照也纳入重建，否则新增字段永不回填。
+    """
     in_window = _is_in_disclosure_window()
+    ordered = sorted(all_symbols)
     if in_window:
         # 披露窗口期：全部重建
-        return all_symbols
-    # 非披露期：只补缺失的
-    return [s for s in all_symbols if s not in existing_symbols]
+        return ordered
+    # 非披露期：补缺失的 + 缺必需字段的
+    outdated = outdated_symbols or set()
+    return [s for s in ordered if s not in existing_symbols or s in outdated]
+
+
+# 快照 payload 必需字段（schema 守卫）。
+#
+# 增量构建若只看「主键是否已存在」，新增字段在存量行上就永不回填：
+# 2026-09-20 的 profit_yoy 即如此丢失（5211 条存量快照缺该键 →
+# market_scan.technical_overlay 的 PEG 恒 None → 「强买入」档不可达）。
+# 以后给 run_full_analysis 返回值加字段时，把键名追加到这里即可自愈。
+_REQUIRED_SNAPSHOT_KEYS: tuple[str, ...] = ("profit_yoy",)
+
+
+def _outdated_snapshot_symbols() -> set[str]:
+    """返回 payload 缺少任一必需字段的 symbol 集合。
+
+    判定依据是**键是否存在**（``json_type`` 为 NULL = 路径不存在），
+    不是值是否为 null —— 合法的空值（如无同比数据）不应触发反复重建。
+    SQLite 无 JSON1 时回退 Python 解析 payload。
+    """
+    if not _REQUIRED_SNAPSHOT_KEYS:
+        return set()
+    db = SessionLocal()
+    try:
+        try:
+            conds = " OR ".join(
+                f"json_type(payload, '$.{k}') IS NULL" for k in _REQUIRED_SNAPSHOT_KEYS
+            )
+            sql = text(f"SELECT symbol FROM factor_snapshots WHERE {conds}")
+            return {row[0] for row in db.execute(sql)}
+        except Exception:
+            logger.warning(
+                "factor_db schema guard SQL failed; falling back to python parse",
+                exc_info=True,
+            )
+        outdated: set[str] = set()
+        for sym, payload in db.query(
+            FactorSnapshot.symbol, FactorSnapshot.payload
+        ).all():
+            try:
+                data = json.loads(payload)
+            except (json.JSONDecodeError, TypeError):
+                outdated.add(sym)
+                continue
+            if not isinstance(data, dict) or any(
+                k not in data for k in _REQUIRED_SNAPSHOT_KEYS
+            ):
+                outdated.add(sym)
+        return outdated
+    except Exception:
+        logger.warning("factor_db schema guard failed", exc_info=True)
+        return set()
+    finally:
+        db.close()
 
 
 def build_all(
@@ -197,7 +261,15 @@ def build_all(
             existing = {r.symbol for r in db.query(FactorSnapshot.symbol).all()}
         finally:
             db.close()
-        to_build = _get_stale_symbols(existing, set(all_symbols))
+        # schema 守卫：已存在但 payload 缺必需字段的存量快照也要重建
+        outdated = _outdated_snapshot_symbols()
+        if outdated:
+            logger.info(
+                "factor_db.build_all: %d snapshots outdated by schema guard %s",
+                len(outdated),
+                _REQUIRED_SNAPSHOT_KEYS,
+            )
+        to_build = _get_stale_symbols(existing, all_symbols, outdated)
 
     if max_symbols is not None and max_symbols > 0:
         to_build = to_build[: int(max_symbols)]

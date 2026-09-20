@@ -1,0 +1,17 @@
+﻿=== market-coverage ??? ===
+{"code":200,"message":"success","data":{"covered":5213,"universe":5382,"remaining":169,"coverage_pct":96.9,"latest_built_at":"2026-09-20T09:02:19.483429","stale_days":0.0,"complete":false},"meta":null}
+=== ????? coverage ?????? ===
+Sep 20 16:22:42 iZuf65meyit9uj12xqp3yzZ uvicorn[11491]: background valuation history failed for 300073.SZ: QueuePool limit of size 5 overflow 10 reached, connection timed out, timeout 30.00 (Background on this error at: https://sqlalche.me/e/20/3o7r)
+Sep 20 16:23:50 iZuf65meyit9uj12xqp3yzZ uvicorn[11491]: background valuation history failed for 300101.SZ: (sqlite3.OperationalError) database is locked
+Sep 20 16:23:50 iZuf65meyit9uj12xqp3yzZ uvicorn[11491]: (Background on this error at: https://sqlalche.me/e/20/e3q8)
+Sep 20 17:02:21 iZuf65meyit9uj12xqp3yzZ uvicorn[13466]: INFO:     127.0.0.1:47438 - "GET /api/v1/fundamentals/market-coverage HTTP/1.1" 200 OK
+=== ????????actor snapshot ?????===
+bash: line 7: ./venv/bin/python: No such file or directory
+ssh : bash: line 12: $'\r': command not found
+所在位置 行:445 字符: 62
++ ... flow\_diag2.sh" -Raw | ssh root@47.100.175.214 "bash -s" 2>&1 | Out-F ...
++                            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (bash: line 12: $'\r': command not 
+    found:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
