@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Sequence
 
 from app.core.ma_cross import ma_cross_kind
+from app.core.nison_rules import LEFT_SIDE_BULLISH
 from app.core.pattern_engine import kline_to_candles
 from app.core.timeframe import weekly_trend_at
 from app.core.windows import active_windows
@@ -261,6 +262,75 @@ def _vol_zh(v: float) -> str:
     return str(int(round(v)))
 
 
+def _volume_cv(vols: list[float]) -> float | None:
+    """近 20 日量能的变异系数（不含今日）。用于判断「几倍量才算异常」。
+
+    量能基线本身越平稳（CV 小），同样倍数越罕见 → 阈值应下调；
+    波动越大（CV 大），同倍数越常见 → 阈值应上调。
+    """
+    base = vols[:-1]
+    if len(base) < 10:
+        return None
+    mean = sum(base) / len(base)
+    if mean <= 0:
+        return None
+    var = sum((v - mean) ** 2 for v in base) / len(base)
+    return (var**0.5) / mean
+
+
+# 量能阈值自适应系数：CV=0.35 视为「常态波动」，对应 k=1.0（即原固定阈值）。
+# 限幅 0.85~1.25，避免极端行情把阈值推到不可解释的区间。
+_VOL_CV_BASE = 0.35
+_VOL_K_MIN = 0.85
+_VOL_K_MAX = 1.25
+VOL_STRONG_RATIO = 1.5
+VOL_MILD_RATIO = 1.2
+VOL_DRY_RATIO = 0.85  # 回调段缩量线
+
+# 左侧超跌形态的趋势确认闸门：收盘在 MA60 下方即为「中期趋势仍向下」，
+# 此时当日量比（对 20 日均量）低于该线就认定为「无量确认」。
+# 与 VOL_MILD_RATIO 同值，但语义独立（那里是「温和放量」的判定线），
+# 刻意分成两个名字，避免将来调其中一个时误改另一个。
+VOL_CONFIRM_MIN = 1.2
+VOL_SHRINK_RATIO = 0.78  # 单日缩量线
+
+
+def _vol_scale(vols: list[float]) -> float:
+    """量能阈值自适应系数 k；CV 不可得时返回 1.0（等于原固定阈值）。"""
+    cv = _volume_cv(vols)
+    if cv is None:
+        return 1.0
+    return max(_VOL_K_MIN, min(_VOL_K_MAX, cv / _VOL_CV_BASE))
+
+
+def _avg_vol_ratio(klines: Sequence, index: int, lookback: int = 20) -> float | None:
+    """当日量能 / 前 ``lookback`` 日均量（不含当日）。
+
+    与 `_detect_buy_signal` 的「近5日均量 vs 近20日均量」不是同一口径，这里
+    刻意用**单日**量比对基线：左侧抄底防守问的是「今天这根形态K线有没有被
+    资金确认」，用 5 日均量会把某一天的天量摊薄掉，反而漏掉真正的放量突破。
+    样本不足或基线为 0 时返回 None（调用方按「无量」处理）。
+    """
+    if index < 2 or index >= len(klines):
+        return None
+    start = max(0, index - lookback)
+    base_slice = klines[start:index]
+    if not base_slice:
+        return None
+    base = sum(_vol(k) for k in base_slice) / len(base_slice)
+    if base <= 0:
+        return None
+    return _vol(klines[index]) / base
+
+
+def _vol_cv_note(vols: list[float]) -> str:
+    """阈值自证文案：让「为什么这次 1.3 倍算放量」可被复核。"""
+    cv = _volume_cv(vols)
+    if cv is None:
+        return ""
+    return f"，动态阈值基于量能波动 CV={cv:.2f}"
+
+
 def _sma(values: list[float], period: int, end: int) -> float | None:
     if end < period - 1:
         return None
@@ -424,8 +494,24 @@ def _volatility_confluence(
     return None
 
 
-def evaluate_confluence(klines: Sequence, index: int, direction: str) -> ConfluenceResult:
-    """Western-tool agreement for a bullish/bearish candle signal at `index`."""
+def evaluate_confluence(
+    klines: Sequence,
+    index: int,
+    direction: str,
+    pattern_name: str | None = None,
+    decision_index: int | None = None,
+) -> ConfluenceResult:
+    """Western-tool agreement for a bullish/bearish candle signal at `index`.
+
+    ``pattern_name`` 为该信号对应的形态名（``PatternResult.pattern_name``），
+    仅供「左侧超跌形态防守」识别形态类别使用；不传时该闸门自动跳过
+    （历史调用方与单元测试保持原行为）。
+
+    ``decision_index`` 为「决策日」所在下标，只影响左侧超跌形态防守的判定基准：
+    榜单/信号页是**今天**要不要买的决策，用户看到的也是今天的价与量，因此该
+    闸门按决策日（扫描层传 ``len(klines)-1``）而非形态发生日判定。缺省 ``None``
+    → 退回 ``index``（形态日口径，历史调用方与单测原行为）。
+    """
     result = ConfluenceResult()
     if index < 20 or index >= len(klines):
         return result
@@ -436,6 +522,7 @@ def evaluate_confluence(klines: Sequence, index: int, direction: str) -> Conflue
     ma20 = _sma(closes, 20, index)
     ma5 = _sma(closes, 5, index)
     ma10 = _sma(closes, 10, index)
+    ma60 = _sma(closes, 60, index)
     lookback = klines[max(0, index - 19) : index + 1]
     prior = klines[max(0, index - 19) : index]
     period_high = max(_high(k) for k in lookback)
@@ -489,6 +576,51 @@ def evaluate_confluence(klines: Sequence, index: int, direction: str) -> Conflue
                 "均线转空",
                 f"MA5 {_px(ma5)} ≤ MA10 {_px(ma10)}，短线转空（MA20 {_px(ma20)}）",
             )
+        # 趋势一致性守卫：标准空头/多头排列里的反向形态 = 接刀/摸顶，不入选。
+        # （尼森：逆短线趋势的反转形态需先突破 MA20 确认；此处按收盘口径拦截）
+        if bullish and ma5 < ma10 < ma20:
+            result.add_soft(
+                "structure_flaw",
+                f"日线均线空头排列：MA5 {_px(ma5)} < MA10 {_px(ma10)} < MA20 {_px(ma20)}，"
+                "看涨形态逆短线趋势，等待放量站回 MA20 再确认",
+            )
+        elif not bullish and ma5 > ma10 > ma20:
+            result.add_soft(
+                "structure_flaw",
+                f"日线均线多头排列：MA5 {_px(ma5)} > MA10 {_px(ma10)} > MA20 {_px(ma20)}，"
+                "看跌形态逆短线趋势，等待收盘跌破 MA20 再确认",
+            )
+
+    # ── 左侧超跌形态防守（决策日口径）──────────────────────────────────
+    # 上面那条空头排列守卫只拦 MA5<MA10<MA20（短线也还在下行）。
+    # 真实缺口在「MA5 已上翘但价格仍在 MA60 下方」：下跌途中的反弹刚起步，
+    # 形态分可以打满，共振却是「无量 + 中期趋势向下」，是最典型的下跌中继。
+    #
+    # 判定基准是**决策日**（decision_index，扫描层传最新一根），不是形态发生日。
+    # 这条曾经写错，代价很直接（2026-09-21 线上实测）：形态日通常伴随放量，
+    # 按形态日判定等于闸门永不触发 —— 002371 北方华创 09-18 平底锅底部当日
+    # 量比 1.48（放行），到 09-21 已缩回 0.87 且仍收在 MA60 724.61 下方，
+    # 榜单上却还挂着「买入候选 · 技术 105」。002409 雅克科技同型（1.28 → 0.97）。
+    # 用户看的是今天的票，所以按今天的价与量判：左侧形态必须等「放量站上 MA60」
+    # 才算右侧确认，无量则按 structure_flaw 淘汰（与空头排列同一处置强度，
+    # 不额外叠加惩罚）。
+    if bullish and pattern_name in LEFT_SIDE_BULLISH:
+        d = decision_index if decision_index is not None else index
+        if 0 <= d < len(klines):
+            d_close = closes[d]
+            d_ma60 = _sma(closes, 60, d)
+            if d_ma60 is not None and d_close < d_ma60:
+                d_vr = _avg_vol_ratio(klines, d)
+                if d_vr is None or d_vr < VOL_CONFIRM_MIN:
+                    _vr = f"量比 {d_vr:.2f}" if d_vr is not None else "量比不可算"
+                    _when = "" if d == index else f"（形态发生在 {as_of}）"
+                    result.add_soft(
+                        "structure_flaw",
+                        f"左侧超跌形态（{pattern_name}）{_when}：决策日收盘 "
+                        f"{_px(d_close)} 仍在 MA60 {_px(d_ma60)} 下方，{_vr} < "
+                        f"{VOL_CONFIRM_MIN:g}（无放量确认），中期趋势仍向下，"
+                        "等待放量站上 MA60 再确认",
+                    )
 
     candles = kline_to_candles(klines)
     cross_kind, cross_detail, cross_weight = _ma_cross_with_freshness(candles, index)
@@ -512,31 +644,42 @@ def evaluate_confluence(klines: Sequence, index: int, direction: str) -> Conflue
         dif, dea, hist, prev_hist = macd
         turning_up = hist > prev_hist
         turning_down = hist < prev_hist
-        if bullish and (dif >= dea or turning_up):
-            bits = []
-            if dif >= dea:
-                bits.append(f"DIF {_px(dif)} 在 DEA {_px(dea)} 之上")
-            else:
-                bits.append(f"DIF {_px(dif)} 仍低于 DEA {_px(dea)}")
+        # 只有 DIF 已在 DEA 正确一侧才算动能支持；
+        # 「绿柱缩短/红柱回落」未过死叉/金叉前不作为反向证据（空头动能未衰竭≠转多）。
+        if bullish and dif >= dea:
+            bits = [f"DIF {_px(dif)} 在 DEA {_px(dea)} 之上"]
             if turning_up:
                 bits.append(f"柱 {_px(hist)} 较前值 {_px(prev_hist)} 抬升")
             result.add("MACD", _stamp(as_of, "；".join(bits)))
-        elif not bullish and (dif <= dea or turning_down):
-            bits = []
-            if dif <= dea:
-                bits.append(f"DIF {_px(dif)} 在 DEA {_px(dea)} 之下")
-            else:
-                bits.append(f"DIF {_px(dif)} 仍高于 DEA {_px(dea)}")
+        elif not bullish and dif <= dea:
+            bits = [f"DIF {_px(dif)} 在 DEA {_px(dea)} 之下"]
             if turning_down:
                 bits.append(f"柱 {_px(hist)} 较前值 {_px(prev_hist)} 回落")
             result.add("MACD", _stamp(as_of, "；".join(bits)))
 
     rsi = rsi_at(closes, index)
     if rsi is not None:
-        if bullish and rsi <= 48:
-            result.add("RSI", _stamp(as_of, f"RSI(14)={rsi:.1f}，低于 48，未超买，支持做多"))
-        elif not bullish and rsi >= 52:
-            result.add("RSI", _stamp(as_of, f"RSI(14)={rsi:.1f}，高于 52，未超卖，支持做空"))
+        # RSI 的语义不是「越超卖越看多」，而是「未超买且方向未破」。
+        # 上界从 48 放宽到 60：强势股回调往往不破 50~60，原区间会把整段
+        # 强势回调买点漏掉；下界保持 28 —— 超卖(<28)仍不作为做多证据，
+        # 反转证据走「RSI背离」（002545 案例结论）。
+        # 分档权重：中轴区满权，弱势区 0.6（动能未确认，不足以单独撑起双证）。
+        if bullish and 28.0 <= rsi <= 60.0:
+            strong_zone = rsi >= 45.0
+            zone = (
+                f"RSI(14)={rsi:.1f}，45~60 强势回调区（未超买），支持做多"
+                if strong_zone
+                else f"RSI(14)={rsi:.1f}，28~45 弱势区（未超卖但动能未确认），弱支持做多"
+            )
+            result.add("RSI", _stamp(as_of, zone), weight=1.0 if strong_zone else 0.6)
+        elif not bullish and 40.0 <= rsi <= 72.0:
+            strong_zone = rsi <= 55.0
+            zone = (
+                f"RSI(14)={rsi:.1f}，40~55 空头动能区（未超卖），支持做空"
+                if strong_zone
+                else f"RSI(14)={rsi:.1f}，55~72 高位钝化区（动能未确认），弱支持做空"
+            )
+            result.add("RSI", _stamp(as_of, zone), weight=1.0 if strong_zone else 0.6)
 
     from app.core.oscillators import (
         bearish_divergence,
@@ -548,15 +691,16 @@ def evaluate_confluence(klines: Sequence, index: int, direction: str) -> Conflue
     stoch = stochastic_at(klines, index)
     if stoch:
         k_val, d_val = stoch
-        if bullish and (k_val <= 25 or (k_val > d_val and k_val < 40)):
+        # 超卖/超买本身不作为证据，需已金叉/死叉（%K 在 %D 正确一侧）才算动能配合
+        if bullish and k_val > d_val and k_val < 40:
             result.add(
                 "随机指标",
-                _stamp(as_of, f"%K={k_val:.1f} %D={d_val:.1f}，超卖区或低位金叉，支持做多"),
+                _stamp(as_of, f"%K={k_val:.1f} %D={d_val:.1f}，低位金叉，支持做多"),
             )
-        elif not bullish and (k_val >= 75 or (k_val < d_val and k_val > 60)):
+        elif not bullish and k_val < d_val and k_val > 60:
             result.add(
                 "随机指标",
-                _stamp(as_of, f"%K={k_val:.1f} %D={d_val:.1f}，超买区或高位死叉，支持做空"),
+                _stamp(as_of, f"%K={k_val:.1f} %D={d_val:.1f}，高位死叉，支持做空"),
             )
         if bullish and k_val >= 90:
             msg = _stamp(
@@ -592,38 +736,48 @@ def evaluate_confluence(klines: Sequence, index: int, direction: str) -> Conflue
         elif not bullish and bearish_divergence(closes, hist_line, index):
             result.add("MACD背离", "价格创新高而 MACD 柱未创新高（看跌背离）")
 
-    # Ch.15 volume: breakout thrust needs ≥1.5×；1.2~1.5 仅标「量能一般」并降权
+    # Ch.15 volume: breakout thrust 需显著放量。阈值按量能波动率自适应：
+    # 量能基线平稳的缩量行情里 1.3~1.4 倍已是有效突破，高波动票则需更大倍数
+    # 才算「异常」。CV 不可得时 k=1.0，退回原固定阈值 1.5× / 1.2×。
     vols = [_vol(k) for k in klines[max(0, index - 19) : index + 1]]
     if len(vols) >= 5:
         avg_vol = sum(vols[:-1]) / max(len(vols) - 1, 1)
         today_vol = _vol(klines[index])
         prev_vol = _vol(klines[index - 1]) if index > 0 else 0.0
+        k = _vol_scale(vols)
+        thr_strong = VOL_STRONG_RATIO * k
+        thr_mild = VOL_MILD_RATIO * k
+        cv_note = _vol_cv_note(vols)
         if avg_vol > 0:
             ratio = today_vol / avg_vol
             breaking_high = prior and close > prior_high
             breaking_low = prior and close < prior_low
-            if today_vol >= avg_vol * 1.5:
+            if ratio >= thr_strong:
                 if bullish:
                     result.add(
                         "放量",
                         f"确认放量 {_vol_zh(today_vol)}≈均量 {ratio:.2f} 倍"
-                        + ("，收盘越过前高" if breaking_high else ""),
+                        + ("，收盘越过前高" if breaking_high else "")
+                        + f"（阈值 {thr_strong:.2f}×{cv_note}）",
                     )
                 else:
                     result.add(
                         "放量",
                         f"确认放量 {_vol_zh(today_vol)}≈均量 {ratio:.2f} 倍"
-                        + ("，收盘跌破前低" if breaking_low else ""),
+                        + ("，收盘跌破前低" if breaking_low else "")
+                        + f"（阈值 {thr_strong:.2f}×{cv_note}）",
                     )
-            elif 1.2 <= ratio < 1.5:
+            elif thr_mild <= ratio < thr_strong:
                 result.add_soft(
                     "low_momentum",
-                    f"量能一般：约均量 {ratio:.2f} 倍（1.2~1.5），突破确认偏弱，信号降权",
+                    f"量能一般：约均量 {ratio:.2f} 倍"
+                    f"（{thr_mild:.2f}~{thr_strong:.2f}），突破确认偏弱，信号降权",
                 )
-        # 缩量回撤：近几日量能低于均量后今日转强/转弱
+        # 缩量回撤：近几日量能低于均量后今日转强/转弱（缩量线同样随波动率自适应）
         if avg_vol > 0 and index >= 3:
+            dry_line = avg_vol * (VOL_DRY_RATIO / k)
             recent3 = [_vol(klines[i]) for i in range(index - 3, index)]
-            dry = sum(1 for v in recent3 if v < avg_vol * 0.85) >= 2
+            dry = sum(1 for v in recent3 if v < dry_line) >= 2
             if bullish and dry and today_vol >= prev_vol and close > float(klines[index].open):
                 result.add(
                     "缩量回撤",
@@ -736,16 +890,17 @@ def evaluate_confluence(klines: Sequence, index: int, direction: str) -> Conflue
                 f"低位超卖杀跌：收盘贴近 20 日低点，RSI(14)={rsi:.1f}，MACD 柱仍未抬升",
             )
 
-    # 缩量反弹/缩量下跌：动能不足，轻度扣分
+    # 缩量反弹/缩量下跌：动能不足，轻度扣分（缩量线同随量能波动率自适应）
     if len(vols) >= 5:
         avg_vol = sum(vols[:-1]) / max(len(vols) - 1, 1)
         today_vol = _vol(klines[index])
         prev_vol = _vol(klines[index - 1]) if index > 0 else 0.0
+        shrink_line = avg_vol * (VOL_SHRINK_RATIO / _vol_scale(vols))
         if avg_vol > 0:
             if (
                 bullish
                 and close > float(klines[index].open)
-                and today_vol < avg_vol * 0.78
+                and today_vol < shrink_line
                 and today_vol <= prev_vol * 0.95
             ):
                 result.add_soft(
@@ -755,7 +910,7 @@ def evaluate_confluence(klines: Sequence, index: int, direction: str) -> Conflue
             elif (
                 not bullish
                 and close < float(klines[index].open)
-                and today_vol < avg_vol * 0.78
+                and today_vol < shrink_line
                 and today_vol <= prev_vol * 0.95
             ):
                 result.add_soft(

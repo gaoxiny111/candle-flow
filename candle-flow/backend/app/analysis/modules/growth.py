@@ -340,7 +340,7 @@ class GrowthAnalyzer(BaseAnalyzer):
                     try:
                         if float(deducted) > 0 and float(parent_np) > 0:
                             if ded_yoy is not None and float(ded_yoy) > 0:
-                                ded_note = f"；扣非同比+{float(ded_yoy):.1f}%，主业修复更强"
+                                ded_note = f"；扣非同比{float(ded_yoy):+.1f}%，主业修复更强"
                             else:
                                 ded_note = "；扣非净利同步改善，主业盈利韧性增强"
                     except (TypeError, ValueError):
@@ -348,79 +348,105 @@ class GrowthAnalyzer(BaseAnalyzer):
                 cycle_industries = ("煤炭", "焦炭", "有色", "钢铁", "化工", "航运", "港口", "开采")
                 industry = str(kwargs.get("industry") or "")
                 is_cycle = any(k in industry for k in cycle_industries) or _profile.get("cyclical", False)
-                if is_cycle:
-                    comment = (
-                        f"周期回落后出现边际修复：营收同比+{yoy_r:.1f}%、净利同比+{yoy_p:.1f}%"
-                        f"{ded_note}；资产注入与多业务板块改善增强盈利韧性"
-                        "（非高成长，但是底部修复）"
+                # 只有 marginal_recovery 成立（净利同比转正，周期股放宽营收）才输出
+                # 「业绩边际改善」。旧逻辑无条件追加，导致新潮能源净利同比 -65.6%、
+                # 营收同比 -21.5% 时仍给出「边际改善 74 分（权重 3.2）」+「单季加速
+                # 82 分（权重 2.8）」，两项合计权重 6.0/16.9 把成长分从衰退口径的
+                # 约 30 分抬到 44.1 —— 指标名与事实相反，且与
+                # metadata.marginal_recovery=False 自相矛盾。降幅收窄但同比未转正的，
+                # 只出提示、不计分。
+                if marginal_recovery:
+                    if is_cycle:
+                        comment = (
+                            f"周期回落后出现边际修复：营收同比{yoy_r:+.1f}%、净利同比{yoy_p:+.1f}%"
+                            f"{ded_note}；资产注入与多业务板块改善增强盈利韧性"
+                            "（非高成长，但是底部修复）"
+                        )
+                        score_m = 78.0 if yoy_p >= 3 else 74.0
+                    else:
+                        comment = (
+                            f"年报CAGR为负，但最新报告期营收同比{yoy_r:+.1f}%、"
+                            f"净利同比{yoy_p:+.1f}%，出现边际修复迹象{ded_note}"
+                        )
+                        score_m = 74.0 if yoy_p >= 3 else 70.0
+                    indicators.append(
+                        IndicatorResult(
+                            name="业绩边际改善",
+                            value=round(yoy_p, 2),
+                            score=score_m,
+                            level=AnalysisLevel.GOOD,
+                            trend="up",
+                            weight=3.2,
+                            period=yoy_period,
+                            comment=comment,
+                        )
                     )
-                    score_m = 78.0 if yoy_p >= 3 else 74.0
+                    # 下调 CAGR 指标权重，避免「仍在衰退」叙事压过边际改善
+                    for ind in indicators:
+                        if "CAGR" in ind.name:
+                            ind.weight = 1.2
                 else:
-                    comment = (
-                        f"年报CAGR为负，但最新报告期营收同比+{yoy_r:.1f}%、"
-                        f"净利同比+{yoy_p:.1f}%，出现边际修复迹象{ded_note}"
+                    warnings.append(
+                        f"最新报告期净利同比{yoy_p:+.1f}%、营收同比{yoy_r:+.1f}%，"
+                        "同比未转正，未构成边际改善；降幅收窄不等于趋势反转，需后续季度验证"
                     )
-                    score_m = 74.0 if yoy_p >= 3 else 70.0
-                indicators.append(
-                    IndicatorResult(
-                        name="业绩边际改善",
-                        value=round(yoy_p, 2),
-                        score=score_m,
-                        level=AnalysisLevel.GOOD,
-                        trend="up",
-                        weight=3.2,
-                        period=yoy_period,
-                        comment=comment,
-                    )
-                )
-                # 下调 CAGR 指标权重，避免「仍在衰退」叙事压过边际改善
-                for ind in indicators:
-                    if "CAGR" in ind.name:
-                        ind.weight = 1.2
                 # 单季业绩加速（Q2 环比/同比大幅改善 → 修复力度超预期）
+                # 口径：单季"加速"必须有同比支撑；纯靠环比改善（同比仍下滑）不计分，
+                # 否则会出现「环比+31%、同比-49%，修复力度较强」这类自相矛盾的结论。
                 sq = kwargs.get("single_quarter")
                 if sq and sq.get("net_profit") is not None:
                     sq_yoy = sq.get("yoy_pct")
                     sq_qoq = sq.get("qoq_pct")
                     if sq_yoy is not None and sq_qoq is not None:
+                        sq_yoy_f = float(sq_yoy)
+                        sq_qoq_f = float(sq_qoq)
+                        sq_score: float | None = None
+                        sq_comment = ""
                         # 修复力度超预期 → 加分项
-                        if float(sq_yoy) >= 30 or float(sq_qoq) >= 50:
+                        if sq_yoy_f >= 30 or (sq_qoq_f >= 50 and sq_yoy_f >= 0):
                             sq_score = 86.0
                             sq_comment = (
-                                f"Q2单季净利环比+{float(sq_qoq):.0f}%、同比+{float(sq_yoy):.0f}%，"
+                                f"Q2单季净利环比{sq_qoq_f:+.0f}%、同比{sq_yoy_f:+.0f}%，"
                                 f"修复力度超预期"
                             )
-                        elif float(sq_yoy) >= 15 or float(sq_qoq) >= 30:
+                        elif sq_yoy_f >= 15 or (sq_qoq_f >= 30 and sq_yoy_f >= 0):
                             sq_score = 82.0
                             sq_comment = (
-                                f"Q2单季净利环比+{float(sq_qoq):.0f}%、同比+{float(sq_yoy):.0f}%，"
+                                f"Q2单季净利环比{sq_qoq_f:+.0f}%、同比{sq_yoy_f:+.0f}%，"
                                 f"修复力度较强"
                             )
-                        else:
+                        elif sq_yoy_f >= 0:
                             sq_score = 75.0
                             sq_comment = (
-                                f"Q2单季净利环比+{float(sq_qoq):.0f}%、同比+{float(sq_yoy):.0f}%"
+                                f"Q2单季净利环比{sq_qoq_f:+.0f}%、同比{sq_yoy_f:+.0f}%"
                             )
-                        # 扣非增速补充
-                        ded_yoy = kwargs.get("deducted_yoy_pct")
-                        if ded_yoy is not None and float(ded_yoy) > 0:
-                            sq_comment += f"；扣非同比+{float(ded_yoy):.1f}%，主业修复更强"
-                        indicators.append(
-                            IndicatorResult(
-                                name="单季业绩加速",
-                                value=round(float(sq_yoy), 2),
-                                score=sq_score,
-                                level=AnalysisLevel.GOOD,
-                                trend="up",
-                                weight=2.8,
-                                period=sq.get("label") or yoy_period,
-                                comment=sq_comment,
+                        else:
+                            warnings.append(
+                                f"Q2单季净利环比{sq_qoq_f:+.0f}%、同比{sq_yoy_f:+.0f}%，"
+                                "环比改善但同比仍下滑，修复未获同比验证，不计入成长加分"
                             )
-                        )
-                warnings.append(
-                    "近3年复合增速为负，但最新报告期已现边际修复"
-                    "（周期企稳+主业/多业务改善），非纯粹衰退通道"
-                )
+                        if sq_score is not None:
+                            # 扣非增速补充
+                            ded_yoy = kwargs.get("deducted_yoy_pct")
+                            if ded_yoy is not None and float(ded_yoy) > 0:
+                                sq_comment += f"；扣非同比{float(ded_yoy):+.1f}%，主业修复更强"
+                            indicators.append(
+                                IndicatorResult(
+                                    name="单季业绩加速",
+                                    value=round(sq_yoy_f, 2),
+                                    score=sq_score,
+                                    level=AnalysisLevel.GOOD,
+                                    trend="up",
+                                    weight=2.8,
+                                    period=sq.get("label") or yoy_period,
+                                    comment=sq_comment,
+                                )
+                            )
+                if marginal_recovery:
+                    warnings.append(
+                        "近3年复合增速为负，但最新报告期已现边际修复"
+                        "（周期企稳+主业/多业务改善），非纯粹衰退通道"
+                    )
             elif profit_cagr_3y < 0:
                 # 周期底部反转已确认时，不再重复输出“盈利能力下滑”
                 if not v_shape and not marginal_recovery:

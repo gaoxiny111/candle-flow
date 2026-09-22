@@ -285,10 +285,12 @@ def test_build_all_caps_batch_and_reports_coverage(monkeypatch, tmp_path):
 
 
 def test_build_all_schema_guard_rebuilds_snapshots_missing_new_keys(monkeypatch, tmp_path):
-    """已有快照但 payload 缺必需字段时，非 force 增量构建也必须重建。
+    """已有快照但 payload 缺必需字段（或口径版本落后）时，非 force 增量构建也必须重建。
 
-    否则给 run_full_analysis 新增字段（如 profit_yoy）在存量行上永不回填。
-    判定看键是否存在：值为 null 的合法缺失不应触发反复重建。
+    否则给 run_full_analysis 新增字段（如 profit_yoy）在存量行上永不回填；
+    同理，改动打分口径后若不重建，榜单会长期停留在旧分数（详情页实时重算、
+    榜单读快照 → 同一只票两个分数）。判定看键是否存在：值为 null 的合法缺失、
+    以及口径版本一致的空值，不应触发反复重建。
     """
     from app.services import factor_db as mod
 
@@ -298,7 +300,7 @@ def test_build_all_schema_guard_rebuilds_snapshots_missing_new_keys(monkeypatch,
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     setup = Session()
-    for sym in ("600000.SH", "000001.SZ", "300750.SZ"):
+    for sym in ("600000.SH", "000001.SZ", "300750.SZ", "000002.SZ"):
         setup.add(StockInfo(symbol=sym, code=sym[:6], name="测试", market=sym[-2:]))
     # 600000：旧 payload 缺 profit_yoy → 应纳入重建
     setup.add(
@@ -308,12 +310,32 @@ def test_build_all_schema_guard_rebuilds_snapshots_missing_new_keys(monkeypatch,
             composite_score=50.0,
         )
     )
-    # 000001：已含 profit_yoy 且值为 null（合法空值）→ 不应重建
+    # 000001：已含 profit_yoy 且值为 null（合法空值）+ 当前口径版本 → 不应重建
     setup.add(
         FactorSnapshot(
             symbol="000001.SZ",
-            payload=json.dumps({"composite_score": 51.0, "profit_yoy": None}),
+            payload=json.dumps(
+                {
+                    "composite_score": 51.0,
+                    "profit_yoy": None,
+                    "scoring_version": mod.SCORING_VERSION,
+                }
+            ),
             composite_score=51.0,
+        )
+    )
+    # 000002：字段齐全但口径版本落后（打分口径已改动）→ 应重建
+    setup.add(
+        FactorSnapshot(
+            symbol="000002.SZ",
+            payload=json.dumps(
+                {
+                    "composite_score": 52.0,
+                    "profit_yoy": 3.0,
+                    "scoring_version": "1970.01.01.0",
+                }
+            ),
+            composite_score=52.0,
         )
     )
     setup.commit()
@@ -351,9 +373,10 @@ def test_build_all_schema_guard_rebuilds_snapshots_missing_new_keys(monkeypatch,
     )
 
     stats = mod.build_all(budget_sec=120)
-    # 600000（缺键）+ 300750（无快照）→ 2 只；000001 已有键 → 跳过
-    assert stats["built"] == 2
-    assert sorted(built_symbols) == ["300750.SZ", "600000.SH"]
+    # 600000（缺键）+ 000002（口径版本落后）+ 300750（无快照）→ 3 只；
+    # 000001 字段齐全且口径版本一致 → 跳过
+    assert stats["built"] == 3
+    assert sorted(built_symbols) == ["000002.SZ", "300750.SZ", "600000.SH"]
     assert stats["skipped"] == 1
 
 
@@ -407,7 +430,7 @@ def test_technical_overlay_merges_and_aggregates(monkeypatch):
                           "pattern_name": None},
         }
         monkeypatch.setattr(ms, "_overlay_one",
-                            lambda sym, name, score, pe, py: {"symbol": sym, "name": name, **tech[sym]})
+                            lambda sym, name, score, peg: {"symbol": sym, "name": name, **tech[sym]})
         ms._overlay_cache.update({"ts": 0.0, "key": None, "payload": None})
         out = ms.technical_overlay(db, top=3)
         assert out["count"] == 3
@@ -483,7 +506,7 @@ def test_overlay_covers_whole_page_not_first_n(monkeypatch):
     )
     calls: list[str] = []
 
-    def fake_one(sym, name, score, pe, py):
+    def fake_one(sym, name, score, peg):
         calls.append(sym)
         return {"symbol": sym, "name": name, "kline_bars": 90,
                 "buy_signal": "neutral", "buy_label": "中性", "buy_reasons": [],
@@ -524,7 +547,7 @@ def test_overlay_retries_failed_symbol_and_never_caches_failure(monkeypatch):
     calls: list[str] = []
     fail_once = {"600002.SH"}
 
-    def flaky(sym, name, score, pe, py):
+    def flaky(sym, name, score, peg):
         calls.append(sym)
         if sym in fail_once:
             fail_once.discard(sym)
@@ -550,7 +573,7 @@ def test_overlay_retries_failed_symbol_and_never_caches_failure(monkeypatch):
         monkeypatch.setattr(ms, "_overlay_item_cache", {})
         monkeypatch.setattr(
             ms, "_overlay_one",
-            lambda sym, name, score, pe, py: {"symbol": sym, "name": name, "kline_bars": 0,
+            lambda sym, name, score, peg: {"symbol": sym, "name": name, "kline_bars": 0,
                                               "buy_signal": "insufficient_data",
                                               "buy_label": "分析失败", "buy_reasons": [],
                                               "pattern_name": None, "failed": True},
@@ -571,7 +594,7 @@ def test_overlay_one_without_klines_is_insufficient(monkeypatch):
     Base.metadata.create_all(engine)
     mem = sessionmaker(bind=engine)
     monkeypatch.setattr(ms, "SessionLocal", mem)
-    row = ms._overlay_one("600999.SH", "无K线", 80.0, 10.0, None)
+    row = ms._overlay_one("600999.SH", "无K线", 80.0, None)
     assert row["buy_signal"] == "insufficient_data"
     assert row["kline_bars"] == 0
 
@@ -637,18 +660,41 @@ def test_tech_score_derives_from_combined_and_missing_is_none(monkeypatch):
     # 有达标形态共振：组合分 107.2 → 截断到 100
     monkeypatch.setattr(
         MarketConfluenceService, "_scan_job",
-        lambda self, job: (
+        lambda self, job, diag=None: (
             {"pattern_name": "启明星", "pattern_score": 88.0,
              "confluence_effective": 3.2, "combined_score": 107.2}, "hit"),
     )
-    assert ms._overlay_one("600001.SH", "甲", 88.0, 10.0, 20.0)["tech_score"] == 100
+    assert ms._overlay_one("600001.SH", "甲", 88.0, 1.2)["tech_score"] == 100
 
     # 无达标形态共振 → None（不可评估），绝不赋 0 或中性分
-    monkeypatch.setattr(MarketConfluenceService, "_scan_job", lambda self, job: (None, "ok"))
-    assert ms._overlay_one("600002.SH", "乙", 88.0, 10.0, 20.0)["tech_score"] is None
+    monkeypatch.setattr(
+        MarketConfluenceService, "_scan_job", lambda self, job, diag=None: (None, "ok")
+    )
+    assert ms._overlay_one("600002.SH", "乙", 88.0, 1.2)["tech_score"] is None
 
     # 未达 100 时原样保留（不重标定量纲）
     assert ms._tech_score(83.4) == 83 and ms._tech_score(None) is None
+
+    # 被「左侧超跌形态防守」否决 → 技术面同样为 None，但必须带回否决原因，
+    # 与「本来就没有形态」区分（否则用户会以为形态逻辑坏了）。
+    def _blocked(self, job, diag=None):
+        if diag is not None:
+            diag["left_side_blocked"] = (
+                "左侧超跌形态（平底锅底部）：收盘 10.00 在 MA60 12.00 下方，"
+                "量比 0.87 < 1.2（无放量确认）"
+            )
+        return None, "left_side_blocked"
+
+    monkeypatch.setattr(MarketConfluenceService, "_scan_job", _blocked)
+    blocked_case = ms._overlay_one("600003.SH", "丙", 88.0, 1.2)
+    assert blocked_case["tech_score"] is None
+    assert "左侧超跌形态" in (blocked_case["tech_blocker"] or "")
+    v, reasons = ms._verdict(
+        88.0, None, min_fund=70, min_tech=70, core=85, veto=60,
+        tech_blocker=blocked_case["tech_blocker"],
+    )
+    assert v == "watch"
+    assert any("技术面已否决" in r for r in reasons)
 
 
 def test_overlay_labels_verdicts_and_keeps_scores_untouched(monkeypatch):
@@ -666,7 +712,7 @@ def test_overlay_labels_verdicts_and_keeps_scores_untouched(monkeypatch):
     try:
         monkeypatch.setattr(
             ms, "_overlay_one",
-            lambda sym, name, score, pe, py: {
+            lambda sym, name, score, peg: {
                 "symbol": sym, "name": name, "kline_bars": 90,
                 "buy_signal": "neutral", "buy_label": "中性", "buy_reasons": [],
                 "pattern_name": None, "tech_score": tech_score[sym],
@@ -710,7 +756,7 @@ _RESO_TECH = {
 }
 
 
-def _fake_overlay_one(sym, name, score, pe, py):
+def _fake_overlay_one(sym, name, score, peg):
     return {
         "symbol": sym, "name": name, "kline_bars": 90,
         "buy_signal": "neutral", "buy_label": "中性", "buy_reasons": [],
@@ -808,3 +854,218 @@ def test_resonance_rejects_unknown_verdict_filter():
     finally:
         db.close()
 
+
+
+# ── 分类准入门槛（候选池熔断，只封档位不改分）─────────────────────────────
+# 背景：600722 金牛化工 PE 193.5 / 每股经营现金流 0.078 / ROE 3.92%，
+# 却因偿债 93.9 + 现金流 75.8 把综合分拉到 71.5 → 进「买入候选」。
+# 病根是「估值极高 却盈利极弱」的矛盾组合被加权平均掩盖，不是单指标超标。
+#
+# 关键设计约束（实测 2026-09-21，5254 只）：
+#   单一绝对阈值全部被否决——
+#     周转率<0.5 命中 55.8%、ROE<5% 命中 54.2%、PE分位>85% 命中 18.7%；
+#     「PE分位≥90 且 PB分位≥90」甚至拦掉中国神华(87.2/A)、生益科技、深南电路。
+#   反证：PE分位 95.6% 拦中国神华，却放走 PE分位 89.8% 的金牛化工。
+# 因此改为「分类适用 + 矛盾组合」：四类资产各用各的门槛，不新造综合分。
+
+
+def test_admission_gate_blocks_jinniu_chemical_style_mismatch():
+    """金牛化工式「高估值 + 弱盈利」矛盾组合必须被拦。"""
+    gate = ms.classify_admission_gate(
+        roe=3.92, asset_turnover=0.316, pe_percentile=89.8
+    )
+    assert gate is not None
+    label, why = gate
+    assert label == "传统价值型"
+    assert "背离" in why
+    assert "ROE" in why
+
+
+def test_admission_gate_spares_quality_high_percentile():
+    """高分位但盈利强的优质股不得被误杀（分位高 ≠ 泡沫）。"""
+    # 中国神华：PE 分位 95.6 但 ROE 12.76
+    assert ms.classify_admission_gate(
+        roe=12.76, asset_turnover=0.6, pe_percentile=95.6
+    ) is None
+    # 三环集团：PE 分位 97.8 但 ROE 12.62
+    assert ms.classify_admission_gate(
+        roe=12.62, asset_turnover=0.5, pe_percentile=97.8
+    ) is None
+    # 生益科技/深南电路：成长型不设 PE 上限
+    assert ms.classify_admission_gate(
+        is_growth_stock=True, revenue_yoy=25.0, gross_margin=22.0
+    ) is None
+
+
+def test_admission_gate_dividend_branch_skips_roe_and_turnover():
+    """红利型不看 ROE/周转率（重资产低周转是行业属性），只看分红能力。"""
+    # 大秦铁路：ROE 3.64 / 周转 0.367（若按传统价值型会被「矛盾组合」命中），
+    # 但股息 4.72% + payout 75% → 走红利分支必须放行。
+    assert ms.classify_admission_gate(
+        is_dividend_asset=True, dividend_yield=4.72, payout_ratio=75.0
+    ) is None
+    # 红利型但分红不达标 → 拦
+    gate = ms.classify_admission_gate(
+        is_dividend_asset=True, dividend_yield=2.0, payout_ratio=30.0
+    )
+    assert gate is not None and gate[0] == "红利型"
+
+
+def test_admission_gate_missing_fields_pass_through():
+    """关键字段缺失一律放行——不猜、不因缺数据而改变判定。"""
+    assert ms.classify_admission_gate() is None
+    assert ms.classify_admission_gate(roe=None, pe_percentile=None) is None
+    # 成长型两者都缺 → 放行
+    assert ms.classify_admission_gate(is_growth_stock=True) is None
+
+
+def test_admission_gate_cyclical_traps_at_earnings_peak():
+    """周期型：景气高点（cycle_trap）熔断。"""
+    gate = ms.classify_admission_gate(is_strong_cyclical=True, cycle_trap=True)
+    assert gate is not None and gate[0] == "周期型"
+
+
+def test_admission_gate_cyclical_is_not_a_free_pass():
+    """周期型**不是免检通道**：高估值分位 + 弱盈利同样拦截。
+
+    历史缺陷：该分支只判 ``cycle_trap`` 而该参数恒为 False，导致 894 只强周期股
+    全部无条件放行，混入 143 只「PE分位≥80 且 ROE<6」，与金牛化工同病。
+    """
+    # 泸天化式：PE分位 99.3 / ROE 0.5 → 拦
+    gate = ms.classify_admission_gate(
+        is_strong_cyclical=True,
+        pe_percentile=99.3,
+        roe=0.5,
+    )
+    assert gate is not None and gate[0] == "周期型"
+    assert "背离" in gate[1]
+    # 招商蛇口式：PE分位 100.0 / ROE 0.73 → 拦
+    assert ms.classify_admission_gate(
+        is_strong_cyclical=True, pe_percentile=100.0, roe=0.73
+    ) is not None
+    # 峰值周期股不误杀：高 ROE 拿高估值分位是常态（中国神华式）
+    assert ms.classify_admission_gate(
+        is_strong_cyclical=True, pe_percentile=95.6, roe=12.76
+    ) is None
+    # 真·底部反转不误杀：谷底 ROE 为负但估值在低位，正是该买时点
+    assert ms.classify_admission_gate(
+        is_strong_cyclical=True, pe_percentile=12.0, roe=-3.0
+    ) is None
+    # 缺字段放行（不猜）
+    assert ms.classify_admission_gate(
+        is_strong_cyclical=True, pe_percentile=None, roe=1.0
+    ) is None
+    assert ms.classify_admission_gate(
+        is_strong_cyclical=True, pe_percentile=99.0, roe=None
+    ) is None
+
+
+def test_admission_gate_financial_exempt_from_turnover_floor():
+    """金融业结构性豁免周转率门槛：银行/券商周转 0.02~0.08 是业务模型，非低效。
+
+    实测 42 家银行 / 49 家券商 / 20 家多元金融周转率 <0.15，若不豁免全部误杀
+    （宁波银行 0.02、华泰证券 0.033、华夏银行 0.019）。
+    """
+    # 宁波银行式：周转 0.02 但银行身份 → 不被周转兜底拦（ROE 正常）
+    assert ms.classify_admission_gate(
+        asset_turnover=0.02, roe=11.0, pe_percentile=60.0, industry="银行Ⅱ"
+    ) is None
+    # 同一周转率但不是金融 → 仍拦（真僵尸资产）
+    gate = ms.classify_admission_gate(
+        asset_turnover=0.02, roe=11.0, pe_percentile=60.0, industry="化学原料"
+    )
+    assert gate is not None and "周转率" in gate[1]
+    # 券商同理豁免
+    assert ms.classify_admission_gate(
+        asset_turnover=0.033, roe=8.0, pe_percentile=50.0, industry="证券Ⅱ"
+    ) is None
+    # 豁免不等于免检：金融股照样过「估值↔盈利矛盾」这一关
+    gate2 = ms.classify_admission_gate(
+        asset_turnover=0.02, roe=0.7, pe_percentile=100.0, industry="银行Ⅱ"
+    )
+    assert gate2 is not None and "背离" in gate2[1]
+
+
+def test_verdict_profile_gate_caps_to_watch_without_score_rewrite():
+    """闸门命中只封顶「观察」，且理由带类型标签；fund 已低于淘汰线仍报淘汰。"""
+    v, reasons = ms._verdict(
+        71.5, 100,
+        min_fund=80, min_tech=80, core=85, veto=60,
+        profile_gate=("传统价值型", "估值与盈利背离：…"),
+    )
+    assert v == "watch"
+    assert any("分类准入未通过" in r for r in reasons)
+    # 更差的票（fund < veto）仍报淘汰，不被闸门理由覆盖
+    v2, _ = ms._verdict(
+        45.0, 100,
+        min_fund=80, min_tech=80, core=85, veto=60,
+        profile_gate=("传统价值型", "…"),
+    )
+    assert v2 == "eliminated"
+
+
+def test_verdict_no_gate_keeps_original_behaviour():
+    """不传 profile_gate 时行为与既有完全一致（历史调用方不受影响）。"""
+    assert ms._verdict(
+        90.0, 90, min_fund=80, min_tech=80, core=85, veto=60
+    )[0] == "core"
+    assert ms._verdict(
+        82.0, 82, min_fund=80, min_tech=80, core=85, veto=60
+    )[0] == "candidate"
+    assert ms._verdict(
+        70.0, 82, min_fund=80, min_tech=80, core=85, veto=60
+    )[0] == "watch"
+
+
+def test_admission_gate_growth_branch_handles_partial_none():
+    """成长型分支任一字段为 None 时不得抛异常。
+
+    回归锁：首版格式化文案直接 `float(revenue_yoy)`，当营收为 None 而毛利率
+    有值（或反之）且均不达标时会抛 TypeError，**导致共振索引构建整体失败**
+    （线上表现为 /technical-overlay 恒 503、progress 报
+    「float() argument must be ... not 'NoneType'」）。
+    """
+    # 营收 None + 毛利率有值且不达标
+    gate = ms.classify_admission_gate(
+        is_growth_stock=True, revenue_yoy=None, gross_margin=20.0
+    )
+    assert gate is not None and gate[0] == "成长型"
+    assert "缺失" in gate[1]
+    # 营收有值且不达标 + 毛利率 None
+    gate2 = ms.classify_admission_gate(
+        is_growth_stock=True, revenue_yoy=10.0, gross_margin=None
+    )
+    assert gate2 is not None and gate2[0] == "成长型"
+    assert "缺失" in gate2[1]
+    # 两者都有值且不达标
+    gate3 = ms.classify_admission_gate(
+        is_growth_stock=True, revenue_yoy=10.0, gross_margin=20.0
+    )
+    assert gate3 is not None
+
+
+def test_base_items_gate_survives_missing_new_fields():
+    """旧快照缺新增分类字段时 _base_items 不得崩溃（回退路径同样安全）。"""
+    row = {
+        "symbol": "600722.SH",
+        "composite_score": 71.5,
+        "pe_ttm": 193.5,
+        "name": "金牛化工",
+        "industry": "化学原料",
+        "final_rating": "B",
+        "risk_level_label": "风险可控",
+        "market_cap": 1.09e10,
+        "price": 16.02,
+        "pb": 8.49,
+        "dividend_yield": 0.47,
+        "dim_profitability": 54.7,
+        "dim_growth": 76.7,
+        "dim_cashflow": 75.8,
+        "dim_solvency": 93.9,
+        "dim_valuation": 56.0,
+        # 关键：分类字段全缺（模拟 09-20 旧快照）
+    }
+    items = ms._base_items([row])
+    assert len(items) == 1
+    # 字段全缺 → 传统价值型分支但三个判据都缺 → 放行（不猜）
+    assert items[0]["profile_gate"] is None

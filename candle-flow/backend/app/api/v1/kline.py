@@ -111,6 +111,20 @@ def latest_kline(symbol: str = Query(...), db: Session = Depends(get_db)):
     return ApiResponse(data=KlineOut.model_validate(item))
 
 
+@router.get("/kline/tech-narrative")
+def tech_narrative(symbol: str = Query(...), db: Session = Depends(get_db)):
+    """技术面叙述分析：由系统指标生成成文报告（趋势/形态/指标/支撑压力/操作建议）。"""
+    from app.services.tech_narrative import build_tech_narrative
+
+    resolved = _resolve_symbol(symbol, db)
+    if isinstance(resolved, ApiResponse):
+        return resolved
+    data = build_tech_narrative(db, resolved)
+    if not data.get("ok"):
+        return ApiResponse(code=400101, message=data.get("reason") or "无法生成技术面分析", data=data)
+    return ApiResponse(data=data)
+
+
 @router.post("/kline/sync")
 def sync_kline(body: KlineSyncRequest, db: Session = Depends(get_db)):
     try:

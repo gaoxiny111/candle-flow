@@ -1,0 +1,28 @@
+﻿=== candle-flow ===
+.git
+.trae
+backend
+dist-ref
+docs
+frontend
+scripts
+.gitignore
+install_windows.bat
+README.md
+start_all.bat
+_fe_tsc3.txt
+_fe_tsc4.txt
+=== deep backend ===
+analysis
+api
+core
+models
+schemas
+services
+utils
+workers
+__pycache__
+config.py
+database.py
+main.py
+__init__.py

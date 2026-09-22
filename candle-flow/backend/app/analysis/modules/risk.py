@@ -194,9 +194,24 @@ class RiskAnalyzer(BaseAnalyzer):
                 "宏观与政策风险（观察）：关注高端消费景气度、消费税改革及禁酒/公务消费政策对估值的影响"
             )
             risk_score -= 5
-        if any(k in industry for k in ("煤炭", "焦炭", "煤业", "开采")):
+        if any(k in industry for k in ("煤炭", "焦炭", "煤业")):
             warnings.append(
                 "行业风险（观察）：关注煤炭价格周期波动、长协煤履约率及分红政策稳定性"
+            )
+            risk_score -= 3
+            if is_div:
+                warnings.append(
+                    "红利资产观察：高股息可持续性依赖经营现金流与分红承诺兑现"
+                )
+        elif any(
+            k in industry
+            for k in ("石油", "天然气", "油气", "油服", "勘探", "开采", "采矿", "矿业", "冶炼")
+        ):
+            # 资源开采类不能用煤炭口径：油气看油价/气价与储产量、套保效果，
+            # 「长协煤履约率」与其毫不相干。旧逻辑把泛化的「开采」并进煤炭分支，
+            # 使油气开采股（新潮能源 600777）被套上煤炭提示。
+            warnings.append(
+                "行业风险（观察）：关注原油/天然气价格周期波动、储产量与套期保值效果"
             )
             risk_score -= 3
             if is_div:
@@ -316,6 +331,14 @@ class RiskAnalyzer(BaseAnalyzer):
             risk_score = min(risk_score, 15.0)
             delist_risk = True
 
+        # 生存级风险已解除（撤销退市风险警示、审计非标影响已消除等）：
+        # 不再否决、不再标 delist_risk，但要留痕说明"低分依据已过时"。
+        released_labels = kwargs.get("survival_released_labels") or []
+        if released_labels:
+            highlights.append(
+                "生存级风险已解除：" + "、".join(str(x) for x in released_labels) + "（不再一票否决）"
+            )
+
         observe_events = kwargs.get("observe_risk_events") or []
         if observe_events:
             labels = sorted({str(e.get("label") or "") for e in observe_events if e.get("label")})
@@ -323,6 +346,44 @@ class RiskAnalyzer(BaseAnalyzer):
                 warnings.append("观察级风险：" + "、".join(labels) + "（扣分但不否决）")
             # 观察级风险扣分减半（原12分/事件，现6分/事件）
             risk_score -= min(15.0, 6.0 * len(observe_events))
+
+        # ── 减持窗口期倒计时 + 大宗交易折价率 ─────────────────────────────
+        # 减持窗口期是**时间性**压制：窗口开启期间抛压持续存在，结束后消失。
+        # 倒计时按自然日折算成轻量附加扣分（上限 5 分 → 不影响生存级判定，
+        # 也不与上面「观察级风险 6 分」重复计数：那 6 分是「有减持公告」，
+        # 这里只对「窗口正在开启中」的时间溢价额外计价）。
+        #
+        # 大宗交易折价率：折价越深说明承接方要求的风险补偿越高，短期抛压信号
+        # 越强。只对近 30 日内存在深折价（≥5%）的交易计价，上限 4 分。
+        #
+        # 两个都**只减不增、有上限、不触发 delist_risk**，且全部落 metadata 留痕。
+        reduce_window = kwargs.get("reduce_window") or {}
+        remaining_days = kwargs.get("reduce_remaining_days")
+        window_deduct = 0.0
+        if reduce_window and reduce_window.get("in_window") and remaining_days:
+            _rd = int(remaining_days)
+            # 剩余天数越多，压制越久 → 扣分越高（5 分上限，60 天及以上取满）
+            window_deduct = round(min(5.0, 5.0 * min(_rd, 60) / 60.0), 1)
+            if window_deduct > 0:
+                risk_score -= window_deduct
+            warnings.append(
+                f"减持窗口期：{reduce_window.get('start')} 至 {reduce_window.get('end')}"
+                f"（剩余 {_rd} 天），窗口期内存在持续抛压"
+            )
+
+        block_deduct = 0.0
+        latest_block = kwargs.get("latest_block_trade") or {}
+        _disc = latest_block.get("discount_pct")
+        if _disc is not None and float(_disc) >= 5.0:
+            block_deduct = round(min(4.0, 4.0 * float(_disc) / 15.0), 1)
+            if block_deduct > 0:
+                risk_score -= block_deduct
+            _px = latest_block.get("deal_price")
+            warnings.append(
+                f"大宗交易折价：{latest_block.get('trade_date')} 成交价 "
+                f"{_px if _px is not None else '—'} 元，折价 {float(_disc):.2f}%，"
+                f"承接方要求较高风险补偿，短期抛压信号"
+            )
 
         # ── 风险释放恢复：减持完毕+承诺不减持时，风险评分恢复 ──
         risk_released = kwargs.get("risk_released")
@@ -349,5 +410,13 @@ class RiskAnalyzer(BaseAnalyzer):
                 "major_risk_count": len(major_events),
                 "observe_risk_count": len(observe_events),
                 "highlights": highlights,
+                # 减持窗口期 / 大宗交易留痕（扣分依据自证）
+                "reduce_window": reduce_window or None,
+                "reduce_remaining_days": (
+                    int(remaining_days) if remaining_days is not None else None
+                ),
+                "reduce_window_deduct": window_deduct,
+                "block_trade_deduct": block_deduct,
+                "latest_block_trade": latest_block or None,
             },
         )

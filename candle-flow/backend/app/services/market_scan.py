@@ -33,6 +33,10 @@ from sqlalchemy.orm import Session
 from app.database import SessionLocal
 from app.models.factor_snapshot import FactorSnapshot
 from app.models.stock import StockInfo
+# 强周期行业（精确匹配，28 行业 / 919 只）。**不能用子串关键词表**：
+# 线上行业名来自申万三级（特钢Ⅱ/化学原料/工业金属…），「特钢Ⅱ」里根本没有
+# 「钢铁」二字，子串表只能命中 1.6%。见 engine.STRONG_CYCLICAL_INDUSTRIES。
+from app.analysis.engine import STRONG_CYCLICAL_INDUSTRIES
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +82,9 @@ def _is_gem_star(symbol: str) -> bool:
 #         正交加权 + 周线趋势多周期确认 + 软冲突否决）
 #   买点：market_confluence_service._detect_buy_signal（MA20/60 + 量比 + PEG）
 # 参数与 market_confluence_service 保持一致（KLINE_LIMIT / MIN_BARS / 信号阈值）。
+# K 线窗口不在此处另设常量：统一取 market_confluence_service.KLINE_LIMIT（180），
+# 避免「榜单用 90、信号页用 180」这类同源不同值的分叉。
 OVERLAY_WORKERS = 8
-OVERLAY_KLINE_LIMIT = 90
 OVERLAY_MIN_BARS = 40
 OVERLAY_RECENT_BARS = 2
 # 技术叠加层逐票分析，覆盖「本页全部标的」——上限与榜单单页上限一致(M=500)，
@@ -152,7 +157,24 @@ _LIGHT_SQL = text(
            json_extract(payload, '$.dim_scores."成长性"')     AS dim_growth,
            json_extract(payload, '$.dim_scores."现金流质量"') AS dim_cashflow,
            json_extract(payload, '$.dim_scores."偿债能力"')   AS dim_solvency,
-           json_extract(payload, '$.dim_scores."估值合理性"') AS dim_valuation
+           json_extract(payload, '$.dim_scores."估值合理性"') AS dim_valuation,
+           -- 分类准入门槛（_admission_gate）所需字段：四类资产各用各的门槛，
+           -- 不能一套绝对阈值一刀切（见 ADMISSION_* 说明）。
+           json_extract(payload, '$.valuation.is_dividend_asset')             AS is_dividend_asset,
+           json_extract(payload, '$.valuation.growth_stock_profile.is_growth_stock') AS is_growth_stock,
+           json_extract(payload, '$.market.pe_percentile')                    AS pe_percentile,
+           json_extract(payload, '$.valuation.dividend_profile.payout_ratio_pct') AS payout_ratio_pct,
+           -- ROE 恒为盈利能力指标数组第 0 项、总资产周转率恒为效率模块第 0 项
+           -- （实测 5254 只快照位置稳定；见 601006/600722 抽查）。
+           json_extract(payload, '$.modules.profitability.indicators[0].value') AS roe_pct,
+           json_extract(payload, '$.modules.efficiency.indicators[0].value')    AS asset_turnover,
+           -- 毛利率：盈利能力数组第 1 项（ROE/毛利率/ROIC/净利率 固定顺序）
+           json_extract(payload, '$.modules.profitability.indicators[1].value') AS gross_margin_pct,
+           json_extract(payload, '$.revenue_yoy')                             AS revenue_yoy,
+           json_extract(payload, '$.profit_yoy')                              AS profit_yoy,
+           -- 大股东减持窗口期：供买点信号封顶（强买入→观察）使用。
+           -- 只改档位不改分数，因此不参与任何重算，仅随快照透传。
+           json_extract(payload, '$.major_risks.reduce_window')               AS reduce_window
     FROM factor_snapshots
     WHERE composite_score IS NOT NULL
     """
@@ -181,6 +203,15 @@ def _from_payload(row: FactorSnapshot) -> dict[str, Any]:
         d = {}
     m = d.get("market") or {}
     dims = d.get("dim_scores") or {}
+    val = d.get("valuation") or {}
+    modules = d.get("modules") or {}
+
+    def _ind_value(module: str, idx: int) -> Any:
+        items = ((modules.get(module) or {}).get("indicators") or [])
+        if idx < len(items):
+            return (items[idx] or {}).get("value")
+        return None
+
     out: dict[str, Any] = {
         "symbol": row.symbol,
         "composite_score": row.composite_score,
@@ -194,6 +225,20 @@ def _from_payload(row: FactorSnapshot) -> dict[str, Any]:
         "price": m.get("price"),
         "pb": m.get("pb"),
         "dividend_yield": m.get("dividend_yield"),
+        # 分类准入门槛所需字段（与 _LIGHT_SQL 一一对应，两条读取路径口径必须一致）
+        "is_dividend_asset": val.get("is_dividend_asset"),
+        "is_growth_stock": (val.get("growth_stock_profile") or {}).get("is_growth_stock"),
+        "pe_percentile": m.get("pe_percentile"),
+        "payout_ratio_pct": (val.get("dividend_profile") or {}).get("payout_ratio_pct"),
+        "roe_pct": _ind_value("profitability", 0),
+        "asset_turnover": _ind_value("efficiency", 0),
+        "gross_margin_pct": _ind_value("profitability", 1),
+        "revenue_yoy": d.get("revenue_yoy"),
+        "profit_yoy": d.get("profit_yoy"),
+        # 减持窗口期嵌在 major_risks 下（**不是**顶层），路径写错会静默取到
+        # None → 封顶逻辑形同虚设且零报错。旧快照（本版之前构建）该字段为
+        # None，_detect_buy_signal 会自然放行，不会炸。
+        "reduce_window": (d.get("major_risks") or {}).get("reduce_window"),
     }
     for eng, cn in DIM_KEYS.items():
         out[f"dim_{eng}"] = dims.get(cn)
@@ -317,6 +362,23 @@ def _base_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         comp = _to_float(r.get("composite_score"))
         mcap = _to_float(r.get("market_cap"))
         ind = str(r.get("industry") or "")
+        # 分类准入门槛：四类资产各用各的门槛（见 ADMISSION_* 说明）。
+        # 命中即记 profile_gate，由 _verdict 封顶「观察」——不改任何分数。
+        _gate = classify_admission_gate(
+            is_dividend_asset=bool(r.get("is_dividend_asset")),
+            is_growth_stock=bool(r.get("is_growth_stock")),
+            is_strong_cyclical=ind in STRONG_CYCLICAL_INDUSTRIES,
+            cycle_trap=False,  # 周期陷阱需 PB 分位，见 _overlay 层补充
+            dividend_yield=_to_float(r.get("dividend_yield")),
+            payout_ratio=_to_float(r.get("payout_ratio_pct")),
+            ocf_positive=None,  # 快照未直出 OCF 符号，缺省放行（不猜）
+            revenue_yoy=_to_float(r.get("revenue_yoy")),
+            gross_margin=_to_float(r.get("gross_margin_pct")),
+            roe=_to_float(r.get("roe_pct")),
+            asset_turnover=_to_float(r.get("asset_turnover")),
+            pe_percentile=_to_float(r.get("pe_percentile")),
+            industry=ind,
+        )
         items.append(
             {
                 "symbol": r["symbol"],
@@ -337,6 +399,10 @@ def _base_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 },
                 "market_pct": market_pct.get(r["symbol"]),
                 "industry_pct": (industry_pct.get(ind) or {}).get(r["symbol"]),
+                "profile_gate": list(_gate) if _gate else None,
+                # 减持窗口期：转交 _compute_tech_map → _overlay_one →
+                # _detect_buy_signal，窗口开启时把强买入封顶为观察（不改分数）。
+                "reduce_window": r.get("reduce_window"),
             }
         )
     return items
@@ -489,7 +555,7 @@ def scan_market(
 def _profit_yoy_map(db: Session | None, symbols: list[str]) -> dict[str, float | None]:
     """从因子快照取净利同比（engine 返回自 2026-09-20 起携带 profit_yoy）。
 
-    旧快照无此键 → 返回 None → PEG 缺失 → 强买入信号保守降级（不虚构增速）。
+    仅用于展示与诊断；**买点信号的 PEG 不再由此重算**（见 _snapshot_peg_map）。
     """
     if not symbols:
         return {}
@@ -510,6 +576,42 @@ def _profit_yoy_map(db: Session | None, symbols: list[str]) -> dict[str, float |
     return out
 
 
+def _snapshot_peg_map(db: Session | None, symbols: list[str]) -> dict[str, float | None]:
+    """从因子快照取**个股分析口径**的 PEG（`valuation.relative.PEG.value`）。
+
+    这是 engine 算好的值：优先 3 年净利 CAGR，周期底部负 CAGR 与红利资产
+    会被置 None 并附 note。扫描层直接复用，不另立「PE_TTM ÷ 单期同比」的算法——
+    否则同一只票在个股分析与榜单买点信号里会得到两个 PEG，且周期股在景气
+    高点（低 PE + 极高增速）会被严重低估。
+
+    ⚠ 路径必须是 `valuation.relative.PEG.value`：快照 payload 没有顶层 `relative`，
+    相对估值块整体挂在 `valuation` 下。2026-09-21 曾误写为 `relative.PEG.value`，
+    导致**全库 PEG 恒为 None**，而 buy_signal 的 strong_buy/watch 两档都硬性要求
+    `peg is not None` —— 结果整张榜单买点信号 100% 落在 neutral，
+    档位静默失效且无任何报错。改动此路径务必同步 test_market_scan 的路径回归用例。
+    """
+    if not symbols:
+        return {}
+    out: dict[str, float | None] = {}
+    sess = db or SessionLocal()
+    try:
+        sql = text(
+            "SELECT symbol, json_extract(payload, '$.valuation.relative.PEG.value') "
+            "FROM factor_snapshots WHERE symbol IN :syms"
+        ).bindparams(bindparam("syms", expanding=True))
+        for sym, val in sess.execute(sql, {"syms": list(symbols)}):
+            try:
+                out[sym] = None if val is None else float(val)
+            except (TypeError, ValueError):
+                out[sym] = None
+    except Exception:
+        logger.debug("snapshot peg map query failed", exc_info=True)
+    finally:
+        if db is None:
+            sess.close()
+    return out
+
+
 def _tech_score(combined: float | None) -> int | None:
     """共振组合分 → 0~100 技术面得分。
 
@@ -521,6 +623,183 @@ def _tech_score(combined: float | None) -> int | None:
     return int(round(max(0.0, min(float(combined), VERDICT_TECH_MAX))))
 
 
+# ── 分类准入门槛（候选池熔断，只封档位不改分）─────────────────────────────
+# 背景：综合分是「加权平均」，单一维度极差会被其他维度的高分掩盖。实测
+# 600722 金牛化工：PE_TTM 193.5 / PE 分位 89.8 / PB 8.49 / ROE 3.92% /
+# 每股经营现金流 0.078，却因偿债 93.9、现金流 75.8 拉到综合 71.5 → 进「买入候选」。
+#
+# **为什么不用单一绝对阈值**（实测 2026-09-21，5254 只，均被否决）：
+#   周转率 < 0.5 → 命中 55.8%（铁路/高速/水电/银行等重资产本就在此区间）
+#   ROE < 5%     → 命中 54.2%（大秦铁路 3.64%，最经典的红利压舱石）
+#   PE 分位 > 85% → 命中 18.7%（科创板 688 成长期硬科技几乎全中）
+#   「PE分位≥90 且 PB分位≥90」→ 拦掉中国神华(87.2/A)、生益科技、深南电路、
+#     三环集团等评分最高的优质股——**分位高 ≠ 泡沫**：优质公司盈利持续增长
+#     会抬高估值中枢，长期停在高分位是常态而非异常。
+#   反证：PE分位 95.6% 拦中国神华，却放走 PE分位 89.8% 的金牛化工
+#     —— 单指标阈值对本问题完全无效。
+#
+# **有效判据 = 指标间的矛盾，而非单指标绝对值**：
+#   金牛化工的病是「估值极高(PE分位89.8/PB分位98.8) 却盈利极弱(ROE 3.92)」
+#   这种矛盾组合才是真泡沫；而中国神华「估值分位高 但 ROE 12.76」有盈利支撑，
+#   不构成矛盾。实测「PE分位≥80 且 ROE<6%」命中 15.0%，且：
+#     中国神华/生益科技/深南电路/三环集团 均不命中（ROE 12~21）
+#     大秦铁路命中 ROE 3.64 —— 但它是红利型，走股息率/分红比例分支，不受此限。
+#
+# 四类门槛（命中即封顶「观察」，不改写 composite_score / 技术面读数）：
+#   红利型：股息率 ≥3.5% 且 分红比例 ≥50%（不看 ROE/周转——重资产低周转是行业属性）
+#   成长型：营收增速 ≥15% 或 毛利率 ≥30%（不看 PE 绝对值——高 PE 是成长特征）
+#   周期型：仅 cycle_trap（PE低分位+PB高分位+高ROE）才熔断，即景气高点
+#   传统价值：估值分位与盈利质量的**矛盾组合**（PE分位≥80 且 ROE<6%）
+#             或 极低周转（<0.15，真僵尸资产）或 PE 分位极端（≥97）
+# 任一类**关键字段缺失则放行**（不猜、不因缺数据而改变判定），与全系统口径一致。
+ADMISSION_DIV_YIELD_MIN = 3.5
+ADMISSION_DIV_PAYOUT_MIN = 50.0
+ADMISSION_GROWTH_REV_YOY_MIN = 15.0
+ADMISSION_GROWTH_GROSS_MARGIN_MIN = 30.0
+# 传统价值型：估值与盈利的「矛盾」判据（核心）
+ADMISSION_VALUE_PE_PCTL_MIN = 80.0
+ADMISSION_VALUE_ROE_MAX = 6.0
+# 传统价值型：极端兜底（单独触发）
+ADMISSION_VALUE_TURNOVER_MIN = 0.15
+ADMISSION_VALUE_PE_PCTL_EXTREME = 97.0
+# 周转率门槛对**金融业结构性豁免**：银行赚息差、券商赚佣金，资产负债表以金融资产
+# 为主，总资产周转率天然在 0.02~0.08（实测 42 家银行 / 49 家券商 / 20 家多元金融
+# 均 <0.15）。用制造业的周转尺子量金融=必然误杀，与「同一指标在四类资产上含义不同
+# 不可同尺」的原则一致。豁免后仍有「估值↔盈利矛盾」判据兜底，不会变成免检通道。
+ADMISSION_FINANCIAL_INDUSTRY_KW = (
+    "银行", "保险", "证券", "多元金融", "信托", "期货",
+)
+
+
+def classify_admission_gate(
+    *,
+    is_dividend_asset: bool = False,
+    is_growth_stock: bool = False,
+    is_strong_cyclical: bool = False,
+    cycle_trap: bool = False,
+    dividend_yield: float | None = None,
+    payout_ratio: float | None = None,
+    ocf_positive: bool | None = None,
+    revenue_yoy: float | None = None,
+    gross_margin: float | None = None,
+    roe: float | None = None,
+    asset_turnover: float | None = None,
+    pe_percentile: float | None = None,
+    industry: str | None = None,
+) -> tuple[str, str] | None:
+    """分类准入门槛：返回 ``(类型标签, 未通过原因)``，通过则返回 None。
+
+    判定顺序按「分类互斥性」排列：红利 → 周期 → 成长 → 传统价值，每类只适用
+    自己的门槛（同一指标在四类资产上含义不同，不可同尺）。字段缺失一律放行。
+    """
+    # ── 红利型：不看 ROE/周转率（重资产低周转是行业属性），看分红能力 ──
+    if is_dividend_asset:
+        fails: list[str] = []
+        if dividend_yield is not None and float(dividend_yield) < ADMISSION_DIV_YIELD_MIN:
+            fails.append(f"股息率 {float(dividend_yield):.2f}% < {ADMISSION_DIV_YIELD_MIN:g}%")
+        if payout_ratio is not None and float(payout_ratio) < ADMISSION_DIV_PAYOUT_MIN:
+            fails.append(f"分红比例 {float(payout_ratio):.0f}% < {ADMISSION_DIV_PAYOUT_MIN:g}%")
+        if ocf_positive is False:
+            fails.append("经营现金流为负")
+        if fails:
+            return "红利型", "；".join(fails)
+        return None
+
+    # ── 周期型置于成长之前：周期股常因毛利率高被判成长，但门槛完全不同 ──
+    # 周期型**不是免检通道**：早先此处只判 cycle_trap 且该参数恒为 False，
+    # 导致 894 只强周期股全部无条件放行，混入 143 只「PE分位≥80 且 ROE<6」
+    # （泸天化 PE分位99.3/ROE0.5、招商蛇口100.0/0.73、华菱钢铁99.2/4.77），
+    # 与金牛化工同病。周期股同样须过「估值↔盈利矛盾」这一关。
+    if is_strong_cyclical:
+        if cycle_trap:
+            return (
+                "周期型",
+                "估值陷阱：PE 处低分位而 PB 处高分位且 ROE 高位，"
+                "便宜来自盈利高点而非资产便宜，杀估值风险高",
+            )
+        # 与「传统价值型」同尺的矛盾判据：高估值分位 + 弱盈利 → 周期也不例外。
+        # 但周期股的 ROE 天然波动大（谷底为负、峰值为高），故：
+        #   ① 必须 PE 分位高 且 ROE 弱 —— 单看 ROE 弱会误杀真·底部反转（ROE 为负但
+        #      估值已在低位），那正是该买的时点；
+        #   ② 只在 PE 分位 ≥ 阈值时触发，谷底低估值不受影响。
+        if (
+            pe_percentile is not None
+            and float(pe_percentile) >= ADMISSION_VALUE_PE_PCTL_MIN
+            and roe is not None
+            and float(roe) < ADMISSION_VALUE_ROE_MAX
+        ):
+            return (
+                "周期型",
+                "估值与盈利背离：PE 分位 "
+                f"{float(pe_percentile):.1f}%（市场已给高预期）而 ROE 仅 "
+                f"{float(roe):.2f}% < {ADMISSION_VALUE_ROE_MAX:g}%，"
+                "周期股在盈利未兑现时拿到高估值，缺乏支撑",
+            )
+        return None
+
+    # ── 成长型：不看 PE 绝对值（高 PE 本身是成长特征），看成长质量 ──
+    if is_growth_stock:
+        rev_ok = revenue_yoy is not None and float(revenue_yoy) >= ADMISSION_GROWTH_REV_YOY_MIN
+        gm_ok = gross_margin is not None and float(gross_margin) >= ADMISSION_GROWTH_GROSS_MARGIN_MIN
+        # 两者均缺失 → 放行；任一已知且达标 → 放行
+        if (revenue_yoy is None and gross_margin is None) or rev_ok or gm_ok:
+            return None
+        # 走到这里说明「两者都有值且都不达标」（缺失已在上面放行），
+        # 格式化时任一为 None 都会抛 TypeError（曾导致共振索引构建整体失败），
+        # 故用 None 安全的自证文案。
+        _rev_txt = f"{float(revenue_yoy):.1f}%" if revenue_yoy is not None else "缺失"
+        _gm_txt = f"{float(gross_margin):.1f}%" if gross_margin is not None else "缺失"
+        return (
+            "成长型",
+            f"营收增速 {_rev_txt} < {ADMISSION_GROWTH_REV_YOY_MIN:g}% "
+            f"且毛利率 {_gm_txt} < {ADMISSION_GROWTH_GROSS_MARGIN_MIN:g}%，"
+            "不具成长质量特征",
+        )
+
+    # ── 传统价值型：估值与盈利的矛盾组合（核心）+ 极端兜底 ──
+    # ① 矛盾组合：估值分位高（市场已给高预期）而 ROE 低（盈利跟不上）
+    if (
+        pe_percentile is not None
+        and roe is not None
+        and float(pe_percentile) >= ADMISSION_VALUE_PE_PCTL_MIN
+        and float(roe) < ADMISSION_VALUE_ROE_MAX
+    ):
+        return (
+            "传统价值型",
+            f"估值与盈利背离：PE 分位 {float(pe_percentile):.1f}%（市场已给高预期）"
+            f"而 ROE 仅 {float(roe):.2f}% < {ADMISSION_VALUE_ROE_MAX:g}%，"
+            "高估值缺盈利支撑",
+        )
+    # ② 极端兜底：周转率过低（真僵尸资产）
+    #    金融业结构性豁免——银行/券商的总资产周转率天然在 0.02~0.08，
+    #    那不是「资产产出效率过低」而是业务模型本身。
+    _is_financial = bool(industry) and any(
+        k in industry for k in ADMISSION_FINANCIAL_INDUSTRY_KW
+    )
+    if (
+        not _is_financial
+        and asset_turnover is not None
+        and float(asset_turnover) < ADMISSION_VALUE_TURNOVER_MIN
+    ):
+        return (
+            "传统价值型",
+            f"总资产周转率 {float(asset_turnover):.2f} < {ADMISSION_VALUE_TURNOVER_MIN:g}，"
+            "资产产出效率过低",
+        )
+    # ③ 极端兜底：PE 分位到顶（历史最贵区间）
+    if (
+        pe_percentile is not None
+        and float(pe_percentile) >= ADMISSION_VALUE_PE_PCTL_EXTREME
+        and (roe is None or float(roe) < 12.0)  # 高 ROE 者（如中国神华12.76）不拦
+    ):
+        return (
+            "传统价值型",
+            f"PE 分位 {float(pe_percentile):.1f}% 已达历史极端区间"
+            f"{'且 ROE 偏低' if roe is not None else ''}",
+        )
+    return None
+
+
 def _verdict(
     fund: float | None,
     tech: int | None,
@@ -529,12 +808,32 @@ def _verdict(
     min_tech: float,
     core: float,
     veto: float,
+    tech_blocker: str | None = None,
+    profile_gate: tuple[str, str] | None = None,
 ) -> tuple[str, list[str]]:
     """双阈值漏斗判定：淘汰 → 核心持仓 → 买入候选 → 观察。
 
     缺失值不当作最差：技术面不可评估（无形态共振）时归入「观察」并说明，
     而不是按 <veto 淘汰。
+
+    ``tech_blocker`` 为技术面为 None 时的**否决原因**（目前只有「左侧超跌
+    形态防守」会填）。不传时按「本来就没有形态」描述——两者对用户是不同
+    的信息：前者是「形态有、但不让买」，后者是「没有形态」。
+
+    ``profile_gate`` 为**分类准入门槛**的否决结果 ``(类型标签, 原因)``，由
+    ``classify_admission_gate`` 产出。命中时**只封顶档位为「观察」**，不改写
+    ``composite_score`` 与技术面读数（与双阈值同一处置强度，不产生第二个总分）。
+    分类适用不同门槛而非用一套绝对阈值一刀切：红利看股息/分红、成长看营收/毛利、
+    周期看 PE-PB-ROE 组合陷阱、传统价值看 ROE/周转率——同一指标在四类资产上
+    的含义不同（铁路的 0.37 周转率与消费股的 0.37 不是同一回事）。
     """
+    if profile_gate is not None:
+        _label, _why = profile_gate
+        # 分类准入先于档位判定：不满足该类型的最低质量要求，不进候选池。
+        # 但已被双阈值判「淘汰」的仍报淘汰（更差），避免理由互相覆盖。
+        if fund is not None and fund < veto:
+            return "eliminated", [f"基本面 {fund:.1f} < {veto:g}"]
+        return "watch", [f"分类准入未通过（{_label}）：{_why}"]
     if fund is not None and fund < veto:
         return "eliminated", [f"基本面 {fund:.1f} < {veto:g}"]
     if tech is not None and tech < veto:
@@ -552,7 +851,10 @@ def _verdict(
     elif fund < min_fund:
         reasons.append(f"基本面 {fund:.1f} < {min_fund:g}")
     if tech is None:
-        reasons.append("技术面不可评估（近 2 根K线无达标注形态共振）")
+        if tech_blocker:
+            reasons.append(f"技术面已否决：{tech_blocker}")
+        else:
+            reasons.append("技术面不可评估（近 2 根K线无达标注形态共振）")
     elif tech < min_tech:
         reasons.append(f"技术面 {tech} < {min_tech:g}")
     return "watch", reasons or ["未同时满足双阈值"]
@@ -562,18 +864,23 @@ def _overlay_one(
     symbol: str,
     name: str,
     fund_score: float | None,
-    pe: float | None,
-    profit_yoy: float | None,
+    peg: float | None,
+    reduce_window: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """单票技术面叠加：K线买点信号（全票）+ 形态共振（达标才有）。
 
     复用 MarketConfluenceService._scan_job（PatternEngine + evaluate_confluence +
     候选门槛），保证「主板战法 / 信号页」与本榜单的形态共振口径逐位一致。
+
+    ``peg`` 由调用方从因子快照读取（个股分析 engine 口径：3 年净利 CAGR 优先，
+    周期底部负 CAGR / 红利资产置 None），**本函数不再自行计算 PEG**。
+
+    ``reduce_window`` 由调用方从因子快照读取（大股东减持窗口期）。窗口开启时
+    ``_detect_buy_signal`` 会把强买入封顶为观察（只改档位、不改分数）。
     """
     from app.services.kline_service import KlineService
     from app.services.market_confluence_service import (
         KLINE_LIMIT,
-        _calc_peg,
         _detect_buy_signal,
         MarketConfluenceService,
     )
@@ -592,6 +899,7 @@ def _overlay_one(
         "confluence_hits": None,
         "combined_score": None,
         "tech_score": None,
+        "tech_blocker": None,
     }
     sess = SessionLocal()
     try:
@@ -599,12 +907,27 @@ def _overlay_one(
         if len(klines) < OVERLAY_MIN_BARS:
             empty["buy_label"] = "K线不足40根"
             return empty
-        # 买点信号：MA20/MA60 + 量比 + PEG（_detect_buy_signal 对 peg=None 已保守处理）
-        peg = _calc_peg(pe, profit_yoy)
-        buy = _detect_buy_signal(klines, float(fund_score or 0), peg, pe)
-        # 形态共振：bullish 形态 + 共振达标 + 近 2 根K线（_scan_job 内部自会过滤）
+        # 形态共振先算：买点信号是决策的下游，必须知道「形态是否达标」「是否
+        # 被左侧超跌防守否决」，否则会出现「决策=买入候选 / 买点=中性」的悖论。
+        diag: dict[str, Any] = {}
         svc = MarketConfluenceService(sess)
-        best, _outcome = svc._scan_job(_Job(symbol=symbol, name=name, recent_bars=OVERLAY_RECENT_BARS))
+        best, _outcome = svc._scan_job(
+            _Job(symbol=symbol, name=name, recent_bars=OVERLAY_RECENT_BARS),
+            diag,
+        )
+        pattern_name = (best or {}).get("pattern_name")
+        left_side_blocked = bool(best is None and diag.get("left_side_blocked"))
+        # 买点信号：MA20/MA60 + 量比 + PEG（PEG 缺失时 _detect_buy_signal 保守不触发）
+        buy = _detect_buy_signal(
+            klines,
+            float(fund_score or 0),
+            peg,
+            None,
+            pattern_name=pattern_name,
+            pattern_ready=best is not None,
+            left_side_blocked=left_side_blocked,
+            reduce_window=reduce_window,
+        )
         return {
             "symbol": symbol,
             "name": name,
@@ -614,7 +937,14 @@ def _overlay_one(
             "buy_reasons": buy.get("reasons") or [],
             "buy_note": buy.get("note"),
             "peg": peg,
-            "pattern_name": (best or {}).get("pattern_name"),
+            # 口径自证必须与真实取值一致：原先无论 peg 是否为 None 都硬编码
+            # 「3年净利CAGR口径，周期/红利已豁免」，会让人误以为值已读到。
+            "peg_source": (
+                "个股分析口径（3年净利CAGR优先，周期/红利已豁免）"
+                if peg is not None
+                else "个股分析未给出 PEG（负/缺失 CAGR 或红利豁免）→ 强买入/观察档保守不触发"
+            ),
+            "pattern_name": pattern_name,
             "pattern_score": (best or {}).get("pattern_score"),
             "confluence_effective": (best or {}).get("confluence_effective"),
             "confluence_hits": (best or {}).get("confluence_hits"),
@@ -622,6 +952,11 @@ def _overlay_one(
             "combined_score": (best or {}).get("combined_score"),
             "tech_score": _tech_score((best or {}).get("combined_score")),
             "pattern_date": (best or {}).get("candle_date"),
+            # 技术面为 None 时说明「为什么不可评估」：被左侧超跌防守否决的票
+            # 与「本来就没有形态」的票，用户看到的文案必须不同。
+            "tech_blocker": diag.get("left_side_blocked") if best is None else None,
+            # 减持窗口期闸门留痕：signal 被门控时 _detect_buy_signal 会带 gate 字段
+            "signal_gate": buy.get("gate"),
         }
     except Exception:
         logger.debug("technical overlay failed for %s", symbol, exc_info=True)
@@ -636,12 +971,15 @@ def _overlay_one(
 
 def _compute_tech_map(
     pool: list[dict[str, Any]],
-    py_map: dict[str, float | None],
+    peg_map: dict[str, float | None],
     *,
     force: bool = False,
     progress: Any = None,
 ) -> dict[str, dict[str, Any]]:
     """对给定标的池计算技术面（带单票缓存 + 失败串行重试）。
+
+    ``peg_map`` 为 **个股分析口径** 的 PEG（``_snapshot_peg_map``），逐票透传给
+    买点信号判定；缺失即按保守口径不触发强买入。
 
     返回 ({symbol: overlay_fields}, 重试票数, 本次新算票数)。失败的票带
     ``failed=True`` 且**不写缓存**（多为盘后批跑期间的 SQLite 写锁竞争，属瞬时状态）。
@@ -665,8 +1003,9 @@ def _compute_tech_map(
             sym,
             it.get("name") or "",
             it.get("composite_score"),
-            it.get("pe_ttm"),
-            py_map.get(sym),
+            peg_map.get(sym),
+            # 减持窗口期来自因子快照（同一次 payload 读取，不额外发起请求）
+            it.get("reduce_window"),
         )
 
     if todo:
@@ -782,13 +1121,14 @@ def technical_overlay(
         cached["cached"] = True
         return cached
 
-    py_map = _profit_yoy_map(db, [it["symbol"] for it in pool])
-    results, retry_count, computed_count = _compute_tech_map(pool, py_map, force=force)
+    peg_map = _snapshot_peg_map(db, [it["symbol"] for it in pool])
+    results, retry_count, computed_count = _compute_tech_map(pool, peg_map, force=force)
 
     items: list[dict[str, Any]] = []
     for it in pool:
         merged = dict(it)
         merged.update(results.get(it["symbol"]) or {})
+        _gate = merged.get("profile_gate")
         v, v_reasons = _verdict(
             merged.get("composite_score"),
             merged.get("tech_score"),
@@ -796,6 +1136,8 @@ def technical_overlay(
             min_tech=min_tech,
             core=core_score,
             veto=veto_score,
+            tech_blocker=merged.get("tech_blocker"),
+            profile_gate=(tuple(_gate) if _gate else None),
         )
         merged["verdict"] = v
         merged["verdict_label"] = VERDICT_LABELS.get(v, v)
@@ -860,10 +1202,11 @@ def technical_overlay(
             "pattern_hits": sum(1 for it in page_items if it.get("pattern_name")),
             "peg_available": peg_available,
             "peg_note": (
-                "快照均携带净利同比，PEG 完整"
+                "PEG 取自个股分析（3 年净利 CAGR 口径，周期底部/红利资产已豁免），PEG 完整"
                 if peg_available == len(page_items)
-                else f"仅 {peg_available}/{len(page_items)} 只快照携带净利同比（旧快照未落库该字段），"
-                "PEG 缺失的票按保守口径不触发强买入；明日盘后增量批跑后补齐"
+                else f"{peg_available}/{len(page_items)} 只可取到 PEG"
+                "（其余为缺失：负增长/周期底部/红利资产按口径置空，或旧快照未含相对估值）；"
+                "PEG 缺失的票按保守口径不触发强买入——这不是数据缺口，多数是口径豁免"
             ),
         },
         "filters": base.get("filters"),
@@ -876,10 +1219,24 @@ def technical_overlay(
             "分析失败（多为盘后批跑期间的数据库写锁竞争）会串行重试一次，且不写入缓存，"
             "下一次请求即可恢复，不会在缓存周期内固定在「分析失败」。",
             "买点信号口径：强买入=基本面≥80 + PEG<1.5 + 站上MA20 + 近5日量能较20日均量放大20%+；"
-            "观察=基本面≥80 + PEG>2 + 回踩MA60(±3%)缩量；短线博弈=基本面<60 但突破MA20且放量。",
+            "观察=基本面≥80 + PEG>2 + 回踩MA60(±3%)缩量；短线博弈=基本面<60 但突破MA20且放量；"
+            "左侧超跌观察=左侧反转形态达标但收盘仍在MA60下方且当日无量，等放量站上MA60；"
+            "右侧底部企稳=左侧形态 + 站上MA20 + 放量；形态达标待确认=通过候选门槛但形态属延续类，等回踩。"
+            "买点信号是决策的下游：凡通过形态共振候选门槛的票，信号不会停在「趋势未确认」，"
+            "避免出现「决策=买入候选 / 买点=中性」的自相矛盾。"
+            "PEG 取个股分析口径（3 年净利 CAGR 优先；周期底部负增长与红利资产按口径置空，"
+            "不适用 PEG 者不触发该信号，也不另用 PB-ROE 造第二套估值尺子）。",
+            "左侧抄底防守：左侧反转形态（平底锅底部/破低反涨/看涨吞没/启明星/锤子线等）"
+            "若收盘在 MA60 下方且当日量比 <1.2，按「无量确认的下跌中继」处理，"
+            "记 structure_flaw 并让技术面不可评估（与「均线空头排列」同一处置强度）。"
+            "即在 MA60 上方、或当日放量者不受此限。",
             "形态共振口径：Nison 蜡烛+西方指标 bullish 形态（PatternEngine≥60 分），"
             "叠加趋势/动量/波动/量价/结构正交共振（含周线趋势多周期确认），"
-            "组合分 = 形态分 + 有效共振数×6，与「主板战法 / 信号页」同源。",
+            "组合分 = 形态分 + 有效共振数×6，与「主板战法 / 信号页」同源。"
+            "K 线窗口 180 根（≈36 周），与「技术面成文分析」同源——同一只票的周线趋势在两处必须一致。",
+            "量能阈值随量能波动率自适应：k=clip(近20日量能变异系数/0.35, 0.85, 1.25)，"
+            "放量线 1.5k、温和放量线 1.2k、缩量线 0.78/k。量能基线平稳的缩量行情里 "
+            "1.3~1.4 倍即可算有效突破，高波动票则需更大倍数才算「异常」。",
             "行业共振为板块效应统计（同板块≥2 只出现信号才列出），不改变个股信号。",
             f"决策标签（共振过滤法）：基本面 ≥{min_fund:g} 且 技术面 ≥{min_tech:g} → 买入候选；"
             f"两者均 ≥{core_score:g} → 核心持仓；任一 <{veto_score:g} → 淘汰；其余为观察。"
@@ -888,7 +1245,9 @@ def technical_overlay(
             "无达标形态共振时为缺失（不可评估，不赋 0、不赋中性）；"
             "系统候选门槛为 80，故有形态共振者天然 ≥80，"
             f"因此 min_tech={min_tech:g} 在本数据上等价于「有达标形态共振」，真正的区分线是 {core_score:g}。"
-            "「大盘环境」与「资金面」因本数据源无取数链路，未纳入技术面得分。",
+            "大盘环境不改分：指数状态另由 /fundamentals/market-scan/market-regime 以"
+            "展示提示提供（scoring_impact=none），是否据此抬高门槛由使用者决定；"
+            "个股资金面亦不进入技术面得分。",
         ],
     }
     _overlay_cache["ts"] = now
@@ -947,9 +1306,9 @@ def resonance_index_build(
         ]
         if progress:
             progress(0, len(pool), "tech")
-        py_map = _profit_yoy_map(None, [it["symbol"] for it in pool])
+        peg_map = _snapshot_peg_map(None, [it["symbol"] for it in pool])
         results, retry_count, _computed = _compute_tech_map(
-            pool, py_map, force=force, progress=progress
+            pool, peg_map, force=force, progress=progress
         )
 
         items: list[dict[str, Any]] = []
@@ -1031,6 +1390,7 @@ def resonance_view(
             min_market_cap_yi=min_market_cap_yi,
         ):
             continue
+        _gate = raw.get("profile_gate")
         v, reasons = _verdict(
             raw.get("composite_score"),
             raw.get("tech_score"),
@@ -1038,6 +1398,8 @@ def resonance_view(
             min_tech=min_tech,
             core=core_score,
             veto=veto_score,
+            tech_blocker=raw.get("tech_blocker"),
+            profile_gate=(tuple(_gate) if _gate else None),
         )
         counts[v] += 1
         if verdict_filter and v not in VERDICT_FILTERS[verdict_filter]:
@@ -1071,8 +1433,15 @@ def resonance_view(
         "标签只做分类，综合分与技术面原始读数均不改写，不产生第二个综合分。",
         "技术面得分 = 信号页共振组合分（形态分 + 有效共振数×6）截断 0~100，与信号页同源；"
         "无达标形态共振为缺失（不可评估，不赋 0），缺失归入「观察」。",
+        "技术面口径（2026-09-21 修订）：K 线窗口 180 根（≈36 周，周线趋势判定与"
+        "「技术面成文分析」同源）；RSI 命中区间放宽至 28~60 / 40~72 并对弱势区降权 0.6；"
+        "量能阈值随近 20 日量能波动率自适应（k=clip(CV/0.35, 0.85, 1.25)）。",
+        "PEG 取个股分析口径（3 年净利 CAGR 优先；周期底部负增长与红利资产按口径置空），"
+        "扫描层不另算 PEG，也不引入 PB-ROE 等第二套估值尺子。",
         "档位分布统计基于当前筛选条件命中的全部标的（非仅本页）；"
         "「仅看某档」为服务端过滤，翻页 / 计数口径一致。",
+        "大盘环境不参与本视图的分数与阈值；指数状态见"
+        " /fundamentals/market-scan/market-regime（scoring_impact=none）。",
     ]
     stats = dict(_reso_cache["stats"] or {})
     if veto_score < VERDICT_VETO_SCORE:

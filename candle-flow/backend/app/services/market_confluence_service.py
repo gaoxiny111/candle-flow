@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.core.bull_tactics import is_st_name
 from app.core.confluence import SoftConflict, evaluate_confluence
-from app.core.nison_rules import WESTERN_NOT_CANDLES
+from app.core.nison_rules import LEFT_SIDE_BULLISH, WESTERN_NOT_CANDLES
 from app.core.pattern_engine import PatternEngine, kline_to_candles
 from app.database import SessionLocal
 from app.models.stock import StockInfo
@@ -33,7 +33,13 @@ logger = logging.getLogger(__name__)
 
 SCAN_WORKERS = 8
 FUND_WORKERS = 8
-KLINE_LIMIT = 90
+# 180 根日线 ≈ 36 根周线：周线波段判定（is_uptrend/is_downtrend 需 ≥8~10 根周线）
+# 才有足够摆动点，缓跌行情才能被判成 down 而不是 sideways。
+# 90 根时只有 ~18 周，周线硬否决经常失效（002545 案例）。
+# 同时与 tech_narrative.KLINE_LIMIT=180 对齐 —— 同一只票在「技术面成文分析」
+# 与「榜单共振」里必须得到同一个周线趋势，否则又是同一判定两处两值。
+# 库内日线由 fetch_daily(默认 365 天) 累积，通常 ≥240 根，提升窗口不增加取数成本。
+KLINE_LIMIT = 180
 MIN_BARS = 40
 DEFAULT_RECENT_BARS = 2
 # 扫描阶段仍用较低门槛收集候选；展示前再切 S/A/B
@@ -131,11 +137,29 @@ def _detect_buy_signal(
     fundamental_score: float,
     peg: float | None,
     pe: float | None,
+    *,
+    pattern_name: str | None = None,
+    pattern_ready: bool = False,
+    left_side_blocked: bool = False,
+    reduce_window: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """买点信号叠加验证。
-    - 强买入: 基本面≥80 + PEG<1.5 + 突破20日均线 + 成交量放大20%
-    - 观察: 基本面≥80 + PEG>2 + 回踩60日均线缩量
-    - 短线博弈: 基本面<60 + K线突破信号
+
+    档位设计（必须与「决策」列自洽，不允许出现「买入候选 + 中性」的悖论）：
+
+    - ``strong_buy`` 强买入：基本面≥80 + PEG<1.5 + 站上 MA20 + 近5日量能较20日均量 +20%
+    - ``watch``   观察：基本面≥80 + PEG>2 + 回踩 MA60(±3%) 缩量
+    - ``left_side`` 左侧超跌观察：左侧形态达标，但**收盘仍在 MA60 下方且无量**
+      （被趋势确认闸门否决，或虽过门槛而中期趋势尚未修复）—— 等放量站上 MA60
+    - ``bottom_confirm`` 右侧底部企稳：左侧形态 + 站上 MA20 + 放量（趋势已确认）
+    - ``setup_ready`` 形态达标待确认：通过形态共振候选门槛但入场点尚未给出
+      （延续形态等回踩；左侧形态已收复 MA60、只差放量确认）
+    - ``short_term`` 短线博弈：基本面<60 但突破 MA20 且放量
+    - ``neutral`` 趋势未确认：无形态共振，也没触发上面任何一条
+
+    设计要点：**买点信号是「决策」的下游**。决策=买入候选来自形态共振，
+    信号则必须回答「现在能不能下手」；两者若一为「候选」一为「中性」，
+    用户无法判断。故凡通过候选门槛的票，信号至少落到 ``setup_ready``。
     """
     if not klines or len(klines) < 60:
         return {"signal": "insufficient_data", "label": "数据不足"}
@@ -157,26 +181,66 @@ def _detect_buy_signal(
     near_ma60 = ma60 is not None and abs(price - ma60) / ma60 < 0.03 if ma60 else False
     vol_up_20pct = vol_ratio > 0.20
     vol_shrink = vol_ratio < -0.10
+    is_left_side = pattern_name in LEFT_SIDE_BULLISH
+    ma20_txt = f"{ma20:.2f}" if ma20 else "N/A"
+    ma60_txt = f"{ma60:.2f}" if ma60 else "N/A"
 
-    # 强买入信号
+    # ① 左侧超跌观察（最高优先）：技术面已被趋势确认闸门否决，
+    #    买点信号绝不能再报「强买入」，否则决策与信号互相打脸。
+    if left_side_blocked:
+        reasons = [
+            f"形态「{pattern_name or '左侧反转'}」达标，但收盘 {price:.2f} 仍在 MA60={ma60_txt} 下方",
+            f"近5日量能较20日均量{vol_ratio*100:+.0f}%（未放量确认）",
+        ]
+        if not above_ma20:
+            reasons.append(f"且未站上 MA20={ma20_txt}")
+        return {
+            "signal": "left_side",
+            "label": "左侧超跌观察",
+            "reasons": reasons,
+            "note": "左侧抄底：等待放量站上 MA60 再确认，无量视为下跌中继",
+        }
+
+    # ② 强买入信号
     if (
         fundamental_score >= 80
         and peg is not None and peg < 1.5
         and above_ma20
         and vol_up_20pct
     ):
+        _sb_reasons = [
+            f"基本面{fundamental_score:.0f}分（优质）",
+            f"PEG={peg}（<1.5 估值合理）",
+            f"价格{price:.2f} > MA20={ma20_txt}（突破20日均线）",
+            f"近5日量能较20日均量+{vol_ratio*100:.0f}%（放量）",
+        ]
+        # ── 减持窗口期闸门：窗口内封顶「观察」，不改写任何分数 ──────────
+        # 大股东减持窗口期（见 major_risk_events.fetch_reduce_window）内存在
+        # 持续抛压，"强买入"的技术前提虽已满足，但短期胜率被压制。
+        # 处置强度与 profile_gate 同构：**只封顶档位 + 写理由**，不改写
+        # composite_score 与技术面读数（不产生第二个总分）。
+        # 窗口结束后（in_window=False）自动放行，无需人工干预。
+        if reduce_window and reduce_window.get("in_window"):
+            _rd = reduce_window.get("remaining_days")
+            _rd_txt = f"，剩余 {_rd} 天" if _rd else ""
+            return {
+                "signal": "watch",
+                "label": "观察",
+                "reasons": _sb_reasons + [
+                    f"但处于大股东减持窗口期（{reduce_window.get('start')} 至 "
+                    f"{reduce_window.get('end')}{_rd_txt}），窗口期内抛压持续，"
+                    f"暂不给出强买入"
+                ],
+                "note": "技术条件已满足，仅因减持窗口期封顶为观察；窗口结束后自动解除",
+                "gate": "reduce_window",
+            }
         return {
             "signal": "strong_buy",
             "label": "强买入",
-            "reasons": [
-                f"基本面{fundamental_score:.0f}分（优质）",
-                f"PEG={peg}（<1.5 估值合理）",
-                f"价格{price:.2f} > MA20={ma20:.2f}（突破20日均线）",
-                f"近5日量能较20日均量+{vol_ratio*100:.0f}%（放量）",
-            ],
+            "reasons": _sb_reasons,
         }
 
-    # 观察信号
+    # ③ 观察信号
     if (
         fundamental_score >= 80
         and peg is not None and peg > 2.0
@@ -189,13 +253,13 @@ def _detect_buy_signal(
             "reasons": [
                 f"基本面{fundamental_score:.0f}分（优质）",
                 f"PEG={peg}（>2 估值偏高）",
-                f"价格{price:.2f} 回踩 MA60={ma60:.2f}（±3%）",
+                f"价格{price:.2f} 回踩 MA60={ma60_txt}（±3%）",
                 f"近5日量能较20日均量{vol_ratio*100:.0f}%（缩量）",
             ],
             "note": "等待估值消化",
         }
 
-    # 短线博弈（基本面<60 但有技术突破）
+    # ④ 短线博弈（基本面<60 但有技术突破）
     if fundamental_score < 60 and above_ma20 and vol_up_20pct:
         return {
             "signal": "short_term",
@@ -207,21 +271,81 @@ def _detect_buy_signal(
             "note": "严格止损，仅短线",
         }
 
+    # ⑤⑥⑦ 形态阶段化：凡通过形态共振候选门槛者，都必须给出可操作的阶段说明
+    if is_left_side and pattern_ready:
+        if above_ma20 and vol_up_20pct:
+            return {
+                "signal": "bottom_confirm",
+                "label": "右侧底部企稳",
+                "reasons": [
+                    f"左侧形态「{pattern_name}」+ 站上 MA20={ma20_txt}",
+                    f"近5日量能较20日均量+{vol_ratio*100:.0f}%（放量确认）",
+                ],
+                "note": "趋势已由放量站上均线确认",
+            }
+        # 「左侧超跌观察」只留给真正还在 MA60 下方的票 —— 那是「接飞刀」风险
+        # 所在；已经收复 MA60 的（如 603995 甬金股份 26.67 / MA60 23.29）中期
+        # 趋势已修复，只是量能没跟上，标成「左侧超跌」会误导用户以为它还在跌。
+        below_ma60 = ma60 is not None and price < ma60
+        if below_ma60:
+            return {
+                "signal": "left_side",
+                "label": "左侧超跌观察",
+                "reasons": [
+                    f"左侧形态「{pattern_name}」已达标，但收盘 {price:.2f} 仍在 "
+                    f"MA60={ma60_txt} 下方",
+                    f"近5日量能较20日均量{vol_ratio*100:+.0f}%（未放量确认）",
+                ],
+                "note": "左侧抄底：等放量站上 MA60 再确认，无量视为下跌中继",
+            }
+        return {
+            "signal": "setup_ready",
+            "label": "形态达标待确认",
+            "reasons": [
+                f"左侧形态「{pattern_name}」已达标，且已收复 MA60={ma60_txt}"
+                + (f"、站上 MA20={ma20_txt}" if above_ma20 else ""),
+                f"但近5日量能较20日均量仅{vol_ratio*100:+.0f}%（缺放量确认）",
+            ],
+            "note": "底部形态已修复中期趋势，等放量确认后再跟进",
+        }
+    if pattern_ready:
+        return {
+            "signal": "setup_ready",
+            "label": "形态达标待确认",
+            "reasons": [
+                f"形态「{pattern_name or '共振形态'}」通过候选门槛",
+                f"价格{price:.2f} / MA20={ma20_txt}（{'站上' if above_ma20 else '未站上'}）",
+                f"近5日量能较20日均量{vol_ratio*100:+.0f}%",
+            ],
+            "note": "形态未给出手续费级的入场点，等回踩或放量突破再执行",
+        }
+
     # 默认：技术信号描述
     reasons: list[str] = []
     if above_ma20:
-        reasons.append(f"站上MA20({ma20:.2f})")
+        reasons.append(f"站上MA20({ma20_txt})")
     elif ma20:
-        reasons.append(f"低于MA20({ma20:.2f})")
+        reasons.append(f"低于MA20({ma20_txt})")
     if vol_up_20pct:
         reasons.append(f"放量+{vol_ratio*100:.0f}%")
     elif vol_shrink:
         reasons.append(f"缩量{vol_ratio*100:.0f}%")
 
+    # 档位门槛自证：strong_buy / watch 都有硬性前提，缺哪一条用户从「中性」
+    # 二字完全看不出来，会误以为「形态分高却没有买点」是形态逻辑的问题。
+    gate: list[str] = []
+    if fundamental_score < 80:
+        gate.append(f"基本面 {fundamental_score:.0f} < 80")
+    if peg is None:
+        gate.append("PEG 缺失（3年CAGR为负或红利/周期豁免）")
+    if gate:
+        reasons.append("未达强买入/观察档：" + "、".join(gate))
+
     return {
         "signal": "neutral",
-        "label": "中性",
+        "label": "趋势未确认",
         "reasons": reasons or ["无明显技术信号"],
+        "note": "近 2 根 K 线无达标注形态共振，不构成买点",
     }
 
 
@@ -232,6 +356,24 @@ def _extract_fundamental_fields(result: dict[str, Any]) -> dict[str, Any]:
         return {"score": None, "error": result.get("error", "no_composite_score")}
     modules = result.get("modules") or {}
     market = result.get("market") or {}
+    # PEG 直接取个股分析已算好的值（engine._growth_for_peg：3 年净利 CAGR 优先，
+    # 周期底部负 CAGR / 红利资产会被置 None 并附 note）。
+    # 2026-09-21：`_growth_for_peg` 已禁止在「年报窗口存在但负增长/含亏损」时
+    # 退化成单期同比，故这里收到的 None 是「PEG 本就不适用」而非数据缺失。
+    # 绝不用「PE_TTM ÷ 单期净利同比」在此重算 —— 那会让同一只票在
+    # 「个股分析」与「榜单买点信号」出现两个 PEG，且周期股在景气高点失真。
+    #
+    # ⚠ 相对估值块挂在 `valuation` 下：快照 payload 与 engine 返回 dict **都没有**
+    # 顶层 `relative`。2026-09-21 曾误写为 `result.get("relative")`，导致 PEG 恒为
+    # None，买点信号 strong_buy/watch 两档（均硬性要求 peg is not None）静默失效。
+    # 保留顶层回退仅为兼容历史结构，正常情况下走 valuation.relative。
+    rel = (result.get("valuation") or {}).get("relative") or result.get("relative") or {}
+    peg_block = rel.get("PEG") or {}
+    peg_raw = peg_block.get("value")
+    try:
+        peg_val = float(peg_raw) if peg_raw is not None else None
+    except (TypeError, ValueError):
+        peg_val = None
     return {
         "score": float(composite),
         "profitability": (modules.get("profitability") or {}).get("score"),
@@ -241,6 +383,26 @@ def _extract_fundamental_fields(result: dict[str, Any]) -> dict[str, Any]:
         "pe_ttm": market.get("pe_ttm"),
         "industry": result.get("industry") or "",
         "price": market.get("price"),
+        "peg": peg_val,
+        "peg_growth_label": peg_block.get("growth_label"),
+        "peg_note": peg_block.get("note"),
+        # 周期陷阱预警：只在「PE 低分位 + PB 高分位 + 高 ROE」同时成立时置位，
+        # 表示低 PE 来自盈利高点而非资产便宜。读层据此打标签，不改分。
+        "cycle_trap_warning": bool(
+            (result.get("valuation") or {}).get("cycle_trap_warning")
+        ),
+        "cycle_trap_note": (result.get("valuation") or {}).get("cycle_trap_note"),
+        "is_growth_stock": bool((result.get("valuation") or {}).get("is_growth_stock")),
+    }
+
+
+def _fund_peg_info(result: dict[str, Any]) -> dict[str, Any]:
+    """供报告/诊断：PEG 及其口径自证（缺失原因、成长口径标签）。"""
+    fields = _extract_fundamental_fields(result)
+    return {
+        "peg": fields.get("peg"),
+        "growth_label": fields.get("peg_growth_label"),
+        "note": fields.get("peg_note"),
     }
 
 
@@ -349,7 +511,14 @@ class MarketConfluenceService:
             out.append((sym, name))
         return out, filt
 
-    def _scan_job(self, job: _Job) -> tuple[dict | None, Outcome]:
+    def _scan_job(self, job: _Job, diag: dict | None = None) -> tuple[dict | None, Outcome]:
+        """扫描单票的形态共振。
+
+        ``diag`` 为可选的诊断出参（调用方传入 dict 即被填充），用于把
+        「技术面为什么不可评估」的原因带回读层——有达标形态共振、但被
+        「左侧超跌形态防守」否决的票，与「本来就没有形态」的票必须在
+        榜单文案上区分开，否则用户会以为形态逻辑坏了。
+        """
         db = SessionLocal()
         try:
             klines, _ = KlineService(db).get_recent_klines(job.symbol, limit=KLINE_LIMIT)
@@ -373,10 +542,24 @@ class MarketConfluenceService:
                     continue
                 if r.candle_index < min_idx or r.candle_index > last_idx:
                     continue
-                conf = evaluate_confluence(klines, r.candle_index, r.direction)
+                # 决策日 = 最新一根 K 线：左侧超跌形态防守按「今天」的价与量判定，
+                # 形态日的放量不能代表今天仍成立（详见 confluence.evaluate_confluence）。
+                conf = evaluate_confluence(
+                    klines, r.candle_index, r.direction, r.pattern_name,
+                    decision_index=last_idx,
+                )
                 if not conf.ok:
                     continue
+                if diag is not None:
+                    diag["bullish_patterns"] = diag.get("bullish_patterns", 0) + 1
+                left_side_flaws = [
+                    sc
+                    for sc in conf.soft_conflict_items
+                    if sc.kind == "structure_flaw" and "左侧超跌形态" in sc.message
+                ]
                 if not _is_candidate(float(r.score), conf.effective_count, conf.soft_conflict_items):
+                    if diag is not None and left_side_flaws:
+                        diag["left_side_blocked"] = left_side_flaws[0].message
                     continue
                 combined = _combined_score(float(r.score), conf.effective_count, conf.soft_conflict_items)
                 if combined <= best_score:
@@ -405,6 +588,9 @@ class MarketConfluenceService:
                 best["_closes"] = [round(float(k.close), 4) for k in klines]
                 best["_volumes"] = [float(k.volume) for k in klines]
                 return best, "hit"
+            # 入选失败但确实被左侧防守拦下 → 诊断出参留给 _overlay_one 用
+            if diag is not None and diag.get("left_side_blocked"):
+                return None, "left_side_blocked"
             return None, "ok"
         except Exception as exc:
             logger.debug("market confluence scan failed for %s: %s", job.symbol, exc)
@@ -671,7 +857,9 @@ class MarketConfluenceService:
 
             pe = fund.get("pe_ttm")
             profit_yoy = fund.get("profit_yoy")
-            peg = _calc_peg(pe, profit_yoy)
+            # PEG 取个股分析口径（engine 的 3 年 CAGR + 周期/红利豁免），
+            # 与「个股分析」「技术面成文分析」保持同一来源。
+            peg = fund.get("peg")
 
             enriched = {
                 "symbol": sym,

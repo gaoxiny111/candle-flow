@@ -1,0 +1,16 @@
+=== 1. restart vs source mtime ===
+ExecMainStartTimestamp=Mon 2026-09-21 15:56:18 CST
+2026-09-21 15:48:51.000000000 +0800  app/core/confluence.py
+2026-09-21 15:52:34.000000000 +0800  app/services/market_scan.py
+2026-09-21 15:51:05.000000000 +0800  app/services/market_regime.py
+2026-09-21 15:49:50.000000000 +0800  app/services/market_confluence_service.py
+=== 2. health ===
+{"code":200,"message":"success","data":{"status":"ok","db":"connected","akshare":"available"},"meta":null}
+=== 3. kline depth (180-bar window needs >=180) ===
+600519.SH bars = 256
+002545.SZ bars = 257
+603136.SH bars = 257
+000300.SH bars = 0
+000001.SH bars = 242
+=== 4. market regime ===
+{"code":200,"message":"success","data":{"regime":"neutral","label":"震荡","advice":"大盘区间震荡，共振信号需要基本面支撑，不宜单靠技术面追高。","items":[{"symbol":"000300.SH","name":"沪深300","bars":180,"regime":"risk_off","label":"偏空","trend":"bear","weekly_trend":"down","close":4539.57,"ma20":4547.49,"ma60":4648.38,"change_20d_pct":-0.52,"reason":"收盘 4539.57，MA20 4547.49，MA60 4648.38（空头排列）；周线向下；近 20 日 -0.52%"},{"symbol":"000001.SH","name":"上证指数","bars":180,"regime":"neutral","label":"震荡","trend":"range","weekly_trend":"down","close":3986.3,"ma20":3924.9,"ma60":3957.17,"change_20d_pct":4.64,"reason":"收盘 3986.30，MA20 3924.90，MA60 3957.17（均线纠缠）；周线向下；近 20 日 +4.64%"}],"rule":"单指数：收盘 > MA20 > MA60 且（周线向上 或 20 日涨幅>0）→ 偏多；收盘 < MA20 < MA60 且（周线向下 或 20 日涨幅<0）→ 偏空；其余为震荡。两指数合成：全部偏空 → 偏空；全部偏多 → 偏多；不一致 → 震荡。","scoring_impact":"none","note":"大盘环境**不参与**技术面得分与任何阈值，仅作展示提示；是否按其建议调整门槛（min_tech）由使用者决定，系统不会自动改写。","cached":false,"cache_age_sec":0},"meta":null}

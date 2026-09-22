@@ -123,6 +123,117 @@ export const syncKline = async (symbol: string, force = true) => {
   return { data: checkApi(res) }
 }
 
+export interface TechNarrativeLevel {
+  price: number
+  source: string
+  note: string
+}
+
+export interface TechNarrativeFundFlowDay {
+  date: string
+  main: number | null
+  main_ratio: number | null
+  xlarge: number | null
+  large: number | null
+  mid: number | null
+  small: number | null
+  close: number | null
+  chg: number | null
+}
+
+export interface TechNarrativeFundFlow {
+  as_of: string
+  source: string
+  updated_at: string
+  main: {
+    as_of: string
+    close: number | null
+    chg: number | null
+    latest_net: number | null
+    latest_ratio: number | null
+    net_5d: number | null
+    net_10d: number | null
+    net_5d_prev: number | null
+    ratio_5d_avg: number | null
+    streak_days: number
+    streak_dir: string
+    inflow_days_5d: number | null
+    xlarge_5d: number | null
+    large_5d: number | null
+    series: TechNarrativeFundFlowDay[]
+  } | null
+  margin: {
+    date: string
+    balance: number | null
+    balance_chg_5d: number | null
+    net_5d: number | null
+    net_10d: number | null
+    net_latest: number | null
+    buy_latest: number | null
+    balance_ratio: number | null
+    short_volume: number | null
+    short_chg_5d: number | null
+    short_balance: number | null
+    series: { date: string; balance: number | null; net: number | null; short_volume: number | null }[]
+  } | null
+  lhb: {
+    date: string
+    reason: string
+    net_buy: number | null
+    buy_amt: number | null
+    sell_amt: number | null
+    days_ago: number
+  } | null
+  texts: { main: string; margin: string; lhb: string; stance: string }
+}
+
+export interface TechNarrative {
+  ok: boolean
+  reason?: string
+  symbol: string
+  name: string
+  as_of: string
+  close: number
+  trend: {
+    align: string
+    weekly: string
+    chg5: number | null
+    chg20: number | null
+    ma5: number | null
+    ma10: number | null
+    ma20: number | null
+    ma60: number | null
+    close: number
+    summary: string
+  }
+  patterns: { date: string; direction: string; name: string; score: number }[]
+  guard_note: string
+  indicators: {
+    macd?: {
+      available: boolean
+      dif: number
+      dea: number
+      hist: number
+      state: string
+      cross: string
+      bar_note: string
+    }
+    rsi: number | null
+    rsi_text: string
+    stoch?: { k: number; d: number } | null
+    boll?: { position: string; mid: number | null; upper: number | null; lower: number | null }
+    volume?: { available: boolean; ratio: number; label: string } | null
+  }
+  levels: { supports: TechNarrativeLevel[]; resistances: TechNarrativeLevel[] }
+  fund_flow: TechNarrativeFundFlow | null
+  verdict: { short_term: string; mid_term: string; actions: string[] }
+  note: string
+}
+
+export const fetchTechNarrative = (symbol: string) =>
+  api.get<ApiResponse<TechNarrative>>('/kline/tech-narrative', { params: { symbol } })
+
+
 export const fetchPatterns = (symbol?: string, watchlistOnly = false, symbols?: string[]) =>
   api.get<ApiResponse<PatternItem[]>>('/patterns', {
     params: {
@@ -1360,7 +1471,11 @@ export const fetchMarketCoverage = async () => {
 export interface MarketScanOverlayFields {
   /** 本地K线根数；0 = 无K线（非主板同步范围） */
   kline_bars: number
-  /** strong_buy / watch / short_term / neutral / insufficient_data */
+  /**
+   * strong_buy 强买入 / bottom_confirm 右侧底部企稳 / watch 观察 /
+   * left_side 左侧超跌观察 / setup_ready 形态达标待确认 / short_term 短线博弈 /
+   * neutral 趋势未确认 / insufficient_data 数据不足
+   */
   buy_signal: string | null
   buy_label: string | null
   buy_reasons: string[]
@@ -1379,6 +1494,14 @@ export interface MarketScanOverlayFields {
    * 不赋 0、不赋中性）。系统候选门槛为 80，故有形态共振者天然 ≥80。
    */
   tech_score: number | null
+  /**
+   * 技术面为 null 时的**否决原因**（目前仅「左侧超跌形态防守」会填）。
+   * 与「本来就没有形态」是不同信息，前端 verdict_reasons 会据此区分文案。
+   */
+  tech_blocker?: string | null
+  /** 周期陷阱预警：PE 低分位 + PB 高分位 + 高 ROE 同时成立 */
+  cycle_trap_warning?: boolean
+  cycle_trap_note?: string | null
   /** core（核心持仓）/ candidate（买入候选）/ watch（观察）/ eliminated（淘汰） */
   verdict: MarketScanVerdict
   verdict_label: string
@@ -1561,6 +1684,50 @@ export const fetchResonanceProgress = async (jobId?: string) => {
   const res = await api.get<ApiResponse<ResonanceJobStatus | { status: string }>>(
     '/fundamentals/market-scan/resonance/progress',
     { params: { job_id: jobId || undefined }, timeout: 15000 },
+  )
+  return { data: checkApi(res) }
+}
+
+/** 单指数环境读数 */
+export interface MarketRegimeIndex {
+  symbol: string
+  name: string
+  bars: number
+  /** 最新一根的交易日（自证取数基准） */
+  as_of?: string | null
+  /** 是否落后于最新交易日（落后则被排除在合成之外） */
+  stale?: boolean
+  regime: 'risk_on' | 'neutral' | 'risk_off' | 'unknown'
+  label?: string
+  trend?: 'bull' | 'bear' | 'range'
+  weekly_trend?: string
+  close?: number
+  ma20?: number | null
+  ma60?: number | null
+  change_20d_pct?: number | null
+  reason?: string
+}
+
+/** 大盘环境提示；scoring_impact 恒为 none（不参与任何打分） */
+export interface MarketRegimeData {
+  regime: 'risk_on' | 'neutral' | 'risk_off' | 'unknown'
+  label: string
+  advice: string
+  items: MarketRegimeIndex[]
+  rule: string
+  /** 本次合成实际使用的指数与各自的数据截止日 */
+  basis?: string
+  stale_indexes?: string[]
+  scoring_impact: 'none'
+  note: string
+  cached: boolean
+  cache_age_sec: number
+}
+
+export const fetchMarketRegime = async (force = false) => {
+  const res = await api.get<ApiResponse<MarketRegimeData>>(
+    '/fundamentals/market-scan/market-regime',
+    { params: { force }, timeout: 30000 },
   )
   return { data: checkApi(res) }
 }

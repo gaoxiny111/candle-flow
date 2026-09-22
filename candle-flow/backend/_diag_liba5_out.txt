@@ -1,0 +1,16 @@
+=== 1. 公告原文（含减持窗口期）===
+公告数: 50
+  [2026-08-25] 立霸股份:关于控股股东一致行动人减持股份计划公告
+      art_code=AN202608241828367755
+
+=== 2. 公告正文（试抓取减持公告全文，看能否解析日期）===
+正文长度: 2272
+日期区间候选: [('2026 年 9 月 16 日', '2026 年 12 月 15 日')]
+片段:  证券代码：603519        证券简称：立霸股份      公告编号：2026-039            江苏立霸实业股份有限公司    关于控股股东一致行动人减持股份计划公告    本公司董事会、全体董事及相关股东保证本公告内容不存在任何虚假记载、误导性陈述或者重大遗漏，并对其内容的真实性、准确性和完整性承担法律责任。 重要内容提示：         股东的基本情况：              截止本公告发布之日，股东蒋达伟先生持有江苏立霸实业股份有         限公司（以下简称“公司”）无限售条件流通股 11,789,904 股，占公司         总股本的 4.43%。本次拟减持的股份来源：IPO 前取得(含 IPO 后资本         公积转增股本取得)。         减持计划的主要内容：              股东蒋达伟先生本次拟减持的股份数量：不超过 7,989,834 股，         通过竞价交易减持的，在任意连续 90 日内减持的股份总数不超过公司         股份总数的 1%；通过大宗交易方式减持的
+
+=== 3. 大宗交易接口探测 ===
+  RPT_DATA_BLOCKTRADE: OK, 5 行
+   keys: ['BUYER_CODE', 'BUYER_NAME', 'CHANGE_RATE', 'CHANGE_RATE_10DAYS', 'CHANGE_RATE_1DAYS', 'CHANGE_RATE_20DAYS', 'CHANGE_RATE_5DAYS', 'CLOSE_PRICE', 'DAILY_RANK', 'DEAL_AMT', 'DEAL_PRICE', 'DEAL_VOLUME', 'DISCOUNT_RATIO', 'DISCOUNT_TURNOVER', 'FREE_SHARES_RATIO', 'INDEX_CLOSE', 'IS_SYSDATE', 'PREMIUM_RATIO', 'PREMIUM_TURNOVER', 'PRE_CLOSE_PRICE', 'QUOTES_CODE', 'SECUCODE', 'SECURITY_CODE', 'SECURITY_INNER_CODE', 'SECURITY_NAME_ABBR']
+   sample: {"SECUCODE": "603519.SH", "SECURITY_INNER_CODE": "1000323781", "SECURITY_CODE": "603519", "SECURITY_NAME_ABBR": "立霸股份", "SECURITY_TYPE": "EQA", "TRADE_DATE": "2026-09-16 00:00:00", "DEAL_PRICE": 13.47, "PREMIUM_RATIO": -0.091706001349, "DEAL_VOLUME": 1997400, "DEAL_AMT": 26905000, "BUYER_NAME": "国泰海通证券股份有限公司上海长宁区江苏路证券营业部", "SELLER_NAME": "华泰证券股份有限公司无锡解放西路证券营业部"}
+  RPT_BLOCKTRADE_DETAIL: 无数据 / 报表配置不存在,RPT_BLOCKTRADE_DETAIL
+  RPT_DMSK_BLOCKTRADE: 无数据 / 报表配置不存在,RPT_DMSK_BLOCKTRADE

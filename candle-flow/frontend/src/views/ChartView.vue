@@ -7,6 +7,7 @@ import RiskCalculator from '@/components/RiskCalculator.vue'
 import IndicatorOverlay from '@/components/IndicatorOverlay.vue'
 import SymbolSearch from '@/components/SymbolSearch.vue'
 import FundamentalPanel from '@/components/FundamentalPanel.vue'
+import TechNarrative from '@/components/TechNarrative.vue'
 import { useKlineStore } from '@/stores/kline'
 import { usePatternStore } from '@/stores/pattern'
 import { useSignalStore } from '@/stores/signal'
@@ -313,6 +314,10 @@ watch(symbol, (s) => {
         </aside>
       </div>
 
+      <div v-if="!isIndexSymbol(symbol) && !isEtf" class="tech-narrative-slot">
+        <TechNarrative :symbol="symbol" />
+      </div>
+
       <div class="pattern-filter card">
         <span>形态筛选:</span>
         <select v-model="pattern.filterDirection" @change="pattern.updateFilter(pattern.filterDirection, pattern.filterStatus)">
@@ -388,6 +393,7 @@ watch(symbol, (s) => {
 .quote-chip.flat { color: var(--text-secondary); }
 .input-error { color: #f5222d; font-size: 13px; }
 .main-layout { display: grid; grid-template-columns: 1fr 320px; gap: var(--space-md); min-height: 500px; }
+.tech-narrative-slot { margin-top: var(--space-md); }
 .chart-area { padding: 0; overflow: hidden; min-height: 720px; }
 .sidebar { display: flex; flex-direction: column; gap: var(--space-md); }
 .pattern-filter { display: flex; align-items: center; gap: var(--space-md); font-size: 14px; }

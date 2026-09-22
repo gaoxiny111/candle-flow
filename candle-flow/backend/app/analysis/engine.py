@@ -125,6 +125,51 @@ def rating_label(score: float) -> str:
 
 RATING_ORDER = ("A", "A-", "B+", "B", "B-", "C", "D", "E")
 
+# ── 周期陷阱（低 PE 幻觉）识别 ─────────────────────────────────────
+# 强周期行业在景气高点利润暴增 → trailing PE 极低（看起来「便宜」），
+# 但紧接着就是业绩下滑 + 杀估值，把低 PE 当成「低估」加分是逻辑反向。
+# 判别不用 fuzz 关键词，而用三件事同时成立：
+#   ① PE 历史分位 ≤ 30%（看起来便宜）
+#   ② PB 历史分位 ≥ 70%（资产端并不便宜 —— 这才是周期高点的真信号：
+#      市场已经按高点 ROE 抬高了 PB，便宜只体现在 PE 上）
+#   ③ ROE ≥ 15%（盈利确实处于高位）
+# PB 分位是这里的关键辨伪项：真周期底部（万华化学 PE分位 27/PB分位 7、
+# 璞泰来 PE分位 6/PB分位 16）PE 与 PB 都在低分位，只有「PE 低 + PB 高」
+# 才是盈利驱动型的假便宜。
+# 只对 STRONG_CYCLICAL_INDUSTRIES 生效（**精确等于**行业名，不做子串模糊匹配），
+# 折扣与现金流折减取 max 而非叠加。
+CYCLE_TRAP_PE_PCT_MAX = 30.0
+CYCLE_TRAP_PB_PCT_MIN = 70.0
+CYCLE_TRAP_ROE_MIN = 15.0
+CYCLE_TRAP_HAIRCUT = 12.0
+# 估值合理性折减的全局上限（现金流折减与周期陷阱折减共用，禁止叠加）
+VALUATION_HAIRCUT_MAX = 22.0
+
+# 强周期行业名录。**取值必须精确等于快照 payload 里的 `industry` 字符串**
+# （2026-09-21 线上盘点的 129 个行业名，共 5254 只全覆盖）。
+# 刻意用精确匹配而非 `_cycle_kw` 那样的子串判断：子串表对真实行业名
+# （特钢Ⅱ / 化学原料 / 化学制品 / 工业金属）几乎全不命中 —— 实测原
+# `_cycle_kw` 只覆盖 86 只（1.6%），而 `特钢Ⅱ` 里根本没有「钢铁」二字。
+# 本名单只收「产品价格周期主导盈利」的行业，不含半导体/电池等
+# 兼具成长属性的板块（那类有独立的成长股估值框架）。
+STRONG_CYCLICAL_INDUSTRIES = frozenset({
+    # 钢铁
+    "普钢", "特钢Ⅱ", "冶钢原料",
+    # 有色 / 金属
+    "工业金属", "小金属", "能源金属", "贵金属", "金属新材料",
+    # 煤炭
+    "煤炭开采", "焦炭Ⅱ",
+    # 化工 / 建材
+    "化学原料", "化学制品", "化学纤维", "农化制品", "塑料", "橡胶",
+    "玻璃玻纤", "水泥", "非金属材料Ⅱ",
+    # 石油天然气
+    "炼化及贸易", "油服工程", "油气开采Ⅱ",
+    # 交运（运价 / 油价周期）
+    "航运港口", "航空机场",
+    # 其他强周期
+    "房地产开发", "造纸", "养殖业", "纺织制造",
+})
+
 
 def downgrade_rating(letter: str, steps: int = 1) -> str:
     """字母评级下调 steps 档（最低 E）。"""
@@ -140,6 +185,114 @@ def _penalized_module_score(score: float) -> float:
     if score < E_GRADE_SCORE:
         return score * E_GRADE_PENALTY
     return score
+
+
+# 成长股估值软化：绝对估值越高，允许的历史分位上限越低（阶梯）。
+# 软化本意是「trailing PE 因周期底部/盈利拐点暂时失真」，但该敞口曾被滥用：
+# 只要 PE > 80 且分位 < 90 就把 signal 洗成「合理」，于是 603099 长白山
+# （PE 80.6 / 分位 86.1）这类「绝对 + 相对双高」的票也被判「合理」。
+# 改为双条件交叉：绝对估值档位决定分位门槛，双高即判「偏高」。
+SOFTEN_MAX_PCTL = 90.0          # 历史常量，保留兼容既有引用
+SOFTEN_PE_HIGH = 80.0           # 进入软化讨论的绝对 PE 下限
+SOFTEN_PE_EXTREME = 150.0       # 绝对 PE 极端档
+SOFTEN_PCTL_PE_HIGH = 80.0      # PE 80~150 档允许的分位上限
+SOFTEN_PCTL_PE_EXTREME = 70.0   # PE >150 档允许的分位上限
+SOFTEN_PCTL_PB = 80.0           # PB >8 档允许的分位上限
+
+
+def _pick_percentile(entry: dict[str, Any]) -> float | None:
+    """从相对估值条目里取历史分位（兼容多种字段名）。"""
+    for k in ("percentile_5y", "percentile", "percentile_10y"):
+        v = entry.get(k)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _apply_valuation_soften_ladder(
+    rel: dict[str, Any],
+    *,
+    pe: float | None,
+    pb: float | None,
+    is_growth: bool,
+    is_div: bool,
+) -> None:
+    """就地改写 ``rel`` 中 PE_TTM / PB 的 signal 与 note（阶梯软化）。
+
+    仅对成长股（且非红利资产）生效；非成长股不动，避免退化成
+    「PE 高 → 算成长 → 免惩罚」的自证循环。
+    """
+    if not is_growth or is_div:
+        return
+    for mk in ("PE_TTM", "PB"):
+        if mk not in rel or not isinstance(rel[mk], dict):
+            continue
+        entry = rel[mk]
+        pctl = _pick_percentile(entry)
+        if mk == "PE_TTM" and pe is not None and float(pe) > SOFTEN_PE_HIGH:
+            limit = (
+                SOFTEN_PCTL_PE_EXTREME
+                if float(pe) > SOFTEN_PE_EXTREME
+                else SOFTEN_PCTL_PE_HIGH
+            )
+            if pctl is not None and pctl >= limit:
+                entry["signal"] = "偏高"
+                entry["note"] = (
+                    f"PE {float(pe):.0f}x 且历史分位 {pctl:.0f}%（≥{limit:.0f}%）"
+                    "已处双高区间：成长预期已被充分定价，不再适用成长股软化口径"
+                )
+            else:
+                entry["signal"] = "合理"
+                entry["growth_percentile_softened"] = True
+                entry["note"] = (
+                    f"PE {float(pe):.0f}x 为周期底部/高增长特征，"
+                    "trailing PE 失真，参考 PS/营收增速/毛利率"
+                    + (f"（历史分位 {pctl:.0f}% < {limit:.0f}%）" if pctl is not None else "")
+                )
+        elif mk == "PB" and pb is not None and float(pb) > 8:
+            if pctl is not None and pctl >= SOFTEN_PCTL_PB:
+                entry["signal"] = "偏高"
+                entry["note"] = (
+                    f"PB {float(pb):.1f}x 且历史分位 {pctl:.0f}%"
+                    f"（≥{SOFTEN_PCTL_PB:.0f}%）已处双高区间：不再适用成长股软化口径"
+                )
+            else:
+                entry["signal"] = "合理"
+                entry["growth_percentile_softened"] = True
+                entry["note"] = (
+                    f"PB {float(pb):.1f}x 为成长股/周期底部特征，"
+                    "参考技术壁垒（毛利率）与赛道景气度"
+                    + (f"（历史分位 {pctl:.0f}% < {SOFTEN_PCTL_PB:.0f}%）" if pctl is not None else "")
+                )
+
+
+def cycle_trap_hit(
+    pe_pct: float | None,
+    pb_pct: float | None,
+    roe: float | None,
+) -> bool:
+    """周期景气高点的「低 PE 幻觉」判据。
+
+    三件事同时成立才算：
+      ① PE 历史分位 ≤ CYCLE_TRAP_PE_PCT_MAX（看起来便宜）
+      ② PB 历史分位 ≥ CYCLE_TRAP_PB_PCT_MIN（资产端并不便宜）
+      ③ ROE ≥ CYCLE_TRAP_ROE_MIN（盈利确实在高位）
+
+    ②是关键辨伪项：真周期底部（盈利差、ROE 低、市场给低 PB）时 PE 与 PB
+    都在低分位；只有「PE 低分位 + PB 高分位 + 高 ROE」才说明便宜来自盈利
+    高点而非资产便宜 —— 这正是后续要被杀估值的位置。
+    任一输入缺失即返回 False（不猜、不给缺失数据加权）。
+    """
+    if pe_pct is None or pb_pct is None or roe is None:
+        return False
+    return (
+        float(pe_pct) <= CYCLE_TRAP_PE_PCT_MAX
+        and float(pb_pct) >= CYCLE_TRAP_PB_PCT_MIN
+        and float(roe) >= CYCLE_TRAP_ROE_MIN
+    )
 
 
 class FundamentalEngine:
@@ -220,6 +373,23 @@ class FundamentalEngine:
         if symbol_roe is None and not fin_df.empty and "roe" in fin_df.columns:
             symbol_roe = float(fin_df["roe"].iloc[-1])
 
+        # 微利稀释闸门判据（cashflow.py MICRO_PROFIT_*）：最新报告期净利率百分数。
+        # 现金流模块在模块循环内运行，无法读取「盈利模块算完后」才知道的值，
+        # 因此这里直接从 fin_df 取（与盈利模块 dupont.net_margin 同源同口径：
+        # net_profit / revenue 的最新一期），保证两处一致且不依赖模块顺序。
+        net_margin_pct: float | None = None
+        if (
+            not fin_df.empty
+            and "net_profit" in fin_df.columns
+            and "revenue" in fin_df.columns
+        ):
+            _rev_latest = fin_df["revenue"].dropna()
+            _np_latest = fin_df["net_profit"].dropna()
+            if len(_rev_latest) and len(_np_latest) and float(_rev_latest.iloc[-1]) != 0:
+                net_margin_pct = (
+                    float(_np_latest.iloc[-1]) / float(_rev_latest.iloc[-1]) * 100.0
+                )
+
         ctx = {
             "debt_ratio": meta.get("debt_ratio"),
             "debt_ratio_estimated": meta.get("debt_ratio_estimated", False),
@@ -230,6 +400,8 @@ class FundamentalEngine:
             "profit_yoy_forward": meta.get("profit_yoy_forward"),
             "profit_yoy_extreme": bool(meta.get("profit_yoy_extreme")),
             "ocf_per_share": meta.get("ocf_per_share"),
+            # 微利稀释闸门判据（cashflow.py MICRO_PROFIT_*）：最新报告期净利率百分数。
+            "net_margin": net_margin_pct,
             "latest_roe": meta.get("latest_roe"),
             "latest_report": meta.get("latest_report"),
             "annual_dates": meta.get("annual_dates") or meta.get("report_dates") or [],
@@ -250,10 +422,18 @@ class FundamentalEngine:
             "pledge_ratio": major_risks.get("pledge_ratio") or 0,
             "pledge_invalid": bool(major_risks.get("pledge_invalid")),
             "major_risk_events": major_risks.get("events") or [],
+            "survival_released_labels": major_risks.get("released_labels") or [],
+            "survival_released_count": int(major_risks.get("survival_released_count") or 0),
             "observe_risk_events": major_risks.get("observe_events") or [],
             "risk_released": bool(major_risks.get("risk_released")),
             "risk_lock_commitment": bool(major_risks.get("risk_lock_commitment")),
             "risk_release_type": major_risks.get("risk_release_type") or "",
+            # 减持窗口期倒计时 + 大宗交易折价率（供 risk 模块计价、前端展示）
+            "reduce_window": major_risks.get("reduce_window"),
+            "reduce_remaining_days": major_risks.get("reduce_remaining_days"),
+            "in_reduce_window": bool(major_risks.get("in_reduce_window")),
+            "latest_block_trade": major_risks.get("latest_block_trade"),
+            "block_trades": major_risks.get("block_trades") or [],
             "latest_cash_ratio": meta.get("latest_cash_ratio"),
             "latest_cash_ratio_source": meta.get("latest_cash_ratio_source"),
             "eps": meta.get("eps"),
@@ -262,11 +442,20 @@ class FundamentalEngine:
             "deducted_yoy_pct": meta.get("deducted_yoy_pct"),
             "single_quarter": meta.get("single_quarter"),
             "ar_metrics": meta.get("ar_metrics"),
+            # 营运效率跟踪（应收周转天数变化率 / 存货营收比），供 efficiency
+            # 模块做利润侵蚀预警。口径由 financials._ops_efficiency_from_sina
+            # 统一产出（同期对同期），模块侧只消费不重算。
+            "ops_efficiency": meta.get("ops_efficiency"),
             "payout_ratio_pct": meta.get("payout_ratio_pct"),
             "dividend_info": meta.get("dividend"),
             "interim_balance_sheet": meta.get("interim_balance_sheet"),
             "dividend_yield": market.get("dividend_yield"),
             "pe_ttm": market.get("pe_ttm"),
+            # PB 供「周期底部反转」判定用（growth_profile.CYCLE_TROUGH_PB_MAX）：
+            # 周期底部 E→0 时 PE 失效，必须用 PB 判断市场是否已定价衰退。
+            # 传给所有模块是为了让各处的 classify_growth_stock 得到同一结论
+            # （同一判定不在两处各算、不产生两个 is_growth）。
+            "pb": market.get("pb"),
             "latest_gross_margin": meta.get("latest_gross_margin"),
             "industry_avg": industry_averages(meta.get("industry", ""), meta.get("latest_report")),
             **kwargs,
@@ -287,6 +476,10 @@ class FundamentalEngine:
             meta["_growth_cagr_3y"] = _gm.metadata.get("profit_cagr_3y")
             meta["_growth_v_shape"] = bool(_gm.metadata.get("v_shape"))
             meta["_growth_marginal_recovery"] = bool(_gm.metadata.get("marginal_recovery"))
+        # 净利率已在算 ctx 前由 fin_df 直接算出并透传（见上方 net_margin_pct），
+        # 此处仅把百分数口径写回现金流 metadata 留痕，便于报告自证闸门判据。
+        if cf is not None and net_margin_pct is not None:
+            cf.metadata["net_margin_pct"] = net_margin_pct
         valuation = self._run_valuation(
             fin_df,
             market,
@@ -357,6 +550,7 @@ class FundamentalEngine:
             if growth_mod
             else None,
             pe_ttm=market.get("pe_ttm"),
+            pb=market.get("pb"),
             is_v_shape=bool(growth_mod.metadata.get("v_shape")) if growth_mod else False,
             is_marginal_recovery=bool(growth_mod.metadata.get("marginal_recovery"))
             if growth_mod
@@ -437,6 +631,22 @@ class FundamentalEngine:
             )
             if module_results.get("risk") is not None:
                 module_results["risk"].metadata["compliance_veto"] = True
+
+        # 生存级风险的解除留痕：已撤销/已消除的生存级事项不再一票否决，
+        # 但必须在报告里显式呈现解除依据（否则用户无法判断"低分是否已过时"）。
+        released_survival = major_risks.get("events_released") or []
+        if released_survival:
+            rel_lines = [
+                (
+                    f"〔已解除〕【{ev.get('label')}】"
+                    f"{ev.get('release_date') or ''} {ev.get('release_title') or ''}"
+                    f"（原风险公告 {ev.get('notice_date') or '日期未披露'}）"
+                ).strip()
+                for ev in released_survival
+            ]
+            for line in reversed(rel_lines):
+                if line and line not in all_warnings:
+                    all_warnings.insert(0, line)
 
         observe_events = major_risks.get("observe_events") or []
         if observe_events and not compliance_veto:
@@ -730,6 +940,7 @@ class FundamentalEngine:
             is_v_shape=bool(meta.get("_growth_v_shape")),
             is_marginal_recovery=bool(meta.get("_growth_marginal_recovery")),
             pe_ttm=pe,
+            pb=pb,
             is_high_growth_quality=bool(result.get("is_high_growth_quality")),
             is_dividend_asset=is_div,
         )
@@ -741,24 +952,26 @@ class FundamentalEngine:
         is_cycle_val = any(k in str(meta.get("industry") or "") for k in _cycle_kw)
 
         # ── 成长股：PE/PB 极端值（周期底部/高增长）不直接判高估 ─────
+        # 前提：is_growth 已由 growth_profile 严格认定（含 PB≤CYCLE_TROUGH_PB_MAX
+        # 的周期底部校验），不再是「PE 高 → 算成长股 → 免 PE 惩罚」的自证循环。
+        # 即便 is_growth 为真，仍需交叉校验历史分位：软化只适用于
+        # 「绝对估值高但历史分位不极端」的成长股；若分位本身已在 90% 以上，
+        # 说明市场已把成长预期充分定价，不能再以「成长股」为由洗白（否则
+        # 越贵的票越宽松，正是 600722 金牛化工那类高 PE 高 PB 票的漏洞）。
+        # 门槛按「绝对估值有多贵」分档（阶梯），而不是单一 90% 常量：
+        #   PE > 150        → 分位 ≥ 70 即判偏高（绝对估值已是天文数字，
+        #                     分位不高往往只因自身盈利塌陷拉高了历史基数）
+        #   PE 80 ~ 150     → 分位 ≥ 80 即判偏高（长白山 PE 80.6 / 分位 86.1
+        #                     落在此档：绝对与相对双双高企，不应软化）
+        #   PB > 8 同理     → 分位 ≥ 80
+        # 依据：软化本意是「trailing PE 因周期底部/盈利拐点暂时失真」，
+        # 而「绝对估值极高 + 历史分位偏高」是双重确认的贵，属于该敞口被滥用
+        # 的典型（600722 金牛化工 PE 193、603099 长白山 PE 80.6 皆属此列）。
         if is_growth and not is_div:
-            for _mk in ("PE_TTM", "PB"):
-                if _mk in rel:
-                    if _mk == "PE_TTM" and pe is not None and float(pe) > 80:
-                        rel[_mk]["signal"] = "合理"
-                        rel[_mk]["growth_percentile_softened"] = True
-                        rel[_mk]["note"] = (
-                            f"PE {float(pe):.0f}x 为周期底部/高增长特征，"
-                            "trailing PE 失真，参考 PS/营收增速/毛利率"
-                        )
-                    elif _mk == "PB" and pb is not None and float(pb) > 8:
-                        rel[_mk]["signal"] = "合理"
-                        rel[_mk]["growth_percentile_softened"] = True
-                        rel[_mk]["note"] = (
-                            f"PB {float(pb):.1f}x 为成长股/周期底部特征，"
-                            "参考技术壁垒（毛利率）与赛道景气度"
-                        )
-            if "PEG" in rel and (
+            _apply_valuation_soften_ladder(
+                rel, pe=pe, pb=pb, is_growth=is_growth, is_div=is_div
+            )
+        if is_growth and not is_div and "PEG" in rel and (
                 rel["PEG"].get("growth_rate") is not None
                 and float(rel["PEG"]["growth_rate"]) <= 0
             ):
@@ -1048,11 +1261,40 @@ class FundamentalEngine:
                 (rel.get(k) or {}).get("signal") == "低估" for k in ("PE_TTM", "PB", "PEG")
             ) or base_score >= 70
             if cheap_looking or base_score >= 60:
-                haircut = min(22.0, max(8.0, (45.0 - float(cashflow_score)) * 0.55))
+                haircut = min(
+                    VALUATION_HAIRCUT_MAX, max(8.0, (45.0 - float(cashflow_score)) * 0.55)
+                )
                 rationale_parts.append(
                     f"现金流质量仅 {cashflow_score:.0f} 分，估值合理性折减 {haircut:.0f} 分"
                     f"（账面估值偏便宜但造血不足）"
                 )
+
+        # ── 周期陷阱折减：与现金流折减取 max，不叠加 ──────────────────
+        # 单只票在两个理由同时成立时只吃一次折减，避免惩罚叠加把周期股
+        # 一路打到地板（铁律：惩罚有限度、禁止叠加）。
+        cycle_haircut = 0.0
+        _ind_c = str(meta.get("industry") or "").strip()
+        if _ind_c in STRONG_CYCLICAL_INDUSTRIES and not is_div:
+            pe_pct_c = (rel.get("PE_TTM") or {}).get("percentile_5y")
+            pb_pct_c = (rel.get("PB") or {}).get("percentile_5y")
+            roe_c_raw = meta.get("latest_roe")
+            roe_c = float(roe_c_raw) if roe_c_raw is not None else None
+            if cycle_trap_hit(pe_pct_c, pb_pct_c, roe_c):
+                cycle_haircut = CYCLE_TRAP_HAIRCUT
+                result["cycle_trap_warning"] = True
+                result["cycle_trap_note"] = (
+                    f"{_ind_c}：PE 历史分位 {float(pe_pct_c):.0f}%（低）但 PB 历史分位 "
+                    f"{float(pb_pct_c):.0f}%（高）、ROE {roe_c:.1f}%，"
+                    "典型景气高点特征，低 PE 不等于低估"
+                )
+                rationale_parts.append(
+                    result["cycle_trap_note"] + f"，估值合理性折减 {cycle_haircut:.0f} 分"
+                )
+        if cycle_haircut > haircut:
+            haircut = cycle_haircut
+            # 周期折减胜出时，现金流折减的文案不再成立（分数只减了一次），
+            # 必须把误导性的那句话摘掉，否则文案与实际扣分口径不符。
+            rationale_parts = [p for p in rationale_parts if "造血不足" not in p]
 
         final_score = max(20.0, base_score - haircut)
         result["composite_valuation_score"] = final_score
@@ -1256,7 +1498,25 @@ class FundamentalEngine:
 
     @staticmethod
     def _growth_for_peg(fin_df: pd.DataFrame, meta: dict) -> tuple[float | None, str]:
-        """PEG 优先用 3 年净利 CAGR；不足则回退最新净利同比。"""
+        """PEG 的分母（全系统唯一来源）。
+
+        **只接受多年年报口径的增速**，且窗口不可用时 PEG 直接判「不适用」：
+          1) 年报点 ≥4：近 3 年净利 CAGR；
+          2) 年报点 ≥2：全部年报点的 CAGR（跨度须 ≥1 年）作为补充。
+        **窗口存在但窗口内负增长/含亏损 → 返回 None，禁止退化成单期同比。**
+
+        为什么必须堵住「回退单期同比」：PEG 的定义是「多年可持续增速」倍率，
+        单期同比（尤其周期股底部的低基数反弹）不是可持续增速。混用会造出
+        「PE 越贵、越靠一次性暴增算出越便宜」的反向信号。实测（2026-09-21，
+        5254 只快照）：走回退分支的 1452 只（27.6%）中 1002 只 PEG<1、437 只
+        拿到「PEG核心锚」加分；PE 最高的 25 只（PE 164~285）增速全部等于
+        +300%（极值折减上限），即晶丰明源 PE 285.4 / PEG 0.95「低估」这类结论。
+        抽查其中 12 只，年报点均为 5 个而 3 年 CAGR 全部为负或不可比
+        （亏损基期）——「多年趋势向下 + 单季暴增」正是典型的周期陷阱。
+
+        仅当完全没有多年窗口（新上市票年报点 <2）时才回退单期同比，
+        且拒绝已按极值折减过的同比（那是系统对「该增速不可持续」的自认）。
+        """
         if fin_df is not None and not fin_df.empty and "net_profit" in fin_df.columns:
             clean = fin_df["net_profit"].dropna()
             if len(clean) >= 4:
@@ -1272,15 +1532,14 @@ class FundamentalEngine:
                     cagr = ((end / start) ** (1 / span) - 1) * 100
                     if cagr > 0:
                         return round(cagr, 2), f"{span}年净利CAGR"
-        # 无足够年报序列时才回退同比，且必须用「前瞻口径」：
-        # 493% 这类并表/低基数暴增直接做 PEG 分母会把 PEG 压到 0.05，
-        # 变成完全失真的"极度低估"信号。E 侧统一用 profit_yoy_forward（±300% 上限）。
-        yoy = meta.get("profit_yoy_forward")
-        if yoy is None:
-            yoy = meta.get("profit_yoy")
+                # 年报窗口已存在但不可用（亏损基期 / 负增长）→ PEG 不适用
+                return None, "年报窗口负增长/含亏损，PEG不适用"
+        # 极值同比（±300% 折减后）本身就是「该增速不可持续」的自认，不能做 PEG 分母
+        if meta.get("profit_yoy_extreme"):
+            return None, "单期同比为极值（已折减），不足以做PEG分母"
+        yoy = meta.get("profit_yoy")
         if yoy is not None and float(yoy) > 0:
-            src = "最新净利同比（前瞻口径）" if meta.get("profit_yoy_extreme") else "最新净利同比"
-            return round(float(yoy), 2), src
+            return round(float(yoy), 2), "最新净利同比（无年报序列）"
         return None, "净利增速"
 
     @staticmethod

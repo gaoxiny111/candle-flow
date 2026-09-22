@@ -134,6 +134,60 @@ def fetch_deducted_parent_netprofit(symbol: str, report_date: str | None = None)
     return None
 
 
+def fetch_deducted_series(symbol: str, limit: int = 24) -> dict[str, tuple[float | None, float | None]]:
+    """
+    东财 RPT_DMSK_FN_INCOME 一次性取回多期 (归母净利, 扣非归母净利)。
+
+    返回 {YYYYMMDD: (parent_net_profit, deducted_parent_net_profit)}。
+    「分红来源拆解」需要回溯 3 个年度的非经常性损益占比（见 financials.py
+    的 dividend.nonrecurring_3y）——若逐期调用 fetch_deducted_parent_netprofit
+    会发出 3~6 次 HTTP，故这里合并为单次请求。
+
+    注意：本函数**不做任何补算或回退**，缺失的期次直接缺席，由调用方按
+    「字段缺失即放行」处理（铁律：不得用不完整窗口拼出貌似完整的占比）。
+    """
+    import requests
+
+    code = _income_code(symbol)
+    if not code:
+        return {}
+    try:
+        r = requests.get(
+            "https://datacenter-web.eastmoney.com/api/data/v1/get",
+            params={
+                "reportName": "RPT_DMSK_FN_INCOME",
+                "columns": "SECURITY_CODE,REPORT_DATE,PARENT_NETPROFIT,DEDUCT_PARENT_NETPROFIT",
+                "filter": f'(SECURITY_CODE="{code}")',
+                "pageNumber": "1",
+                "pageSize": str(limit),
+                "sortColumns": "REPORT_DATE",
+                "sortTypes": "-1",
+                "source": "WEB",
+                "client": "WEB",
+            },
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://data.eastmoney.com/"},
+            timeout=12,
+        )
+        if not r.ok:
+            return {}
+        rows = ((r.json() or {}).get("result") or {}).get("data") or []
+    except Exception:
+        return {}
+
+    out: dict[str, tuple[float | None, float | None]] = {}
+    for row in rows:
+        rd = str(row.get("REPORT_DATE") or "")[:10].replace("-", "")
+        if len(rd) != 8:
+            continue
+        p = row.get("PARENT_NETPROFIT")
+        d = row.get("DEDUCT_PARENT_NETPROFIT")
+        out[rd] = (
+            float(p) if p is not None else None,
+            float(d) if d is not None else None,
+        )
+    return out
+
+
 def fetch_deducted_yoy(symbol: str, report_date: str | None = None) -> float | None:
     """扣非归母净利同比（%）：取最近两期 DEDUCT_PARENT_NETPROFIT 计算（支持中报对比）。"""
     import requests
@@ -408,6 +462,102 @@ def _ar_metrics_from_sina(
     return out
 
 
+def _ops_efficiency_from_sina(
+    bs_map: dict[str, dict[str, float | None]],
+    is_map: dict[str, dict[str, float | None]],
+    latest_ymd: str,
+) -> dict[str, Any] | None:
+    """
+    营运效率跟踪数据：应收周转天数变化率 + 存货/营收比值。
+
+    供 efficiency 模块做「利润侵蚀预警」。三个字段全部基于**同一报告期**
+    的资产负债表与利润表，且同比对照必须是**去年同期**（中报对中报），
+    不得用「中报对上年年报」——那会得出无意义的增速。
+
+    实测教训（立霸股份 603519，2026-09-22）：外部建议里给出的「存货同比
+    +77%」正是用 2026 中报存货（2.03 亿）对比 2025 **年报**存货（0.94 亿）
+    得出的；而中报对中报实际是同比下降（2025 中报 2.34 亿 → 2026 中报 2.03 亿）。
+    跨期错配的口径会凭空造出「存货激增」的假信号，故本函数强制同期对照。
+
+    返回：
+      period            : 最新报告期 YYYYMMDD
+      ar_days_latest    : 当期应收周转天数（应收/营收×365，期间口径）
+      ar_days_yoy_pct   : 应收周转天数同比变化率（%）
+      inv_to_rev_latest : 当期存货/营收
+      inv_to_rev_yoy_pct: 存货/营收比值的同比变化率（%）
+      inv_yoy_pct       : 存货同比增速（%），同期口径
+      rev_yoy_pct       : 营收同比增速（%），同期口径
+    """
+    if not latest_ymd or len(str(latest_ymd)) != 8:
+        return None
+    ymd = str(latest_ymd)
+    # 去年同期：中报→去年中报；年报→去年年报（年报本身就应同比自身）
+    prev_ymd = f"{int(ymd[:4]) - 1}{ymd[4:]}"
+
+    b_now, i_now = bs_map.get(ymd), is_map.get(ymd)
+    if not b_now or not i_now:
+        return None
+    rev_now = i_now.get("revenue")
+    if rev_now is None or float(rev_now) <= 0:
+        return None
+    ar_now = b_now.get("accounts_receivable")
+    inv_now = b_now.get("inventory")
+
+    out: dict[str, Any] = {
+        "period": ymd,
+        "ar_days_latest": None,
+        "ar_days_yoy_pct": None,
+        "inv_to_rev_latest": None,
+        "inv_to_rev_yoy_pct": None,
+        "inv_yoy_pct": None,
+        "rev_yoy_pct": None,
+        "prev_period": prev_ymd if (prev_ymd in bs_map and prev_ymd in is_map) else None,
+    }
+    if ar_now is not None:
+        out["ar_days_latest"] = round(float(ar_now) / float(rev_now) * 365.0, 1)
+    if inv_now is not None:
+        out["inv_to_rev_latest"] = round(float(inv_now) / float(rev_now), 4)
+
+    b_prev, i_prev = bs_map.get(prev_ymd), is_map.get(prev_ymd)
+    if b_prev and i_prev:
+        rev_prev = i_prev.get("revenue")
+        if rev_prev is not None and float(rev_prev) > 0:
+            out["rev_yoy_pct"] = round(
+                (float(rev_now) / float(rev_prev) - 1) * 100, 1
+            )
+            ar_prev, inv_prev = (
+                b_prev.get("accounts_receivable"),
+                b_prev.get("inventory"),
+            )
+            # 周转天数变化率：只在两个时点都有值且基期为正时计算
+            if ar_now is not None and ar_prev is not None and float(ar_prev) > 0:
+                days_now = float(ar_now) / float(rev_now) * 365.0
+                days_prev = float(ar_prev) / float(rev_prev) * 365.0
+                if days_prev > 1e-6:
+                    out["ar_days_yoy_pct"] = round(
+                        (days_now / days_prev - 1) * 100, 1
+                    )
+            if (
+                inv_now is not None
+                and inv_prev is not None
+                and float(inv_prev) > 0
+            ):
+                out["inv_yoy_pct"] = round(
+                    (float(inv_now) / float(inv_prev) - 1) * 100, 1
+                )
+                # 存货/营收比值的变化率（剔除了营收规模效应，比存货绝对增速更能
+                # 反映「积压程度是否加重」）
+                r_now = float(inv_now) / float(rev_now)
+                r_prev = float(inv_prev) / float(rev_prev)
+                if r_prev > 1e-9:
+                    out["inv_to_rev_yoy_pct"] = round(
+                        (r_now / r_prev - 1) * 100, 1
+                    )
+    if all(v is None for k, v in out.items() if k not in ("period", "prev_period")):
+        return None
+    return out
+
+
 def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
     从东财业绩快报构建多年财务 DataFrame。
@@ -466,7 +616,13 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
         latest_raw = _extract_row(snap_df, symbol)
     if latest_raw is None and annual_dates:
         latest_d = annual_dates[0]
-        latest_raw = _extract_row(frames.get(latest_d) or _fetch_yjbb(latest_d), symbol)
+        # 注意：frames 的值是 DataFrame，不能写 `frames.get(d) or _fetch_yjbb(d)` ——
+        # pandas 下对多行 DataFrame 求布尔会抛 ValueError（truth value ambiguous），
+        # 而调用方（engine._load_fin）没有 try/except，会让整只票的分析直接失败。
+        latest_df = frames.get(latest_d)
+        if latest_df is None or getattr(latest_df, "empty", False):
+            latest_df = _fetch_yjbb(latest_d)
+        latest_raw = _extract_row(latest_df, symbol)
 
     if latest_raw is not None:
         meta["name"] = meta.get("name") or str(latest_raw.get("股票简称") or "")
@@ -638,6 +794,9 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
             if ded_yoy is not None:
                 meta["deducted_yoy_pct"] = ded_yoy
         meta["ar_metrics"] = _ar_metrics_from_sina(sina_bs_all, sina_is_all, list(fd.index))
+        meta["ops_efficiency"] = _ops_efficiency_from_sina(
+            sina_bs_all, sina_is_all, latest_ymd
+        )
 
     # 真实分红历史：D0 / 分红率 / 连续分红年限（红利框架与 DDM 输入）
     try:
@@ -660,9 +819,82 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
             if cash_total and np_fy and float(np_fy) > 0
             else None
         )
+        # ── 分红来源拆解：识别「真红利」与「靠一次性收益/存量现金支撑的伪红利」──
+        #
+        # 动机（立霸股份 603519 实测）：分红率 170.1% 看似极度慷慨，但撑起分红
+        # 能力的一次性投资收益实际发生在 2023 年（投资收益 6.26 亿 / 归母净利
+        # 6.40 亿，占比 97.9%）；2024-2025 投资收益仅 457 万 / 358 万，这两年
+        # 的高分红其实是靠 2023 年沉淀下来的货币资金存量在派发。
+        #
+        # 只看「分红率(%)」会把它当成高股息优质标的；只看「最近年度非经常性
+        # 损益占比」又完全看不到问题（2024/2025 该值仅 4%/3%，因为一次性收益
+        # 早已落在往年）。故必须做「分红来源拆解」，看的是**分红当期及回溯窗口
+        # 的现金创造能力**，而非分红率本身。
+        #
+        # 三个来源字段全部只读真实披露值，不做任何改写：
+        #   fcf_coverage_3y  ：近 3 年累计 FCF / 当年现金分红（<1 说明分红超过
+        #                      主业累计自由现金流创造，只能靠存量现金或融资）
+        #   nonrecurring_3y  ：近 3 年累计(归母净利-扣非净利) / 累计归母净利
+        #                      （回溯窗口口径，能抓到「往年一次性收益撑起当下分红」）
+        #   nonrecurring_latest：最近年度非经常性损益占比（当期口径，作对照）
+        #
+        # 关键设计：nonrecurring 用 3 年累计而非单年。单年口径正是立霸这类
+        # 案例的盲区（一次性收益在 T 年，分红消耗发生在 T+1/T+2 年）。
+        fcf_coverage_3y: float | None = None
+        fcf_sum_3y: float | None = None
+        nonrecurring_3y: float | None = None
+        nonrecurring_latest: float | None = None
+        _fy_year = int(latest_fy["year"])
+        _win = [f"{y}1231" for y in range(_fy_year - 2, _fy_year + 1)]
+        # 扣非归母净利序列：新浪利润表无该科目，统一走东财单次批量拉取。
+        try:
+            ded_series = fetch_deducted_series(symbol)
+        except Exception:
+            ded_series = {}
+
+        def _fcf_of(ymd: str) -> float | None:
+            cf = sina_cf_all.get(ymd)
+            return _sina_fcf(cf) if cf else None
+
+        def _nums_of(ymd: str) -> tuple[float | None, float | None]:
+            """返回 (归母净利, 扣非归母净利)。扣非走东财序列（新浪无此科目）。"""
+            p = None
+            isr = sina_is_all.get(ymd) or {}
+            _p_sina = isr.get("parent_net_profit")
+            if _p_sina is not None:
+                p = float(_p_sina)
+            _ded_series = ded_series.get(ymd) or (None, None)
+            if p is None and _ded_series[0] is not None:
+                p = _ded_series[0]
+            return p, _ded_series[1]
+
+        # 1) 近 3 年累计 FCF / 当年现金分红
+        _fcf_vals = [_fcf_of(d) for d in _win]
+        if all(v is not None for v in _fcf_vals) and _fcf_vals:
+            fcf_sum_3y = float(sum(v for v in _fcf_vals if v is not None))
+            if cash_total and float(cash_total) > 0:
+                fcf_coverage_3y = round(fcf_sum_3y / float(cash_total), 3)
+
+        # 2) 非经常性损益占比（3 年累计 + 最近年度）
+        _np_sum = 0.0
+        _ded_sum = 0.0
+        _ok_all = True
+        for d in _win:
+            p, ded = _nums_of(d)
+            if p is None or ded is None:
+                _ok_all = False
+                break
+            _np_sum += p
+            _ded_sum += ded
+        if _ok_all and abs(_np_sum) > 1e-6:
+            nonrecurring_3y = round((_np_sum - _ded_sum) / abs(_np_sum), 4)
+        _p_l, _d_l = _nums_of(fy_ymd)
+        if _p_l is not None and _d_l is not None and abs(float(_p_l)) > 1e-6:
+            nonrecurring_latest = round((float(_p_l) - float(_d_l)) / abs(float(_p_l)), 4)
+
         meta["dividend"] = {
             "d0": float(latest_fy["dps"]),
-            "fy": int(latest_fy["year"]),
+            "fy": _fy_year,
             "cash_total": float(cash_total) if cash_total else None,
             "payout_ratio_pct": payout,
             "consecutive_years": int(div_hist.get("consecutive_years") or 0),
@@ -673,6 +905,13 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
                 if fcf_fy is not None and cash_total
                 else None
             ),
+            # 分红来源拆解（口径自证随字段一起落库，避免读层猜来源）
+            "fcf_coverage_3y": fcf_coverage_3y,
+            "fcf_sum_3y": round(fcf_sum_3y, 2) if fcf_sum_3y is not None else None,
+            "fcf_window_3y": _win if fcf_sum_3y is not None else None,
+            "nonrecurring_3y": nonrecurring_3y,
+            "nonrecurring_latest": nonrecurring_latest,
+            "nonrecurring_window_3y": _win if nonrecurring_3y is not None else None,
         }
         if payout is not None:
             meta["payout_ratio_pct"] = payout

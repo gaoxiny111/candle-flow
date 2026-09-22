@@ -1,0 +1,37 @@
+﻿[36mvite v5.4.21 [32mbuilding for production...[36m[39m
+transforming...
+[32m鉁?[39m 181 modules transformed.
+rendering chunks...
+computing gzip size...
+[2mdist/[22m[32mindex.html                            [39m[1m[2m  0.61 kB[22m[1m[22m[2m 鈹?gzip:  0.42 kB[22m
+[2mdist/[22m[35massets/BacktestView-3MoSOwWY.css      [39m[1m[2m  1.24 kB[22m[1m[22m[2m 鈹?gzip:  0.48 kB[22m
+[2mdist/[22m[35massets/SymbolSearch-CDY01BH_.css      [39m[1m[2m  1.29 kB[22m[1m[22m[2m 鈹?gzip:  0.56 kB[22m
+[2mdist/[22m[35massets/FlowView-aKB4Wqwj.css          [39m[1m[2m  1.60 kB[22m[1m[22m[2m 鈹?gzip:  0.53 kB[22m
+[2mdist/[22m[35massets/SignalDetailView-0whff3n_.css  [39m[1m[2m  1.76 kB[22m[1m[22m[2m 鈹?gzip:  0.60 kB[22m
+[2mdist/[22m[35massets/AdminView-DD-f2OQP.css         [39m[1m[2m  1.81 kB[22m[1m[22m[2m 鈹?gzip:  0.56 kB[22m
+[2mdist/[22m[35massets/RiskCalculator-vFGuagVY.css    [39m[1m[2m  1.91 kB[22m[1m[22m[2m 鈹?gzip:  0.55 kB[22m
+[2mdist/[22m[35massets/SettingsView-Dq5E9cRJ.css      [39m[1m[2m  3.15 kB[22m[1m[22m[2m 鈹?gzip:  0.82 kB[22m
+[2mdist/[22m[35massets/SignalListView-CrV4lj3j.css    [39m[1m[2m  3.31 kB[22m[1m[22m[2m 鈹?gzip:  0.87 kB[22m
+[2mdist/[22m[35massets/BullTacticsView-DDRqknai.css   [39m[1m[2m  3.54 kB[22m[1m[22m[2m 鈹?gzip:  0.99 kB[22m
+[2mdist/[22m[35massets/index-BFXNMFm_.css             [39m[1m[2m  4.00 kB[22m[1m[22m[2m 鈹?gzip:  1.26 kB[22m
+[2mdist/[22m[35massets/MarketScanView-C4iv3OXe.css    [39m[1m[2m 10.35 kB[22m[1m[22m[2m 鈹?gzip:  2.00 kB[22m
+[2mdist/[22m[35massets/DashboardView-PIvSc784.css     [39m[1m[2m 12.66 kB[22m[1m[22m[2m 鈹?gzip:  2.49 kB[22m
+[2mdist/[22m[35massets/ChartView-Dt2V6PHE.css         [39m[1m[2m 21.76 kB[22m[1m[22m[2m 鈹?gzip:  3.96 kB[22m
+[2mdist/[22m[36massets/confluence-ZlPIVCkO.js         [39m[1m[2m  0.57 kB[22m[1m[22m[2m 鈹?gzip:  0.32 kB[22m
+[2mdist/[22m[36massets/signal-OgLkRj7r.js             [39m[1m[2m  0.57 kB[22m[1m[22m[2m 鈹?gzip:  0.34 kB[22m
+[2mdist/[22m[36massets/pattern-BgRfGzPY.js            [39m[1m[2m  0.96 kB[22m[1m[22m[2m 鈹?gzip:  0.44 kB[22m
+[2mdist/[22m[36massets/labels-Sx0XMzz7.js             [39m[1m[2m  2.15 kB[22m[1m[22m[2m 鈹?gzip:  1.38 kB[22m
+[2mdist/[22m[36massets/BacktestView-W6t_EZPy.js       [39m[1m[2m  2.66 kB[22m[1m[22m[2m 鈹?gzip:  1.55 kB[22m
+[2mdist/[22m[36massets/SymbolSearch-9iJ4Q9e4.js       [39m[1m[2m  3.36 kB[22m[1m[22m[2m 鈹?gzip:  1.63 kB[22m
+[2mdist/[22m[36massets/SignalDetailView-DQXRPPNK.js   [39m[1m[2m  4.18 kB[22m[1m[22m[2m 鈹?gzip:  1.91 kB[22m
+[2mdist/[22m[36massets/AdminView-D-Fdshld.js          [39m[1m[2m  4.18 kB[22m[1m[22m[2m 鈹?gzip:  2.12 kB[22m
+[2mdist/[22m[36massets/FlowView-BDBpTPpH.js           [39m[1m[2m  4.52 kB[22m[1m[22m[2m 鈹?gzip:  2.33 kB[22m
+[2mdist/[22m[36massets/BullTacticsView-B9IZgECT.js    [39m[1m[2m  5.43 kB[22m[1m[22m[2m 鈹?gzip:  2.75 kB[22m
+[2mdist/[22m[36massets/SignalListView-fBjiT1bM.js     [39m[1m[2m  5.64 kB[22m[1m[22m[2m 鈹?gzip:  2.66 kB[22m
+[2mdist/[22m[36massets/RiskCalculator-HsC9y2-J.js     [39m[1m[2m  6.82 kB[22m[1m[22m[2m 鈹?gzip:  3.14 kB[22m
+[2mdist/[22m[36massets/SettingsView-BB0MXAZq.js       [39m[1m[2m  7.71 kB[22m[1m[22m[2m 鈹?gzip:  3.43 kB[22m
+[2mdist/[22m[36massets/DashboardView-BaMqt2Rl.js      [39m[1m[2m 20.23 kB[22m[1m[22m[2m 鈹?gzip:  7.27 kB[22m
+[2mdist/[22m[36massets/MarketScanView-B37G9JKa.js     [39m[1m[2m 25.96 kB[22m[1m[22m[2m 鈹?gzip: 10.19 kB[22m
+[2mdist/[22m[36massets/index-D9rd1LJk.js              [39m[1m[2m179.57 kB[22m[1m[22m[2m 鈹?gzip: 67.97 kB[22m
+[2mdist/[22m[36massets/ChartView-DUcMq1_e.js          [39m[1m[2m229.51 kB[22m[1m[22m[2m 鈹?gzip: 73.98 kB[22m
+[32m鉁?built in 6.67s[39m

@@ -478,3 +478,160 @@ def test_reduce_hold_still_counts_when_only_plan_announced(monkeypatch):
     result = detect_major_risk_events("000651.SZ")
     assert result["observe_count"] == 1
     assert any(e["rule_id"] == "reduce_hold" for e in result["observe_events"])
+
+
+# ── 生存级风险的解除通道（新潮能源 600777 案例，2026-09-21） ──────────────
+# 旧逻辑对生存级事件没有释放路径：一旦命中「可能被终止上市」「无法表示意见」，
+# 即使公司已摘帽也永远强制 E 级、估值锁 28 分，与事实相反。
+
+_600777_NOTICES = [
+    {"title": "新潮能源:2026年半年度业绩暨现金分红说明会投资者关系活动记录表",
+     "notice_date": "2026-09-07", "url": ""},
+    {"title": "*ST新潮:山东新潮能源股份有限公司关于撤销退市风险警示及其他风险警示暨停牌的公告",
+     "notice_date": "2026-06-19", "url": ""},
+    {"title": "*ST新潮:山东新潮能源股份有限公司关于申请撤销公司股票退市风险警示和其他风险警示的公告",
+     "notice_date": "2026-04-24", "url": ""},
+    {"title": "*ST新潮:山东新潮能源股份有限公司关于2024年度内部控制和财务报表审计报告"
+              "无法表示意见涉及事项影响已消除的专项说明",
+     "notice_date": "2026-04-24", "url": ""},
+    {"title": "*ST新潮:山东新潮能源股份有限公司关于公司股票可能被终止上市的第六次风险提示公告",
+     "notice_date": "2026-04-18", "url": ""},
+]
+
+
+def _patch(monkeypatch, notices):
+    clear_major_risk_cache()
+    monkeypatch.setattr(
+        "app.services.major_risk_events.fetch_stock_notices", lambda *_a, **_k: notices
+    )
+    monkeypatch.setattr(
+        "app.services.major_risk_events.fetch_controller_pledge_ratio",
+        lambda *_a, **_k: {"ratio": None, "invalid": False, "source": "", "holder": ""},
+    )
+
+
+def test_survival_release_clears_veto_after_st_removal(monkeypatch):
+    """已正式撤销退市风险警示且简称去 ST → 生存级事件不再一票否决。"""
+    _patch(monkeypatch, _600777_NOTICES)
+    result = detect_major_risk_events("600777.SH")
+    assert result["fatal"] is False
+    assert result["event_count"] == 0
+    assert result["message"] == ""
+    assert set(result["released_labels"]) == {"非标审计/持续经营不确定性", "面值/重大违法退市风险"}
+    assert result["current_name_hint"] == "新潮能源"
+    assert result["name_has_st"] is False
+    assert result["audit_opinion_hint"] is None  # 非标提示不得再传给风险模块扣 30 分
+
+
+def test_application_stage_is_not_release(monkeypatch):
+    """仅「申请撤销」阶段（尚未获准）不得视为解除。"""
+    notices = [n for n in _600777_NOTICES if "暨停牌的公告" not in n["title"]]
+    notices = [
+        n for n in notices if "进展公告" not in n["title"]
+    ]
+    notices.insert(
+        1,
+        {
+            "title": "*ST新潮:山东新潮能源股份有限公司关于申请撤销公司股票退市风险警示"
+                     "及其他风险警示的进展公告",
+            "notice_date": "2026-05-20",
+            "url": "",
+        },
+    )
+    _patch(monkeypatch, notices)
+    result = detect_major_risk_events("600777.SH")
+    assert result["fatal"] is True
+    assert "面值/重大违法退市风险" in result["labels"]
+
+
+def test_still_st_name_blocks_face_delist_release(monkeypatch):
+    """撤销公告已出但简称仍带 ST（口径冲突时保守处理）→ 仍一票否决。"""
+    notices = [
+        {"title": "*ST某公司:关于撤销退市风险警示的公告", "notice_date": "2026-06-19", "url": ""},
+        {"title": "*ST某公司:关于公司股票可能被终止上市的第三次风险提示公告",
+         "notice_date": "2026-04-18", "url": ""},
+    ]
+    _patch(monkeypatch, notices)
+    result = detect_major_risk_events("000001.SZ")
+    assert result["fatal"] is True
+    assert result["name_has_st"] is True
+
+
+def test_release_rule_covers_audit_and_reorg_but_not_clean_reports():
+    """解除语义白名单：非标已消除/重整执行完毕可解除；常规报告不误判。"""
+    from app.services.major_risk_events import _survival_release_kind
+
+    assert _survival_release_kind("X:关于审计报告无法表示意见涉及事项影响已消除的专项说明") == "audit_nonstd"
+    assert _survival_release_kind("X:关于重整计划执行完毕的公告") == "pre_reorg"
+    assert _survival_release_kind("X:2026年半年度审计报告") is None
+    assert _survival_release_kind("X:关于变更签字会计师的公告") is None
+    assert _survival_release_kind("X:2025年年度审计报告带强调事项段的无保留意见专项说明") is None
+
+
+# ── 第八轮：中文语序导致的减持漏判（立霸股份 603519 案例）──────────────
+# 真实公告标题「关于控股股东一致行动人减持股份计划公告」（2026-08-25）
+# 含「减持股份计划」，但既不含「减持计划」（非连续）也不含「股份减持」
+# （顺序相反）→ 旧版 4 个连续子串关键词零命中。全库同族写法实测漏判 10/15。
+@pytest.mark.parametrize(
+    "title",
+    (
+        "立霸股份:关于控股股东一致行动人减持股份计划公告",
+        "XX:关于股东减持股份的预披露公告",
+        "XX:关于控股股东减持股份计划的公告",
+        "XX:关于持股5%以上股东减持股份计划公告",
+        "XX:关于董事减持股份计划的公告",
+        "XX:关于股东集中竞价减持股份计划公告",
+        "XX:关于股东减持股份进展公告",
+        "XX:关于股东减持股份计划时间过半的公告",
+        "XX:关于控股股东一致行动人减持公司股份计划公告",
+        "XX:关于公司股东减持股份计划公告",
+    ),
+)
+def test_reduce_hold_semantic_match_covers_word_order_variants(title):
+    """减持标题的语序变体必须全部命中（语义共现，非连续子串）。"""
+    from app.services.major_risk_events import scan_notice_titles
+
+    hits = scan_notice_titles([{"title": title, "notice_date": "2026-08-25", "url": ""}])
+    assert any(h.rule_id == "reduce_hold" for h in hits), title
+
+
+@pytest.mark.parametrize(
+    "title",
+    (
+        "XX:关于股东减持计划实施完毕的公告",
+        "格力电器:关于大股东减持计划期限届满暨减持结果的公告",
+    ),
+)
+def test_reduce_hold_expiry_titles_go_to_release_not_risk(title):
+    """「计划已结束」类标题不得记为新增减持风险，应走释放通道。"""
+    from app.services.major_risk_events import scan_notice_titles, scan_risk_release
+
+    n = [{"title": title, "notice_date": "2026-06-22", "url": ""}]
+    assert not any(h.rule_id == "reduce_hold" for h in scan_notice_titles(n))
+    assert scan_risk_release(n)["released"] is True
+
+
+def test_release_only_cancels_older_reduce_events(monkeypatch):
+    """释放公告只释放早于它的事件；更晚的新减持仍计入观察扣分。"""
+    clear_major_risk_cache()
+    monkeypatch.setattr(
+        "app.services.major_risk_events.fetch_stock_notices",
+        lambda *_a, **_k: [
+            # 先有旧减持，随后计划届满释放
+            {"title": "X:关于股东减持股份计划的公告", "notice_date": "2026-03-01", "url": ""},
+            {"title": "X:关于股东减持计划期限届满暨减持结果的公告",
+             "notice_date": "2026-06-22", "url": ""},
+            # 释放之后又出现**新的**减持计划 → 不得被旧释放洗白
+            {"title": "X:关于控股股东一致行动人减持股份计划公告",
+             "notice_date": "2026-08-25", "url": ""},
+        ],
+    )
+    monkeypatch.setattr(
+        "app.services.major_risk_events.fetch_controller_pledge_ratio",
+        lambda *_a, **_k: {"ratio": None, "invalid": False, "source": "", "holder": ""},
+    )
+    result = detect_major_risk_events("603519.SH")
+    active = [e for e in result["observe_events"] if e.get("rule_id") == "reduce_hold"]
+    # 2026-08-25 的新减持仍在观察级（未被 2026-06-22 的释放抵消）
+    assert any(e.get("notice_date") == "2026-08-25" for e in active)
+    assert result["observe_count"] >= 1

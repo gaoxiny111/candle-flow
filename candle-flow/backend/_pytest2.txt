@@ -1,0 +1,67 @@
+F....FF...s.................................                             [100%]
+================================== FAILURES ===================================
+______________ test_rsi_strong_pullback_zone_hits_full_weight[7] ______________
+
+seed = 7
+
+    @pytest.mark.parametrize("seed", [7, 11, 23, 42, 99])
+    def test_rsi_strong_pullback_zone_hits_full_weight(seed):
+        """RSI 48~60（强势回调区）此前是盲区，现在应命中且权重 1.0。"""
+        bars = _walk(seed=seed)
+        idx = _find_rsi_index(bars, 48.0, 60.0)
+        if idx is None:
+            pytest.skip(f"seed={seed} 未生成 48~60 区间样本")
+        res = evaluate_confluence(bars, idx, "bullish")
+        hits = [h for h in res.hits if h.name == "RSI"]
+>       assert hits, f"RSI 48~60 应命中（idx={idx}）"
+E       AssertionError: RSI 48~60 应命中（idx=47）
+E       assert []
+
+tests\test_confluence_tuning.py:77: AssertionError
+_______________ test_rsi_weak_zone_hits_with_reduced_weight[7] ________________
+
+seed = 7
+
+    @pytest.mark.parametrize("seed", [7, 11, 23, 42, 99])
+    def test_rsi_weak_zone_hits_with_reduced_weight(seed):
+        """RSI 28~45 仍命中，但权重降为 0.6（动能未确认，不足以单独撑双证）。"""
+        bars = _walk(seed=seed)
+        idx = _find_rsi_index(bars, 30.0, 44.0)
+        if idx is None:
+            pytest.skip(f"seed={seed} 未生成 30~44 区间样本")
+        res = evaluate_confluence(bars, idx, "bullish")
+        hits = [h for h in res.hits if h.name == "RSI"]
+>       assert hits, f"RSI 30~44 应命中（idx={idx}）"
+E       AssertionError: RSI 30~44 应命中（idx=30）
+E       assert []
+
+tests\test_confluence_tuning.py:90: AssertionError
+_______________ test_rsi_weak_zone_hits_with_reduced_weight[11] _______________
+
+seed = 11
+
+    @pytest.mark.parametrize("seed", [7, 11, 23, 42, 99])
+    def test_rsi_weak_zone_hits_with_reduced_weight(seed):
+        """RSI 28~45 仍命中，但权重降为 0.6（动能未确认，不足以单独撑双证）。"""
+        bars = _walk(seed=seed)
+        idx = _find_rsi_index(bars, 30.0, 44.0)
+        if idx is None:
+            pytest.skip(f"seed={seed} 未生成 30~44 区间样本")
+        res = evaluate_confluence(bars, idx, "bullish")
+        hits = [h for h in res.hits if h.name == "RSI"]
+>       assert hits, f"RSI 30~44 应命中（idx={idx}）"
+E       AssertionError: RSI 30~44 应命中（idx=30）
+E       assert []
+
+tests\test_confluence_tuning.py:90: AssertionError
+============================== warnings summary ===============================
+venv\Lib\site-packages\pydantic\_internal\_config.py:291
+  D:\candle-flow(2)\candle-flow\candle-flow\backend\venv\Lib\site-packages\pydantic\_internal\_config.py:291: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.9/migration/
+    warnings.warn(DEPRECATION_MESSAGE, DeprecationWarning)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/test_confluence_tuning.py::test_rsi_strong_pullback_zone_hits_full_weight[7]
+FAILED tests/test_confluence_tuning.py::test_rsi_weak_zone_hits_with_reduced_weight[7]
+FAILED tests/test_confluence_tuning.py::test_rsi_weak_zone_hits_with_reduced_weight[11]
+3 failed, 40 passed, 1 skipped, 1 warning in 3.35s

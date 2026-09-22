@@ -1,0 +1,15 @@
+=== A. market regime (stale-basis fix) ===
+regime = neutral 震荡 | scoring_impact = none
+basis  = 沪深300（截至 2026-09-21）、上证指数（截至 2026-09-21）
+stale  = []
+  - 沪深300 risk_off as_of= 2026-09-21 stale= False
+     收盘 4539.57，MA20 4547.49，MA60 4648.38（空头排列）；周线向下；近 20 日 -0.52%
+  - 上证指数 risk_on as_of= 2026-09-21 stale= False
+     收盘 3949.91，MA20 3925.82，MA60 3921.34（多头排列）；周线震荡；近 20 日 +1.75%
+=== B. PEG 口径核查（快照值 vs 单期同比重算）===
+600019.SH 宝钢股份 [普钢] engine_PEG=None (None) 单期同比=-6.3 PE=12.5 -> 旧口径PEG=None
+600519.SH 贵州茅台 [白酒Ⅱ] engine_PEG=None (None) 单期同比=-1.95 PE=19.3 -> 旧口径PEG=None
+600777.SH 新潮能源 [油气开采Ⅱ] engine_PEG=None (None) 单期同比=-65.59 PE=47.34 -> 旧口径PEG=None
+601088.SH 中国神华 [煤炭开采] engine_PEG=None (None) 单期同比=4.1 PE=18.58 -> 旧口径PEG=4.53
+=== C. 重建共振索引（180 根窗口） ===
+{"code":200,"message":"success","data":{"status":"started","job_id":"d2e69dd05ec2","progress":{"job_id":"d2e69dd05ec2","kind":"resonance_index","status":"running","phase":"starting","message":"共振索引构建已启动","done":0,"total":0,"pct":0.0,"result":null,"error":null,"started_at":1789977578.241741,"updated_at":1789977578.241741}},"meta":null}

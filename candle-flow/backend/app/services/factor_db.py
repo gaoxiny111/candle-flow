@@ -114,6 +114,9 @@ def upsert(symbol: str, report: dict[str, Any]) -> None:
     """写入或更新单条因子快照。"""
     db = SessionLocal()
     try:
+        # 打上口径版本戳：build_all(force=False) 与盘后任务据此识别"口径已变、
+        # 分数需重算"的存量快照（见 SCORING_VERSION 注释）。
+        report = {**report, "scoring_version": SCORING_VERSION}
         payload = json.dumps(report, ensure_ascii=False, default=str)
         composite = report.get("composite_score")
         market = report.get("market") or {}
@@ -170,11 +173,69 @@ def _get_stale_symbols(
 # 2026-09-20 的 profit_yoy 即如此丢失（5211 条存量快照缺该键 →
 # market_scan.technical_overlay 的 PEG 恒 None → 「强买入」档不可达）。
 # 以后给 run_full_analysis 返回值加字段时，把键名追加到这里即可自愈。
-_REQUIRED_SNAPSHOT_KEYS: tuple[str, ...] = ("profit_yoy",)
+_REQUIRED_SNAPSHOT_KEYS: tuple[str, ...] = ("profit_yoy", "scoring_version")
+
+# 打分数值口径版本。**任何会改变 composite_score / 模块分 / 风控判定的改动
+# 都必须 bump 这个值**，否则盘后 build_all()（非 force）会把这些口径变更后
+# 的分数当成"新鲜快照"跳过，要等到下一个披露窗口才生效 —— 期间榜单与详情
+# 页会出现同一只票两个分数（详情页实时重算、榜单读快照）。
+# 例：2026-09-21 修掉「ST 已摘帽仍强制 E」「衰退股按边际改善加分」两处口径，
+# 若不 bump，摘帽股在榜单上会一直停在 25 分 E 级。
+# .3：拆除 pe_distorted 自证循环 + turnaround 增加 PB 底部前提
+#     + PEG 分母禁止退化为单期同比（三者都直接改估值分，必须全量重建）。
+# .4：周期陷阱折减（低 PE 幻觉：PE低分位+PB高分位+高ROE → 估值合理性降 12 分）
+#     —— 直接改估值分，必须全量重建。左侧抄底防守与买点信号阶段化是**读层**
+#     改动（共振索引 / 榜单叠加），不进快照，但 .4 重建会顺带刷新它们的输入。
+# .5：① 现金流「微利稀释」封顶（每股经营现金流<0.3 且 净利率<5% → 模块分≤50）
+#        —— 直接改现金流模块分，必须全量重建；
+#     ② 估值软化（PE>80 → signal"合理"）增加分位交叉校验（分位≥90 不再洗白）
+#        —— 直接改估值分口径。
+#     ③ 分类准入门槛（_admission_gate）是**读层**改动（榜单判档），不进快照。
+# .6：① 分类准入闸门修两个洞（纯读层，但需 bump 以逼一次干净全量重建，
+#        扫掉仍停留在 09-20 的 3640 份旧口径快照）：
+#        - 周期型分支原本只判 cycle_trap 且该参数**恒为 False** → 894 只强周期股
+#          无条件免检，混入 143 只「PE分位≥80 且 ROE<6」（泸天化99.3/0.5、
+#          招商蛇口100.0/0.73、华菱钢铁99.2/4.77），与金牛化工同病。
+#          现补「估值↔盈利矛盾」判据（高估值分位+弱 ROE），仍豁免真·谷底反转
+#          （PE 低分位时 ROE 为负照常放行）。
+#        - 周转率兜底（<0.15）对**金融业结构性豁免**：银行/券商周转天然
+#          0.02~0.08，实测误杀 42 家银行 + 49 家券商 + 20 家多元金融
+#          （宁波银行 0.02、华泰证券 0.033）。豁免后仍过矛盾判据，非免检。
+#        实测全库 5254 只：新增拦截 160 只、纠正误杀 152 只（净 PASS 3893→3885）。
+# .7：① 估值软化阶梯收紧（engine.py）—— 原 `PE>80 → signal="合理"` 只看绝对 PE，
+#        只用了单边分位上限 90；现改为「绝对估值档位决定分位门槛」的双条件交叉：
+#        PE 80~150 要求分位 <80、PE >150 要求分位 <70、PB >8 要求分位 <80，
+#        否则改判「偏高」不再软化。直接改估值分，必须全量重建。
+#        （靶点：603099 长白山 PE 80.6/分位 86.1 曾被洗成「合理」；
+#          600722 金牛化工 PE 193.5/分位 89.8 同病。真成长 PE 95/分位 60 不受影响。）
+#     ② 风险事件「减持」漏判修复（major_risk_events.py）—— 中文标题语序多变，
+#        连续子串匹配实测 15 种真实写法只命中 5 种（漏 67%）：
+#        「关于控股股东一致行动人减持股份计划公告」（立霸股份 2026-08-25）
+#        含「减持股份计划」，却既不含连续的「减持计划」也不含顺序相反的
+#        「股份减持」→ 零命中，公告已扫到（notice_scanned=150）但 events 为空。
+#        现加 `all_of` 语义共现（("减持",) + ("计划"/"预披露"/"进展"/"减持股份")），
+#        召回 5/15 → 13/15（余 2 例是「计划已结束」应走释放通道）；
+#        并把「届满/到期/实施完毕」交给释放通道，释放只抵消更早的事件。
+# .8（2026-09-22）：① 现金流模块新增「分红含金量」指标（cashflow.py）——
+#        拆解分红来源，识别「靠一次性收益/存量现金支撑的伪红利」：
+#        判据 = 近3年累计非经常性损益占比 ≥30% 或 近3年累计FCF/当年分红 <1。
+#        口径用 **3 年累计**而非单年（单年是盲区：立霸 603519 一次性收益发生在
+#        2023 年，2024/2025 单年非经常占比仅 4%/3%，而 3 年累计达 57.5%）。
+#        直接改现金流模块分，必须全量重建。
+#     ② 营运效率模块新增「应收周转天数变化率」+「存货/营收比值」（efficiency.py）
+#        → 存货增速持续高于营收增速时输出利润侵蚀预警。同期对同期口径由
+#        financials._ops_efficiency_from_sina 统一产出。模块分改变（效率不参与
+#        综合加权，但榜单展示分改变），需重建。
+#     ③ 风险模块新增「减持窗口期倒计时」+「大宗交易折价率」扣分
+#        （major_risk_events.fetch_reduce_window / fetch_recent_block_trades）
+#        → 风险分改变，经风险乘数传导至 composite，必须全量重建。
+#     ④ 买点信号新增「减持窗口期闸门」：窗口内 strong_buy 封顶为 watch
+#        （market_confluence_service._detect_buy_signal，只改档位不改分数）。
+SCORING_VERSION = "2026.09.22.8"
 
 
 def _outdated_snapshot_symbols() -> set[str]:
-    """返回 payload 缺少任一必需字段的 symbol 集合。
+    """返回 payload 缺必需字段或口径版本落后的 symbol 集合。
 
     判定依据是**键是否存在**（``json_type`` 为 NULL = 路径不存在），
     不是值是否为 null —— 合法的空值（如无同比数据）不应触发反复重建。
@@ -188,6 +249,7 @@ def _outdated_snapshot_symbols() -> set[str]:
             conds = " OR ".join(
                 f"json_type(payload, '$.{k}') IS NULL" for k in _REQUIRED_SNAPSHOT_KEYS
             )
+            conds += f" OR json_extract(payload, '$.scoring_version') IS NOT {json.dumps(SCORING_VERSION)}"
             sql = text(f"SELECT symbol FROM factor_snapshots WHERE {conds}")
             return {row[0] for row in db.execute(sql)}
         except Exception:
@@ -204,8 +266,10 @@ def _outdated_snapshot_symbols() -> set[str]:
             except (json.JSONDecodeError, TypeError):
                 outdated.add(sym)
                 continue
-            if not isinstance(data, dict) or any(
-                k not in data for k in _REQUIRED_SNAPSHOT_KEYS
+            if (
+                not isinstance(data, dict)
+                or any(k not in data for k in _REQUIRED_SNAPSHOT_KEYS)
+                or data.get("scoring_version") != SCORING_VERSION
             ):
                 outdated.add(sym)
         return outdated

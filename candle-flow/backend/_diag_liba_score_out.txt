@@ -1,0 +1,384 @@
+{
+ "symbol": "603519.SH",
+ "composite_score": 71.7,
+ "rating": null,
+ "modules": {
+  "profitability": {
+   "score": 81.3,
+   "level": "B",
+   "indicator_count": 5,
+   "indicators": [
+    {
+     "name": "ROE(%)",
+     "value": 12.44,
+     "score": 90.0,
+     "weight": 3.0
+    },
+    {
+     "name": "毛利率(%)",
+     "value": 15.65,
+     "score": 55.0,
+     "weight": 2.0
+    },
+    {
+     "name": "ROIC(%)",
+     "value": 21.52,
+     "score": 90.0,
+     "weight": 2.5
+    },
+    {
+     "name": "净利率(%)",
+     "value": 9.28,
+     "score": 75.0,
+     "weight": 2.0
+    },
+    {
+     "name": "股息率(%)",
+     "value": 6.2,
+     "score": 90.0,
+     "weight": 2.0
+    }
+   ],
+   "warnings": [],
+   "metadata": {
+    "dupont": {
+     "net_margin": 0.09276874980395798,
+     "asset_turnover": 1.0433767296461616,
+     "equity_multiplier": 1.2852201621685753
+    },
+    "wacc_pct": 4.5,
+    "roic": 21.52,
+    "roic_gross_capital_pct": 10.76,
+    "roic_3y_avg": null,
+    "roic_below_wacc": false,
+    "business_model": null,
+    "is_dividend_asset": true,
+    "dividend_profile": {
+     "is_dividend_asset": true,
+     "tier": "high",
+     "dividend_yield_pct": 6.2,
+     "payout_ratio_pct": 170.1,
+     "bond_yield_pct": 1.7,
+     "div_bond_spread_pct": 4.5,
+     "wacc_pct": 4.5
+    },
+    "is_high_growth_quality": false,
+    "growth_quality": {
+     "is_high_growth_quality": false,
+     "gross_margin_pct": 15.62,
+     "profit_yoy_pct": 29.07,
+     "wacc_pct": null
+    },
+    "gross_margin": 15.65,
+    "is_growth_stock": false,
+    "growth_stock_tier": ""
+   }
+  },
+  "growth": {
+   "score": 72.0,
+   "level": "B",
+   "indicator_count": 6,
+   "indicators": [
+    {
+     "name": "营收3年CAGR(%)",
+     "value": 6.02,
+     "score": 75.0,
+     "weight": 1.8
+    },
+    {
+     "name": "净利润3年CAGR(%)",
+     "value": -34.78,
+     "score": 16.085139925573095,
+     "weight": 1.8
+    },
+    {
+     "name": "前瞻成长性(%)",
+     "value": 29.07,
+     "score": 66.8,
+     "weight": 1.5
+    },
+    {
+     "name": "最新报告期营收同比(%)",
+     "value": 0.02,
+     "score": 75.0,
+     "weight": 3.5
+    },
+    {
+     "name": "最新报告期净利同比(%)",
+     "value": 29.07,
+     "score": 90.0,
+     "weight": 3.5
+    },
+    {
+     "name": "成长拐点",
+     "value": 29.07,
+     "score": 82.0,
+     "weight": 3.0
+    }
+   ],
+   "warnings": [
+    "近3年净利润复合增速为负，但最新报告期已现拐点，需观察持续性"
+   ],
+   "metadata": {
+    "v_shape": true,
+    "marginal_recovery": false,
+    "profit_illusion": false,
+    "deducted_net_profit": 97601802.23,
+    "business_transform": false,
+    "growth_quality": {
+     "is_high_growth_quality": false,
+     "gross_margin_pct": 15.62,
+     "profit_yoy_pct": 29.07,
+     "wacc_pct": null
+    },
+    "cyclical_position": {},
+    "second_curve": null,
+    "resource_injection": null
+   }
+  },
+  "cashflow": {
+   "score": 75.2,
+   "level": "B",
+   "indicator_count": 9,
+   "indicators": [
+    {
+     "name": "经营现金流/净利润(5年均值)",
+     "value": 0.64,
+     "score": 75.0,
+     "weight": 3.0
+    },
+    {
+     "name": "现金流改善趋势",
+     "value": 2,
+     "score": 72.0,
+     "weight": 1.5
+    },
+    {
+     "name": "年报经营现金流/净利润",
+     "value": 1.63,
+     "score": 90.0,
+     "weight": 1.0
+    },
+    {
+     "name": "自由现金流(元)",
+     "value": 251243200.0,
+     "score": 85.0,
+     "weight": 2.5
+    },
+    {
+     "name": "FCF覆盖分红",
+     "value": -15084639.0,
+     "score": 75.0,
+     "weight": 2.0
+    },
+    {
+     "name": "分红含金量",
+     "value": 0.575,
+     "score": 35.0,
+     "weight": 1.5
+    },
+    {
+     "name": "资本支出/经营现金流",
+     "value": 0.02,
+     "score": 90.0,
+     "weight": 2.0
+    },
+    {
+     "name": "每股经营现金流(元)",
+     "value": 0.208,
+     "score": 10.4214573434,
+     "weight": 1.5
+    },
+    {
+     "name": "经营现金流环比大幅改善",
+     "value": 160.3,
+     "score": 90.0,
+     "weight": 1.0
+    }
+   ],
+   "warnings": [
+    "分红含金量偏低（近3年非经常性损益占比57.5%（最近年度2.9%）；近3年累计自由现金流 4.0亿 / 当年分红 2.7亿 = 1.49倍）：高分红率可能由一次性收益或存量现金支撑，不宜按稳定红利资产解读",
+    "应收账款周转效率边际下降，回款节奏放缓，需关注大客户结算周期变化"
+   ],
+   "metadata": {
+    "paper_wealth": false,
+    "consecutive_loss_years": 0,
+    "healthy_working_capital": false,
+    "order_backed_inventory": false,
+    "business_model": null,
+    "distribution_expanding": false,
+    "raw_weighted_score": 75.2,
+    "floor_applied": null,
+    "micro_profit_diluted": false,
+    "micro_profit_cap_applied": false,
+    "scoring_note": null,
+    "net_margin_pct": 9.276874980395798
+   }
+  },
+  "solvency": {
+   "score": 93.9,
+   "level": "A",
+   "indicator_count": 4,
+   "indicators": [
+    {
+     "name": "资产负债率(%)",
+     "value": 36.94,
+     "score": 90.0,
+     "weight": 3.0
+    },
+    {
+     "name": "有息负债率(%)",
+     "value": 0.0,
+     "score": 90.0,
+     "weight": 2.5
+    },
+    {
+     "name": "流动比率",
+     "value": 9.87,
+     "score": 100.0,
+     "weight": 2.0
+    },
+    {
+     "name": "速动比率",
+     "value": 7.62,
+     "score": 100.0,
+     "weight": 1.5
+    }
+   ],
+   "warnings": [],
+   "metadata": {
+    "tight_debt_industry": false,
+    "business_model": null,
+    "bank_leverage_only": false,
+    "asset_quality_metrics_available": true,
+    "balance_sheet": {
+     "report_date": "20260630",
+     "total_assets": 1685045600.0,
+     "total_liabilities": 622460000.0,
+     "operating_liabilities": 90112300.0,
+     "interest_bearing_debt": 0.0,
+     "short_term_borrowings": 0.0,
+     "interest_bearing_ratio": 0.0,
+     "interest_bearing_explicit": true,
+     "current_ratio": 9.87,
+     "quick_ratio": 7.62,
+     "estimated": false,
+     "source": "sina_original",
+     "notes_receivable": 53910900.0
+    },
+    "supply_chain_power": false,
+    "adjusted_current_ratio": null,
+    "adjusted_quick_ratio": null
+   }
+  },
+  "efficiency": {
+   "score": 62.5,
+   "level": "C",
+   "indicator_count": 3,
+   "indicators": [
+    {
+     "name": "总资产周转率",
+     "value": 1.043,
+     "score": 82.59741440512907,
+     "weight": 2.5
+    },
+    {
+     "name": "应收周转天数变化率",
+     "value": 9.3,
+     "score": 70.0,
+     "weight": 2.0
+    },
+    {
+     "name": "存货/营收比值",
+     "value": 0.248,
+     "score": 30.0,
+     "weight": 2.0
+    }
+   ],
+   "warnings": [
+    "利润侵蚀预警：存货/营收比值同比上升77.0%（存货/营收=0.248，存货同比+77.1%、营收同比+0.0%）；存货增速持续高于营收增速，需关注后续存货跌价准备计提对利润的侵蚀"
+   ],
+   "metadata": {
+    "capital_heavy": false,
+    "ops_efficiency": {
+     "period": "20260630",
+     "ar_days_latest": 142.4,
+     "ar_days_yoy_pct": 9.3,
+     "inv_to_rev_latest": 0.2482,
+     "inv_to_rev_yoy_pct": 77.0,
+     "inv_yoy_pct": 77.1,
+     "rev_yoy_pct": 0.0,
+     "prev_period": "20250630"
+    },
+    "inv_erosion_warning": true
+   }
+  },
+  "risk": {
+   "score": 80.6,
+   "level": "B",
+   "indicator_count": 0,
+   "indicators": [],
+   "warnings": [
+    "应收账款周转效率边际下降，回款节奏放缓，需关注大客户结算周期变化；应收票据同比+56%",
+    "观察级风险：实控人/大股东减持（扣分但不否决）",
+    "减持窗口期：2026-09-16 至 2026-12-15（剩余 84 天），窗口期内存在持续抛压",
+    "大宗交易折价：2026-09-16 成交价 13.47 元，折价 9.17%，承接方要求较高风险补偿，短期抛压信号"
+   ],
+   "metadata": {
+    "delist_risk": false,
+    "consecutive_loss_years": 0,
+    "major_risk_count": 0,
+    "observe_risk_count": 1,
+    "highlights": [
+     "应收账款周转天数从80.6天降至72.9天（五年-7.7天，回款效率改善）"
+    ],
+    "reduce_window": {
+     "start": "2026-09-16",
+     "end": "2026-12-15",
+     "in_window": true,
+     "remaining_days": 84,
+     "notice_date": "2026-08-25"
+    },
+    "reduce_remaining_days": 84,
+    "reduce_window_deduct": 5.0,
+    "block_trade_deduct": 2.4,
+    "latest_block_trade": {
+     "trade_date": "2026-09-16",
+     "deal_price": 13.47,
+     "premium_ratio": -0.091706001349,
+     "discount_pct": 9.17,
+     "deal_amt": 26905000.0,
+     "volume": 1997400.0,
+     "buyer": "国泰海通证券股份有限公司上海长宁区江苏路证券营业部",
+     "seller": "华泰证券股份有限公司无锡解放西路证券营业部"
+    },
+    "pledge_ratio": 0.4999,
+    "pledge_invalid": false
+   }
+  },
+  "industry": {
+   "score": 58.5,
+   "level": "C",
+   "indicator_count": 2,
+   "indicators": [
+    {
+     "name": "ROE vs 行业",
+     "value": 12.44,
+     "score": 83.96,
+     "weight": 2.0
+    },
+    {
+     "name": "营收增速 vs 行业",
+     "value": 0.02,
+     "score": 33.11355374288889,
+     "weight": 2.0
+    }
+   ],
+   "warnings": [],
+   "metadata": {
+    "peer_count": 35,
+    "insufficient_sample": false
+   }
+  }
+ }
+}

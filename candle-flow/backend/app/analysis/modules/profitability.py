@@ -198,6 +198,7 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
             revenue_yoy=kwargs.get("revenue_yoy"),
             profit_yoy=kwargs.get("profit_yoy"),
             pe_ttm=kwargs.get("pe_ttm"),
+            pb=kwargs.get("pb"),
         ).get("is_growth_stock")
         if _roe_is_growth and roe < 5:
             roe_score = round(roe_score * 0.7, 1)
@@ -312,6 +313,7 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
             profit_yoy=kwargs.get("profit_yoy"),
             profit_cagr_3y=None,  # 由 engine 传 metadata，模块内不算
             pe_ttm=kwargs.get("pe_ttm"),
+            pb=kwargs.get("pb"),
             is_high_growth_quality=is_hgq,
             is_dividend_asset=is_div,
         )

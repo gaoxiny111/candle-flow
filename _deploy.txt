@@ -1,0 +1,105 @@
+﻿WARN: local tunnel credentials missing; keep server copy
+Hit:1 http://mirrors.cloud.aliyuncs.com/ubuntu noble InRelease
+Get:2 http://mirrors.cloud.aliyuncs.com/ubuntu noble-updates InRelease [126 kB]
+Hit:3 http://mirrors.cloud.aliyuncs.com/ubuntu noble-backports InRelease
+Hit:4 http://mirrors.cloud.aliyuncs.com/ubuntu noble-security InRelease
+Get:5 http://mirrors.cloud.aliyuncs.com/ubuntu noble-updates/main amd64 Packages [1,275 kB]
+Get:6 http://mirrors.cloud.aliyuncs.com/ubuntu noble-updates/universe amd64 Packages [1,689 kB]
+Fetched 3,090 kB in 2s (1,242 kB/s)
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+python3 is already the newest version (3.12.3-0ubuntu2.1).
+python3-venv is already the newest version (3.12.3-0ubuntu2.1).
+python3-pip is already the newest version (24.0+dfsg-1ubuntu1.3).
+tar is already the newest version (1.35+dfsg-3ubuntu0.4).
+curl is already the newest version (8.5.0-2ubuntu10.13).
+ca-certificates is already the newest version (20260601~24.04.1).
+0 upgraded, 0 newly installed, 0 to remove and 73 not upgraded.
+Looking in indexes: http://mirrors.cloud.aliyuncs.com/pypi/simple/
+Requirement already satisfied: pip in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (26.2.1)
+Requirement already satisfied: wheel in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (0.48.0)
+Requirement already satisfied: packaging>=24.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from wheel) (26.3)
+Looking in indexes: http://mirrors.cloud.aliyuncs.com/pypi/simple/
+Requirement already satisfied: fastapi==0.115.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from -r /opt/candle-flow/backend/requirements.txt (line 1)) (0.115.0)
+Requirement already satisfied: uvicorn==0.30.6 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from uvicorn[standard]==0.30.6->-r /opt/candle-flow/backend/requirements.txt (line 2)) (0.30.6)
+Requirement already satisfied: sqlalchemy==2.0.35 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from -r /opt/candle-flow/backend/requirements.txt (line 3)) (2.0.35)
+Requirement already satisfied: alembic==1.13.2 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from -r /opt/candle-flow/backend/requirements.txt (line 4)) (1.13.2)
+Requirement already satisfied: pydantic==2.9.2 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from -r /opt/candle-flow/backend/requirements.txt (line 5)) (2.9.2)
+Requirement already satisfied: pydantic-settings==2.5.2 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from -r /opt/candle-flow/backend/requirements.txt (line 6)) (2.5.2)
+Requirement already satisfied: python-dotenv==1.0.1 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from -r /opt/candle-flow/backend/requirements.txt (line 7)) (1.0.1)
+Requirement already satisfied: akshare>=1.14.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from -r /opt/candle-flow/backend/requirements.txt (line 8)) (1.18.94)
+Requirement already satisfied: pypinyin>=0.50.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from -r /opt/candle-flow/backend/requirements.txt (line 9)) (0.55.0)
+Requirement already satisfied: pandas>=2.0.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from -r /opt/candle-flow/backend/requirements.txt (line 10)) (3.0.5)
+Requirement already satisfied: numpy>=1.24.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from -r /opt/candle-flow/backend/requirements.txt (line 11)) (2.5.2)
+Requirement already satisfied: python-multipart==0.0.9 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from -r /opt/candle-flow/backend/requirements.txt (line 12)) (0.0.9)
+Requirement already satisfied: httpx==0.27.2 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from -r /opt/candle-flow/backend/requirements.txt (line 13)) (0.27.2)
+Requirement already satisfied: websockets==13.1 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from -r /opt/candle-flow/backend/requirements.txt (line 14)) (13.1)
+Requirement already satisfied: apscheduler==3.10.4 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from -r /opt/candle-flow/backend/requirements.txt (line 15)) (3.10.4)
+Requirement already satisfied: cachetools==5.5.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from -r /opt/candle-flow/backend/requirements.txt (line 16)) (5.5.0)
+Requirement already satisfied: pytest==8.3.3 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from -r /opt/candle-flow/backend/requirements.txt (line 17)) (8.3.3)
+Requirement already satisfied: qrcode==8.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from -r /opt/candle-flow/backend/requirements.txt (line 18)) (8.0)
+Requirement already satisfied: pillow>=10.0.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from -r /opt/candle-flow/backend/requirements.txt (line 19)) (12.3.0)
+Requirement already satisfied: starlette<0.39.0,>=0.37.2 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from fastapi==0.115.0->-r /opt/candle-flow/backend/requirements.txt (line 1)) (0.38.6)
+Requirement already satisfied: typing-extensions>=4.8.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from fastapi==0.115.0->-r /opt/candle-flow/backend/requirements.txt (line 1)) (4.16.0)
+Requirement already satisfied: annotated-types>=0.6.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from pydantic==2.9.2->-r /opt/candle-flow/backend/requirements.txt (line 5)) (0.8.0)
+Requirement already satisfied: pydantic-core==2.23.4 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from pydantic==2.9.2->-r /opt/candle-flow/backend/requirements.txt (line 5)) (2.23.4)
+Requirement already satisfied: click>=7.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from uvicorn==0.30.6->uvicorn[standard]==0.30.6->-r /opt/candle-flow/backend/requirements.txt (line 2)) (8.5.0)
+Requirement already satisfied: h11>=0.8 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from uvicorn==0.30.6->uvicorn[standard]==0.30.6->-r /opt/candle-flow/backend/requirements.txt (line 2)) (0.16.0)
+Requirement already satisfied: greenlet!=0.4.17 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from sqlalchemy==2.0.35->-r /opt/candle-flow/backend/requirements.txt (line 3)) (3.5.5)
+Requirement already satisfied: Mako in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from alembic==1.13.2->-r /opt/candle-flow/backend/requirements.txt (line 4)) (1.4.1)
+Requirement already satisfied: anyio in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from httpx==0.27.2->-r /opt/candle-flow/backend/requirements.txt (line 13)) (4.14.2)
+Requirement already satisfied: certifi in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from httpx==0.27.2->-r /opt/candle-flow/backend/requirements.txt (line 13)) (2026.7.22)
+Requirement already satisfied: httpcore==1.* in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from httpx==0.27.2->-r /opt/candle-flow/backend/requirements.txt (line 13)) (1.0.9)
+Requirement already satisfied: idna in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from httpx==0.27.2->-r /opt/candle-flow/backend/requirements.txt (line 13)) (3.19)
+Requirement already satisfied: sniffio in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from httpx==0.27.2->-r /opt/candle-flow/backend/requirements.txt (line 13)) (1.3.1)
+Requirement already satisfied: six>=1.4.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from apscheduler==3.10.4->-r /opt/candle-flow/backend/requirements.txt (line 15)) (1.17.0)
+Requirement already satisfied: pytz in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from apscheduler==3.10.4->-r /opt/candle-flow/backend/requirements.txt (line 15)) (2026.3.post1)
+Requirement already satisfied: tzlocal!=3.*,>=2.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from apscheduler==3.10.4->-r /opt/candle-flow/backend/requirements.txt (line 15)) (5.4.4)
+Requirement already satisfied: iniconfig in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from pytest==8.3.3->-r /opt/candle-flow/backend/requirements.txt (line 17)) (2.3.0)
+Requirement already satisfied: packaging in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from pytest==8.3.3->-r /opt/candle-flow/backend/requirements.txt (line 17)) (26.3)
+Requirement already satisfied: pluggy<2,>=1.5 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from pytest==8.3.3->-r /opt/candle-flow/backend/requirements.txt (line 17)) (1.6.0)
+Requirement already satisfied: httptools>=0.5.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from uvicorn[standard]==0.30.6->-r /opt/candle-flow/backend/requirements.txt (line 2)) (0.8.0)
+Requirement already satisfied: pyyaml>=5.1 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from uvicorn[standard]==0.30.6->-r /opt/candle-flow/backend/requirements.txt (line 2)) (6.0.3)
+Requirement already satisfied: uvloop!=0.15.0,!=0.15.1,>=0.14.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from uvicorn[standard]==0.30.6->-r /opt/candle-flow/backend/requirements.txt (line 2)) (0.22.1)
+Requirement already satisfied: watchfiles>=0.13 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from uvicorn[standard]==0.30.6->-r /opt/candle-flow/backend/requirements.txt (line 2)) (1.2.0)
+Requirement already satisfied: beautifulsoup4>=4.9.1 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (4.15.0)
+Requirement already satisfied: lxml>=4.2.1 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (6.1.2)
+Requirement already satisfied: requests>=2.22.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (2.34.2)
+Requirement already satisfied: curl_cffi>=0.13.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (0.16.2)
+Requirement already satisfied: html5lib>=1.0.1 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (1.1)
+Requirement already satisfied: xlrd>=1.2.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (2.0.2)
+Requirement already satisfied: urllib3>=1.25.8 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (2.7.0)
+Requirement already satisfied: tqdm>=4.43.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (4.70.0)
+Requirement already satisfied: openpyxl>=3.0.3 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (3.1.5)
+Requirement already satisfied: jsonpath>=0.82 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (0.82.2)
+Requirement already satisfied: tabulate>=0.8.6 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (0.10.0)
+Requirement already satisfied: decorator>=4.4.2 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (5.3.1)
+Requirement already satisfied: py-mini-racer>=0.6.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (0.6.0)
+Requirement already satisfied: akracer>=0.0.13 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (0.0.14)
+Requirement already satisfied: python-dateutil>=2.8.2 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from pandas>=2.0.0->-r /opt/candle-flow/backend/requirements.txt (line 10)) (2.9.0.post0)
+Requirement already satisfied: soupsieve>=1.6.1 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from beautifulsoup4>=4.9.1->akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (2.9.2)
+Requirement already satisfied: cffi>=2.0.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from curl_cffi>=0.13.0->akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (2.1.1)
+Requirement already satisfied: pycparser in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from cffi>=2.0.0->curl_cffi>=0.13.0->akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (3.0)
+Requirement already satisfied: webencodings in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from html5lib>=1.0.1->akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (0.6.1)
+Requirement already satisfied: et-xmlfile in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from openpyxl>=3.0.3->akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (2.0.0)
+Requirement already satisfied: charset_normalizer<4,>=2 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from requests>=2.22.0->akshare>=1.14.0->-r /opt/candle-flow/backend/requirements.txt (line 8)) (3.5.1)
+Requirement already satisfied: MarkupSafe>=2.0 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from Mako->alembic==1.13.2->-r /opt/candle-flow/backend/requirements.txt (line 4)) (3.0.3)
+Looking in indexes: http://mirrors.cloud.aliyuncs.com/pypi/simple/
+Requirement already satisfied: httpx==0.27.2 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (0.27.2)
+Requirement already satisfied: anyio in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from httpx==0.27.2) (4.14.2)
+Requirement already satisfied: certifi in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from httpx==0.27.2) (2026.7.22)
+Requirement already satisfied: httpcore==1.* in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from httpx==0.27.2) (1.0.9)
+Requirement already satisfied: idna in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from httpx==0.27.2) (3.19)
+Requirement already satisfied: sniffio in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from httpx==0.27.2) (1.3.1)
+Requirement already satisfied: h11>=0.16 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from httpcore==1.*->httpx==0.27.2) (0.16.0)
+Requirement already satisfied: typing_extensions>=4.5 in /opt/candle-flow/backend/.venv/lib/python3.12/site-packages (from anyio->httpx==0.27.2) (4.16.0)
+SETUP_OK
+powershell : curl: (7) Failed to connect to 127.0.0.1 port 8002 after 0 ms: Couldn't connect to server
+所在位置 行:445 字符: 1
++ powershell -ExecutionPolicy Bypass -File "D:\candle-flow(2)\candle-fl ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (curl: (7) Faile...nnect to server:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

@@ -1,0 +1,5 @@
+﻿scan_http=200
+matched: 1 coverage: {"covered": 5226, "universe": 5382, "remaining": 156, "coverage_pct": 97.1, "latest_built_at": "2026-09-20T10:15:04.104868", "stale_days": 0.62, "complete": false}
+002545 not in keyword scan items: ['002545.SZ']
+{"code":200,"message":"success","data":{"built":0,"failed":156,"skipped":5226,"duration_sec":169.1,"budget_sec":10800.0,"truncated":false,"coverage":{"covered":5226,"universe":5382,"remaining":156,"coverage_pct":97.1}},"meta":null}
+profit_yoy missing: 0/5226

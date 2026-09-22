@@ -4,10 +4,12 @@ import { RouterLink } from 'vue-router'
 import {
   apiErrorText,
   buildMarketScanResonance,
+  fetchMarketRegime,
   fetchMarketScan,
   fetchMarketScanOverlay,
   fetchMarketScanResonance,
   fetchResonanceProgress,
+  type MarketRegimeData,
   type MarketScanCoverage,
   type MarketScanData,
   type MarketScanItem,
@@ -49,6 +51,8 @@ const form = ref({
   include_gem: false,
   top: 50,
   offset: 0,
+  /** 技术面门槛（共振模式的「买入候选」线）；大盘偏空时可由用户调到 85 */
+  min_tech: 70,
 })
 
 /** 共振模式（默认）：排序 = 核心持仓 → 买入候选 → 观察 → 淘汰，不再按综合分 */
@@ -58,6 +62,31 @@ const resoEmpty = ref(false)
 const resoError = ref('')
 const resoLoading = ref(false)
 const resoJob = ref<ResonanceJobStatus | null>(null)
+
+/** 大盘环境提示：纯展示，不参与打分（后端 scoring_impact 恒为 none）。
+ *  是否据此抬高技术面门槛由用户点击决定，系统不会自动改写。 */
+const regime = ref<MarketRegimeData | null>(null)
+const regimeError = ref('')
+
+async function loadRegime(force = false) {
+  try {
+    const { data } = await fetchMarketRegime(force)
+    regime.value = data.data
+    regimeError.value = ''
+  } catch (e) {
+    regime.value = null
+    regimeError.value = apiErrorText(e, '大盘环境读取失败')
+  }
+}
+
+/** 采纳提示：把「买入候选」的技术面门槛提到核心线 85（需用户主动点击） */
+function applyRegimeAdvice() {
+  form.value.min_tech = 85
+  page.value = 1
+  verdictFilter.value = ''
+  applyFilters()
+}
+
 let pollTimer: ReturnType<typeof setTimeout> | null = null
 
 function stopPoll() {
@@ -132,6 +161,7 @@ async function loadResonance() {
       min_market_cap_yi: q.min_market_cap_yi === '' ? undefined : Number(q.min_market_cap_yi),
       exclude_st: q.exclude_st,
       include_gem: q.include_gem,
+      min_tech: q.min_tech,
       verdict_filter: verdictFilter.value || undefined,
     })
     const payload = data.data
@@ -370,6 +400,7 @@ function resetFilters() {
     include_gem: false,
     top: 50,
     offset: 0,
+    min_tech: 70,
   }
   page.value = 1
   overlayOn.value = false
@@ -428,26 +459,14 @@ const displayItems = computed<DisplayRow[]>(() => {
   if (resoMode.value) {
     let rows = (reso.value?.items ?? []) as DisplayRow[]
     if (onlySignaled.value) {
-      rows = rows.filter(
-        (r) =>
-          r.buy_signal === 'strong_buy' ||
-          r.buy_signal === 'watch' ||
-          r.buy_signal === 'short_term' ||
-          r.pattern_name,
-      )
+      rows = rows.filter(hasSignal)
     }
     return rows
   }
   if (overlayOn.value && overlay.value) {
-    let rows = overlay.value.items
+    let rows = overlay.value.items as DisplayRow[]
     if (onlySignaled.value) {
-      rows = rows.filter(
-        (r) =>
-          r.buy_signal === 'strong_buy' ||
-          r.buy_signal === 'watch' ||
-          r.buy_signal === 'short_term' ||
-          r.pattern_name,
-      )
+      rows = rows.filter(hasSignal)
     }
     const vf = verdictFilter.value
     if (vf) {
@@ -471,18 +490,36 @@ const industryConfluence = computed(() => overlay.value?.industry_confluence ?? 
 
 const SIGNAL_LABELS: Record<string, string> = {
   strong_buy: '强买入',
+  bottom_confirm: '右侧底部企稳',
   watch: '观察',
+  left_side: '左侧超跌观察',
+  setup_ready: '形态达标待确认',
   short_term: '短线博弈',
-  neutral: '中性',
+  neutral: '趋势未确认',
   insufficient_data: '数据不足',
   unknown: '分析失败',
 }
 
 function signalTone(sig: string | null | undefined): string {
   if (sig === 'strong_buy') return 'strong'
+  if (sig === 'bottom_confirm') return 'medium'
   if (sig === 'watch') return 'medium'
-  if (sig === 'short_term') return 'weak'
+  if (sig === 'short_term' || sig === 'left_side' || sig === 'setup_ready') return 'weak'
   return 'plain'
+}
+
+// 「只看有信号」的判定：买点信号已含阶段标签，不再只看三档；
+// 保留 pattern_name 兜底（老缓存 payload 可能只有形态没有阶段标签）。
+function hasSignal(r: DisplayRow): boolean {
+  return (
+    r.buy_signal === 'strong_buy' ||
+    r.buy_signal === 'bottom_confirm' ||
+    r.buy_signal === 'watch' ||
+    r.buy_signal === 'short_term' ||
+    r.buy_signal === 'left_side' ||
+    r.buy_signal === 'setup_ready' ||
+    !!r.pattern_name
+  )
 }
 
 async function loadOverlay() {
@@ -551,7 +588,10 @@ function toggleOverlay() {
   loadOverlay()
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  loadRegime()
+})
 </script>
 
 <template>
@@ -565,6 +605,36 @@ onMounted(load)
         （含 E 档打折、风险乘数与公告事件扣分），技术面分与信号页同源，只分类、不改分。
       </p>
     </header>
+
+    <section v-if="regime" class="card regime" :class="`regime-${regime.regime}`">
+      <div class="regime-head">
+        <h2>大盘环境 · {{ regime.label }}</h2>
+        <span class="regime-tag">展示提示，不参与打分</span>
+      </div>
+      <p class="regime-advice">{{ regime.advice }}</p>
+      <ul class="regime-items">
+        <li v-for="it in regime.items" :key="it.symbol">
+          <b>{{ it.name }}</b>
+          <span class="regime-label">{{ it.label || '数据不足' }}</span>
+          <span class="regime-detail">{{ it.reason || '—' }}</span>
+          <span class="regime-detail">
+            截至 {{ it.as_of || '—' }}<template v-if="it.stale">（已落后·未参与合成）</template>
+          </span>
+        </li>
+      </ul>
+      <div class="regime-foot">
+        <button
+          v-if="regime.regime === 'risk_off'"
+          class="btn-secondary"
+          type="button"
+          @click="applyRegimeAdvice"
+        >
+          按提示把技术面门槛提到 85
+        </button>
+        <span class="regime-rule">{{ regime.rule }}</span>
+      </div>
+    </section>
+    <p v-else-if="regimeError" class="coverage-warn">{{ regimeError }}</p>
 
     <section class="card coverage" :class="coverageTone">
       <div class="coverage-head">
@@ -640,6 +710,14 @@ onMounted(load)
       <label class="field">
         <span>市值 ≥（亿）</span>
         <input v-model="form.min_market_cap_yi" type="number" min="0" placeholder="不限" />
+      </label>
+      <label v-if="resoMode" class="field">
+        <span>技术面 ≥</span>
+        <select v-model.number="form.min_tech" @change="applyFilters">
+          <option :value="70">70（默认·等价「有形态共振」）</option>
+          <option :value="85">85（大盘偏空·从严）</option>
+          <option :value="60">60（放宽·仍不吃淘汰线）</option>
+        </select>
       </label>
       <label class="field">
         <span>每页条数</span>
@@ -1092,6 +1170,29 @@ button.verdict-chip { border: 1px solid transparent; cursor: pointer; }
   font-size: 12px;
   word-break: break-all;
 }
+
+/* 大盘环境提示（展示层，不参与打分）；颜色沿用 A 股约定：红=偏多、绿=偏空 */
+.regime { border-left: 3px solid var(--border-color); }
+.regime-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.regime-head h2 { margin: 0; font-size: 15px; }
+.regime-tag {
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--bg-page);
+  border: 1px solid var(--border-color);
+}
+.regime-advice { margin: 6px 0 8px; font-size: 13px; line-height: 1.6; }
+.regime-items { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; }
+.regime-items li { display: flex; gap: 8px; font-size: 13px; flex-wrap: wrap; }
+.regime-label { color: var(--text-secondary); }
+.regime-detail { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.regime-foot { margin-top: 10px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.regime-rule { font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+.regime-risk_on { border-left-color: #cf1322; }
+.regime-neutral { border-left-color: #d46b08; }
+.regime-risk_off { border-left-color: #389e0d; }
 
 /* ── 筛选器 ───────────────────────────────── */
 .filters {

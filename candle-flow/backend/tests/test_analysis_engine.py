@@ -1155,7 +1155,13 @@ def test_wacc_prefers_interest_bearing_ratio():
 
 
 def test_peg_growth_fallback_uses_forward_yoy():
-    """年报序列不足时 PEG 回退同比，须用折减口径，不得让 493% 把 PEG 压到 0.05。"""
+    """极值同比不得做 PEG 分母（2026-09-21 第三轮收紧）。
+
+    旧行为：年报序列不足时回退 ``profit_yoy_forward``（±300% 折减），
+    于是 PE 285 的票借 +300% 算出 PEG 0.95「低估」并触发「PEG核心锚」90 分。
+    新行为：极值同比本身即「该增速不可持续」的自认 → PEG 不适用（None）。
+    仅当同比非极值（真·新上市票）时才保留单期同比兜底。
+    """
     import pandas as pd
 
     meta = {
@@ -1163,16 +1169,21 @@ def test_peg_growth_fallback_uses_forward_yoy():
         "profit_yoy_forward": 300.0,
         "profit_yoy_extreme": True,
     }
-    # 年报序列不足 2 期 → 走回退分支
+    # 年报序列不足 2 期 → 本想走回退分支，但同比是极值 → 拒绝
     fd = pd.DataFrame({"net_profit": [2e8]}, index=["20251231"])
     g, src = FundamentalEngine._growth_for_peg(fd, meta)
-    assert g == 300.0
-    assert "前瞻口径" in src
+    assert g is None
+    assert "极值" in src
 
-    # 非极端情形不受影响，来源文案保持简洁
+    # 非极端情形仍保留兜底，来源文案标明「无年报序列」
     g2, src2 = FundamentalEngine._growth_for_peg(fd, {"profit_yoy": 28.5, "profit_yoy_forward": 28.5})
     assert g2 == 28.5
-    assert src2 == "最新净利同比"
+    assert src2 == "最新净利同比（无年报序列）"
+
+    # 有完整年报窗口但下滑 → 同样不适用（窗口口径优先于单期同比）
+    fd2 = pd.DataFrame({"net_profit": [500.0, 300.0, 150.0, 60.0, 80.0]})
+    g3, src3 = FundamentalEngine._growth_for_peg(fd2, {"profit_yoy": 493.25, "profit_yoy_extreme": True})
+    assert g3 is None and "PEG不适用" in src3
 
 
 def test_comps_uses_explicit_distribution_peers(monkeypatch):
@@ -1909,3 +1920,174 @@ def test_dividend_yield_fallback_shared_across_modules(monkeypatch):
     assert prof.get("wacc_pct") == pytest.approx(4.5)
     # 红利资产不得因 ROIC<WACC 触发价值陷阱一票否决（豁免 ：1198-1204）
     assert not val.get("value_trap_veto")
+
+
+# ── 现金流「微利稀释」闸门 ────────────────────────────────────────────────
+# 病根：净利润趋近 0 时「经营现金流/净利润」被微利分母无限放大。
+# 实测 600722 金牛化工：该比率 5 年均值 2.93 → 90 分（权重 3.0），
+# 而每股经营现金流仅 0.078 元 → 3.9 分（权重 1.5）。
+# 靠权重 3.0 的虚高比率把模块分抬到 75.8，掩盖「绝对造血能力极弱」的事实，
+# 再经综合分（现金流权重 0.32，全模块最重）掩护高估值票。
+# 判据用**每股经营现金流绝对额**（不被微利分母操纵）而非比率本身。
+
+
+def _micro_profit_fin_df():
+    import pandas as pd
+
+    idx = [f"202{i}1231" for i in range(1, 6)]
+    return pd.DataFrame(
+        {
+            "net_profit": [8e6, 7e6, 9e6, 6e6, 5e6],  # 微利 500~900 万
+            "operating_cashflow": [2.3e7, 2.1e7, 2.6e7, 1.8e7, 1.5e7],  # ratio≈2.9
+            "capital_expenditure": [4e6, 3.5e6, 4e6, 3e6, 2.5e6],
+            "revenue": [4.5e8] * 5,
+            "eps": [0.02] * 5,
+        },
+        index=idx,
+    )
+
+
+def test_cashflow_micro_profit_dilution_caps_score():
+    """微利稀释：每股经营现金流 < 0.3 且净利率 < 5% → 模块分封顶 50。"""
+    from app.analysis.modules.cashflow import CashflowAnalyzer
+
+    r = CashflowAnalyzer().analyze(
+        _micro_profit_fin_df(),
+        name="金牛化工",
+        symbol="600722.SH",
+        industry="化学原料",
+        ocf_per_share=0.078,
+        net_margin=1.1,
+        latest_report="20260630",
+        revenue_yoy=1.95,
+        profit_yoy=31.42,
+    )
+    assert r.metadata["micro_profit_diluted"] is True
+    assert r.metadata["micro_profit_cap_applied"] is True
+    assert r.score == 50.0
+    # 原始加权分必须远高于封顶值（自证「封顶确实生效」而不是本来就这么低）
+    assert r.metadata["raw_weighted_score"] > 60.0
+    assert any("微利稀释" in w for w in r.warnings)
+
+
+def test_cashflow_micro_profit_gate_spares_normal_company():
+    """每股经营现金流充足 / 净利率正常的公司不受闸门影响。"""
+    from app.analysis.modules.cashflow import CashflowAnalyzer
+
+    fd = _micro_profit_fin_df()
+    fd["net_profit"] = [8e7] * 5  # 净利抬到 8000 万
+    r = CashflowAnalyzer().analyze(
+        fd,
+        name="正常公司",
+        symbol="600000.SH",
+        industry="银行",
+        ocf_per_share=1.2,
+        net_margin=18.0,
+        latest_report="20260630",
+    )
+    assert r.metadata["micro_profit_diluted"] is False
+    assert r.metadata["micro_profit_cap_applied"] is False
+    assert r.score > 50.0
+
+
+def test_cashflow_micro_profit_gate_needs_both_conditions():
+    """两个条件须同时满足：只有低每股现金流、净利率正常时不触发。"""
+    from app.analysis.modules.cashflow import CashflowAnalyzer
+
+    r = CashflowAnalyzer().analyze(
+        _micro_profit_fin_df(),
+        name="低每股现金流但高净利率",
+        symbol="600001.SH",
+        industry="制造业",
+        ocf_per_share=0.1,
+        net_margin=20.0,  # 净利率达标 → 不触发
+        latest_report="20260630",
+    )
+    assert r.metadata["micro_profit_diluted"] is False
+
+
+def test_cashflow_micro_profit_gate_missing_net_margin_passes():
+    """净利率缺失（未透传）时放行——不猜、不因缺数据而改变判定。"""
+    from app.analysis.modules.cashflow import CashflowAnalyzer
+
+    r = CashflowAnalyzer().analyze(
+        _micro_profit_fin_df(),
+        name="缺净利率",
+        symbol="600002.SH",
+        industry="制造业",
+        ocf_per_share=0.078,
+        latest_report="20260630",
+    )
+    assert r.metadata["micro_profit_diluted"] is False
+
+
+# ── 第八轮：估值软化阶梯（长白山 603099 案例）──────────────────────────
+# 旧口径：PE>80 且分位 <90 → 一律把 signal 洗成「合理」。长白山 PE 80.6 /
+# 分位 86.1 因此被判「合理」，与「估值极高」的事实相悖。新口径按绝对估值
+# 分档收紧分位门槛，使「绝对 + 相对」双高的票不再被软化。
+def _soften_ctx(pe, pctl, pb=None, pb_pctl=None):
+    rel = {"PE_TTM": {"current": pe, "percentile_5y": pctl, "signal": "高估"}}
+    if pb is not None:
+        rel["PB"] = {"current": pb, "percentile_5y": pb_pctl, "signal": "高估"}
+    return rel
+
+
+@pytest.mark.parametrize(
+    "pe,pctl,expect_softened",
+    (
+        (80.6, 86.1, False),   # 长白山：绝对+相对双高 → 不软化
+        (85.0, 80.0, False),   # 刚好触及 80 分位门槛
+        (85.0, 79.9, True),    # 略低于门槛 → 仍软化
+        (193.5, 89.8, False),  # 金牛化工：极端档，70 分位门槛
+        (193.5, 70.0, False),  # 极端档刚到门槛
+        (193.5, 69.9, True),   # 极端档略低 → 软化
+        (60.0, 99.0, False),   # PE 未达 80 → 不进入软化分支（signal 保持原值）
+    ),
+)
+def test_valuation_soften_ladder_thresholds(pe, pctl, expect_softened):
+    """软化阶梯：PE 80~150 用 80 分位门槛，PE>150 用 70 分位门槛。
+
+    PE ≤ 80 时不进入软化分支，signal 保持调用前原值（不软化也不改判）。
+    """
+    from app.analysis.engine import _apply_valuation_soften_ladder
+
+    rel = _soften_ctx(pe, pctl)
+    _apply_valuation_soften_ladder(rel, pe=pe, pb=None, is_growth=True, is_div=False)
+    softened = bool(rel["PE_TTM"].get("growth_percentile_softened"))
+    assert softened is expect_softened, (pe, pctl, rel["PE_TTM"])
+    if pe <= 80:
+        assert rel["PE_TTM"]["signal"] == "高估", "PE≤80 不应触碰 signal"
+    elif not expect_softened:
+        assert rel["PE_TTM"]["signal"] == "偏高"
+
+
+def test_valuation_soften_pb_ladder():
+    """PB > 8 档：分位 ≥80 不软化，<80 才软化。"""
+    from app.analysis.engine import _apply_valuation_soften_ladder
+
+    rel = _soften_ctx(100.0, 10.0, pb=9.0, pb_pctl=85.0)
+    _apply_valuation_soften_ladder(rel, pe=100.0, pb=9.0, is_growth=True, is_div=False)
+    assert not rel["PB"].get("growth_percentile_softened")
+    assert rel["PB"]["signal"] == "偏高"
+
+    rel2 = _soften_ctx(100.0, 10.0, pb=9.0, pb_pctl=50.0)
+    _apply_valuation_soften_ladder(rel2, pe=100.0, pb=9.0, is_growth=True, is_div=False)
+    assert rel2["PB"].get("growth_percentile_softened") is True
+
+
+def test_valuation_soften_skipped_for_dividend_asset():
+    """红利资产不走成长股软化口径（沿用既有设计）。"""
+    from app.analysis.engine import _apply_valuation_soften_ladder
+
+    rel = _soften_ctx(85.0, 50.0)
+    _apply_valuation_soften_ladder(rel, pe=85.0, pb=None, is_growth=True, is_div=True)
+    assert not rel["PE_TTM"].get("growth_percentile_softened")
+
+
+def test_valuation_soften_skipped_when_not_growth():
+    """非成长股不适用软化（避免又变成 PE 高就算成长的漏洞）。"""
+    from app.analysis.engine import _apply_valuation_soften_ladder
+
+    rel = _soften_ctx(85.0, 50.0)
+    _apply_valuation_soften_ladder(rel, pe=85.0, pb=None, is_growth=False, is_div=False)
+    assert not rel["PE_TTM"].get("growth_percentile_softened")

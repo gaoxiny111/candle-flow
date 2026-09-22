@@ -1,0 +1,35 @@
+..........s..............F.                                              [100%]
+================================== FAILURES ===================================
+___________________ test_regime_synthesis_skips_stale_index ___________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002AFF0B924D0>
+
+    def test_regime_synthesis_skips_stale_index(monkeypatch):
+        """两个指数停在不同交易日时，只用已更新到最新交易日的那个（跨日混算是伪精度）。"""
+        from app.services.main_board_kline_sync import target_trade_date
+    
+        import app.services.market_regime as mr
+    
+        fresh = _trend_bars(1.004, n=90, end=target_trade_date())  # 上涨且新鲜 → risk_on
+        stale = _trend_bars(0.996, n=90)  # 下跌但停在 2024 → 应被排除
+        monkeypatch.setattr(
+            mr,
+            "_load_klines",
+            lambda symbol, db=None: fresh if symbol == "000300.SH" else stale,
+        )
+        data = mr.market_regime(db=None, force=True)
+        assert data["regime"] == "risk_on"
+        assert "上证指数" in data["stale_indexes"]
+>       assert "000300.SH（截至" in data["basis"]
+E       AssertionError: assert '000300.SH（截至' in '沪深300（截至 2026-09-21）'
+
+tests\test_confluence_tuning.py:276: AssertionError
+============================== warnings summary ===============================
+venv\Lib\site-packages\pydantic\_internal\_config.py:291
+  D:\candle-flow(2)\candle-flow\candle-flow\backend\venv\Lib\site-packages\pydantic\_internal\_config.py:291: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.9/migration/
+    warnings.warn(DEPRECATION_MESSAGE, DeprecationWarning)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/test_confluence_tuning.py::test_regime_synthesis_skips_stale_index
+1 failed, 25 passed, 1 skipped, 1 warning in 1.17s

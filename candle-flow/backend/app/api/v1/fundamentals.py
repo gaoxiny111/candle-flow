@@ -392,6 +392,26 @@ def market_scan_resonance_progress(job_id: str | None = Query(None)):
     return ApiResponse(data=job)
 
 
+@router.get("/fundamentals/market-scan/market-regime")
+def get_market_regime(
+    force: bool = Query(default=False, description="跳过 10 分钟缓存"),
+    db: Session = Depends(get_db),
+):
+    """大盘环境提示（沪深300 / 上证指数的均线排列 + 周线趋势 + 20 日涨跌）。
+
+    **不参与打分**：本结果不进入技术面得分、不改写任何阈值
+    （响应体 ``scoring_impact: "none"``）。它只是把「当前大盘处于什么状态」
+    如实摆出来，是否据此调整技术面门槛由使用者决定。
+    """
+    from app.services.market_regime import market_regime
+
+    try:
+        data = market_regime(db, force=force)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"大盘环境读取失败：{e}") from e
+    return ApiResponse(data=data)
+
+
 @router.post("/fundamentals/factors/rebuild")
 def rebuild_factors(
     force: bool = False,

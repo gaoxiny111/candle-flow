@@ -1,0 +1,14 @@
+﻿scan_http=200
+matched: 1
+{
+ "symbol": "002545.SZ",
+ "name": "涓滄柟閾佸",
+ "verdict": null,
+ "verdict_reasons": null,
+ "composite_score": 87.3,
+ "final_rating": "A",
+ "tech_score": null,
+ "pattern_name": null,
+ "combined_score": null,
+ "buy_label": null
+}

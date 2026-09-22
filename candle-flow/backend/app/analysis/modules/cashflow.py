@@ -461,6 +461,96 @@ class CashflowAnalyzer(BaseAnalyzer):
                 )
             )
 
+        # ── 分红含金量：拆分红来源，识别「伪红利」 ────────────────────────
+        #
+        # 动机（立霸股份 603519 实测，2026-09-22）：
+        #   分红率 170.1%、股息率 6.19%，单看这两项是标准的「高股息优质标的」；
+        #   但实际上撑起分红能力的一次性投资收益发生在 2023 年（投资收益 6.26 亿
+        #   / 归母净利 6.40 亿），2024-2025 的投资收益只剩 457 万 / 358 万，
+        #   这两年的高分红是靠 2023 年沉淀的货币资金存量在派发。
+        #   结果：系统给出「股息率 90 分、FCF覆盖分红 75 分」，现金流模块 78.9 B，
+        #   完全看不出「分红来源不可持续」。
+        #
+        # 为什么不能只看分红率、也不能只看当期非经常性损益占比：
+        #   立霸当期(2025)非经常占比仅 2.9% —— 一次性收益早已落在往年，
+        #   单年口径存在系统性盲区。故这里用**回溯 3 年累计**口径
+        #   （dividend.nonrecurring_3y，实测立霸 57.5%，神华 -0.2%，海螺 5.1%）。
+        #
+        # 两个来源判据（都只在数据齐全时判定，缺字段一律不判定）：
+        #   ① 非经常性损益占比(近3年累计) ≥ 30%  → 分红来源高度依赖一次性收益
+        #   ② 近3年累计 FCF / 当年现金分红 < 1   → 分红超出主业累计自由现金流创造
+        # 两者取最严重的一档给分，并在 comment 里同时展示两个口径值自证。
+        #
+        # 落点：**只加一个低权重指标**（1.5），不下调模块分、不设一票否决。
+        # 理由：分红可持续性是「质量提示」而非「生存风险」，权重过大等于给
+        # 现金流模块叠加第二个否决通道（既有 cashflow_veto 已处理现金流恶化）。
+        div_info2 = kwargs.get("dividend_info") or {}
+        _cov3y = div_info2.get("fcf_coverage_3y")
+        _nonrec3y = div_info2.get("nonrecurring_3y")
+        _nonrec_latest = div_info2.get("nonrecurring_latest")
+        if _cov3y is not None or _nonrec3y is not None:
+            # 判据阈值：30% 非经常占比 / 1.0 倍 FCF 覆盖
+            NONREC_HIGH, NONREC_MID = 0.30, 0.15
+            COV_LOW, COV_TIGHT = 1.0, 1.5
+            dq_score = 78.0
+
+            if _nonrec3y is not None:
+                if float(_nonrec3y) >= NONREC_HIGH:
+                    dq_score = 35.0
+                elif float(_nonrec3y) >= NONREC_MID:
+                    dq_score = min(dq_score, 58.0)
+            if _cov3y is not None:
+                if float(_cov3y) < COV_LOW:
+                    # 分红超出主业累计自由现金流创造 → 只能靠存量现金/融资
+                    dq_score = min(dq_score, 32.0)
+                elif float(_cov3y) < COV_TIGHT:
+                    dq_score = min(dq_score, 60.0)
+
+            _dq_parts: list[str] = []
+            if _nonrec3y is not None:
+                _nr_txt = f"近3年非经常性损益占比{float(_nonrec3y):.1%}"
+                if _nonrec_latest is not None:
+                    _nr_txt += f"（最近年度{float(_nonrec_latest):.1%}）"
+                _dq_parts.append(_nr_txt)
+            if _cov3y is not None:
+                _fcf_sum_yi = float(div_info2.get("fcf_sum_3y") or 0) / 1e8
+                _cash_yi2 = float(div_info2.get("cash_total") or 0) / 1e8
+                _dq_parts.append(
+                    f"近3年累计自由现金流 {_fmt_yi(_fcf_sum_yi)}亿 / 当年分红 "
+                    f"{_fmt_yi(_cash_yi2)}亿 = {float(_cov3y):.2f}倍"
+                )
+            if dq_score <= 35:
+                _dq_verdict = "分红来源存疑：高度依赖一次性收益或存量现金，非主业持续造血"
+                warnings.append(
+                    f"分红含金量偏低（{'；'.join(_dq_parts)}）："
+                    f"高分红率可能由一次性收益或存量现金支撑，不宜按稳定红利资产解读"
+                )
+            elif dq_score <= 60:
+                _dq_verdict = "分红来源偏弱：主业现金创造对分红的覆盖不足，需跟踪可持续性"
+            else:
+                _dq_verdict = "分红来源扎实：主业自由现金流可覆盖分红，非一次性收益驱动"
+            if _dq_parts:
+                _dq_parts.append(_dq_verdict)
+            indicators.append(
+                IndicatorResult(
+                    name="分红含金量",
+                    # 展示值优先用「非经常性损益占比」（越小越健康）；该字段缺失时
+                    # 退回 FCF 覆盖倍数，避免出现 value=None 的指标行。
+                    value=(
+                        round(float(_nonrec3y), 3)
+                        if _nonrec3y is not None
+                        else round(float(_cov3y), 3)
+                        if _cov3y is not None
+                        else 0.0
+                    ),
+                    score=dq_score,
+                    level=score_to_level(dq_score),
+                    weight=1.5,
+                    comment="；".join(_dq_parts),
+                    period=annual_period,
+                )
+            )
+
         if len(ocf.dropna()) and ocf.iloc[-1] > 0:
             capex_ratio = float(capex.iloc[-1] / ocf.iloc[-1]) if ocf.iloc[-1] else 999.0
             if paper_wealth or single_loss_ocf:
@@ -483,10 +573,40 @@ class CashflowAnalyzer(BaseAnalyzer):
             )
 
         ocf_ps = kwargs.get("ocf_per_share")
+        # ── 微利稀释闸门 ────────────────────────────────────────────────
+        # 「经营现金流/净利润」在净利润趋近 0（微利）时被无限放大：
+        # 分子（经营现金流）绝对额很小，但分母更小，比率虚高到 2~3 甚至十几，
+        # 于是靠权重 3.0 的该指标把现金流模块抬到 75+。
+        # 反证在同一模块内：每股经营现金流只有几分钱（绝对造血能力极弱）却几乎不计分。
+        # 判据用「每股经营现金流」而非净利率——它是绝对额口径，不被微利分母操纵，
+        # 也不受行业净利率差异影响。实测（2026-09-21，金牛化工 600722）：
+        #   经营现金流/净利(5年均值)=2.93→90 分（w3.0），而每股经营现金流=0.078→3.9 分（w1.5），
+        #   模块分 75.8，与「造血能力极弱」的事实背离。
+        # 触发条件：每股经营现金流 < 0.3 元 且 净利率 < 5%（两者同时满足才算微利稀释，
+        # 避免误伤「高每股现金流但净利率受一次性因素压低」的正常公司）。
+        # 命中后：现金流模块分封顶 50（不修改任何真实披露值，只落 capped 标记自证）。
+        MICRO_PROFIT_OCF_PS_MIN = 0.3
+        MICRO_PROFIT_NET_MARGIN_MIN = 5.0
+        MICRO_PROFIT_CAP = 50.0
+        _net_margin_v = kwargs.get("net_margin") or kwargs.get("latest_net_margin")
+        micro_profit_diluted = False
+        if ocf_ps is not None:
+            _ps_v = float(ocf_ps)
+            _nm_v = float(_net_margin_v) if _net_margin_v is not None else None
+            if (
+                _ps_v >= 0  # 仅对正每股现金流判定；负值走既有亏损/背离逻辑
+                and _ps_v < MICRO_PROFIT_OCF_PS_MIN
+                and _nm_v is not None
+                and _nm_v < MICRO_PROFIT_NET_MARGIN_MIN
+            ):
+                micro_profit_diluted = True
         if ocf_ps is not None:
             ps = float(ocf_ps)
             if paper_wealth and ps > 0:
                 ps_score, ps_level = 35.0, AnalysisLevel.POOR
+            elif micro_profit_diluted and ps > 0:
+                # 微利稀释：绝对造血能力极弱，该指标本就该低分，压制其得分
+                ps_score, ps_level = 20.0, AnalysisLevel.POOR
             else:
                 ps_score = self._linear_score(ps, 0, 2)
                 ps_level = AnalysisLevel.GOOD if ps > 0.5 else AnalysisLevel.NEUTRAL
@@ -811,6 +931,22 @@ class CashflowAnalyzer(BaseAnalyzer):
                 f"（原始加权 {raw_module_score:.1f} 分 → 52 分）；仍需跟踪应收账龄与存货跌价"
             )
 
+        # ── 微利稀释封顶：每股经营现金流 < 0.3 且净利率 < 5% ──────────────
+        # 该场景下「经营现金流/净利润」比率被微利分母放大而虚高，绝对造血能力
+        # 却极弱（每股经营现金流仅几分钱）。不能让高比率把模块分抬到 70+，
+        # 否则会经 finance 综合分（现金流权重 0.32，全模块最重）掩护高估值票。
+        # 封顶 50 与「现金流弱」的定性一致；只降不升，不覆盖任何真实披露值。
+        micro_profit_cap_applied = False
+        if micro_profit_diluted and module_score > MICRO_PROFIT_CAP:
+            module_score = MICRO_PROFIT_CAP
+            micro_profit_cap_applied = True
+            warnings.append(
+                f"微利稀释：每股经营现金流仅 {float(ocf_ps):.3f} 元、净利率 "
+                f"{float(_net_margin_v):.1f}%，「经营现金流/净利润」比率被微利分母放大，"
+                f"不代表真实造血能力，现金流评分已封顶 {MICRO_PROFIT_CAP:.0f} 分"
+                f"（原始加权 {raw_module_score:.1f} 分）"
+            )
+
         return ModuleResult(
             module_name="现金流质量",
             score=round(module_score, 1),
@@ -826,6 +962,8 @@ class CashflowAnalyzer(BaseAnalyzer):
                 "distribution_expanding": bool(dist_expanding),
                 "raw_weighted_score": raw_module_score,
                 "floor_applied": floor_applied,
+                "micro_profit_diluted": bool(micro_profit_diluted),
+                "micro_profit_cap_applied": bool(micro_profit_cap_applied),
                 "scoring_note": "；".join(_wc_note_parts) if _wc_note_parts else None,
             },
         )

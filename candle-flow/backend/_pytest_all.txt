@@ -1,0 +1,410 @@
+........................................................................ [ 21%]
+...................F.................................................... [ 43%]
+........................................................................ [ 65%]
+...........................F.FFF..FF.F.................................. [ 87%]
+................FFFF......................                               [100%]
+================================== FAILURES ===================================
+_____________________ test_scan_market_filters_main_board _____________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000157FCA5E510>
+
+    def test_scan_market_filters_main_board(monkeypatch):
+        from datetime import date as dt
+    
+        from app.models.kline import KlineData
+        from app.models.stock import StockInfo
+        from app.services.bull_tactics_service import BullTacticsService
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+        import app.models  # noqa: F401
+        from app.database import Base
+    
+        engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        Session = sessionmaker(bind=engine)
+        Base.metadata.create_all(engine)
+        db = Session()
+        db.add_all(
+            [
+                StockInfo(symbol="600519.SH", code="600519", name="贵州茅台", market="SH"),
+                StockInfo(symbol="300750.SZ", code="300750", name="宁德时代", market="SZ"),
+                StockInfo(symbol="000001.SZ", code="000001", name="ST测试", market="SZ"),
+            ]
+        )
+        for i in range(40):
+            db.add(
+                KlineData(
+                    symbol="600519.SH",
+                    date=dt(2026, 1, 1) + timedelta(days=i),
+                    open=10.0,
+                    high=10.4,
+                    low=9.9,
+                    close=10.0,
+                    volume=1_000_000,
+                )
+            )
+        db.commit()
+    
+        monkeypatch.setattr("app.services.bull_tactics_service.refresh_universe", lambda db, force=False: 0)
+        monkeypatch.setattr(
+            "app.services.bull_tactics_service.scan_tactics",
+            lambda candles, recent_bars=30, tactics=None: [],
+        )
+    
+        svc = BullTacticsService(db)
+        out = svc.scan_market(recent_bars=30, refresh_list=False)
+        assert out["universe_size"] == 1
+>       assert out["scanned"] == 1
+E       assert 0 == 1
+
+tests\test_bull_tactics.py:182: AssertionError
+________________ test_technical_overlay_merges_and_aggregates _________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000157FC9A0090>
+
+    def test_technical_overlay_merges_and_aggregates(monkeypatch):
+        """overlay 必须复用 scan_market 榜单口径，聚合信号计数与行业共振，且缓存生效。"""
+        db = _make_db(
+            [
+                ("600001.SH", "甲", {"comp": 88.0, "ind": "农化制品"}),
+                ("600002.SH", "乙", {"comp": 86.0, "ind": "农化制品"}),
+                ("600003.SH", "丙", {"comp": 84.0, "ind": "白酒"}),
+            ],
+            ["600001.SH", "600002.SH", "600003.SH"],
+        )
+        try:
+            tech = {
+                "600001.SH": {"buy_signal": "strong_buy", "buy_label": "强买入",
+                              "buy_reasons": ["x"], "kline_bars": 90,
+                              "pattern_name": "启明星", "pattern_score": 88.0,
+                              "confluence_effective": 3.2, "combined_score": 107.2},
+                "600002.SH": {"buy_signal": "strong_buy", "buy_label": "强买入",
+                              "buy_reasons": ["x"], "kline_bars": 90,
+                              "pattern_name": None},
+                "600003.SH": {"buy_signal": "neutral", "buy_label": "中性",
+                              "buy_reasons": [], "kline_bars": 90,
+                              "pattern_name": None},
+            }
+            monkeypatch.setattr(ms, "_overlay_one",
+                                lambda sym, name, score, pe, py: {"symbol": sym, "name": name, **tech[sym]})
+            ms._overlay_cache.update({"ts": 0.0, "key": None, "payload": None})
+>           out = ms.technical_overlay(db, top=3)
+
+tests\test_market_scan.py:435: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+app\services\market_scan.py:820: in technical_overlay
+    results, retry_count, computed_count = _compute_tech_map(pool, peg_map, force=force)
+app\services\market_scan.py:735: in _compute_tech_map
+    res = _job(it)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+it = {'composite_score': 88.0, 'dim_scores': {'估值合理性': None, '偿债能力': None, '成长性': None, '现金流质量': None, ...}, 'dividend_yield': 2.0, 'final_rating': 'B', ...}
+
+    def _job(it: dict[str, Any]) -> dict[str, Any]:
+        sym = it["symbol"]
+>       return _overlay_one(
+            sym,
+            it.get("name") or "",
+            it.get("composite_score"),
+            peg_map.get(sym),
+        )
+E       TypeError: test_technical_overlay_merges_and_aggregates.<locals>.<lambda>() missing 1 required positional argument: 'py'
+
+app\services\market_scan.py:699: TypeError
+_________________ test_overlay_covers_whole_page_not_first_n __________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000157FC81A290>
+
+    def test_overlay_covers_whole_page_not_first_n(monkeypatch):
+        """技术分析必须覆盖本页全部标的（不截断），并按单票缓存跳过已算过的票。"""
+        db = _make_db(
+            [(f"60000{i}.SH", f"票{i}", {"comp": 90.0 - i}) for i in range(1, 9)],
+            [f"60000{i}.SH" for i in range(1, 9)],
+        )
+        calls: list[str] = []
+    
+        def fake_one(sym, name, score, pe, py):
+            calls.append(sym)
+            return {"symbol": sym, "name": name, "kline_bars": 90,
+                    "buy_signal": "neutral", "buy_label": "中性", "buy_reasons": [],
+                    "pattern_name": None}
+    
+        monkeypatch.setattr(ms, "_overlay_one", fake_one)
+        try:
+            # 第一页 5 只：全部都要有技术结论，不能截断
+>           out = ms.technical_overlay(db, top=5, offset=0)
+
+tests\test_market_scan.py:518: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+app\services\market_scan.py:820: in technical_overlay
+    results, retry_count, computed_count = _compute_tech_map(pool, peg_map, force=force)
+app\services\market_scan.py:735: in _compute_tech_map
+    res = _job(it)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+it = {'composite_score': 89.0, 'dim_scores': {'估值合理性': None, '偿债能力': None, '成长性': None, '现金流质量': None, ...}, 'dividend_yield': 2.0, 'final_rating': 'B', ...}
+
+    def _job(it: dict[str, Any]) -> dict[str, Any]:
+        sym = it["symbol"]
+>       return _overlay_one(
+            sym,
+            it.get("name") or "",
+            it.get("composite_score"),
+            peg_map.get(sym),
+        )
+E       TypeError: test_overlay_covers_whole_page_not_first_n.<locals>.fake_one() missing 1 required positional argument: 'py'
+
+app\services\market_scan.py:699: TypeError
+_________ test_overlay_retries_failed_symbol_and_never_caches_failure _________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000157FCB72190>
+
+    def test_overlay_retries_failed_symbol_and_never_caches_failure(monkeypatch):
+        """瞬时失败（如 SQLite 写锁竞争）必须串行重试且不进缓存；重试成功即正常参与统计。"""
+        db = _make_db(
+            [
+                ("600001.SH", "甲", {"comp": 90.0}),
+                ("600002.SH", "乙", {"comp": 80.0}),
+            ],
+            ["600001.SH", "600002.SH"],
+        )
+        calls: list[str] = []
+        fail_once = {"600002.SH"}
+    
+        def flaky(sym, name, score, pe, py):
+            calls.append(sym)
+            if sym in fail_once:
+                fail_once.discard(sym)
+                return {"symbol": sym, "name": name, "kline_bars": 0,
+                        "buy_signal": "insufficient_data", "buy_label": "分析失败",
+                        "buy_reasons": [], "pattern_name": None, "failed": True}
+            return {"symbol": sym, "name": name, "kline_bars": 90,
+                    "buy_signal": "neutral", "buy_label": "中性", "buy_reasons": [],
+                    "pattern_name": None}
+    
+        monkeypatch.setattr(ms, "_overlay_one", flaky)
+        try:
+>           out = ms.technical_overlay(db, top=2)
+
+tests\test_market_scan.py:563: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+app\services\market_scan.py:820: in technical_overlay
+    results, retry_count, computed_count = _compute_tech_map(pool, peg_map, force=force)
+app\services\market_scan.py:735: in _compute_tech_map
+    res = _job(it)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+it = {'composite_score': 90.0, 'dim_scores': {'估值合理性': None, '偿债能力': None, '成长性': None, '现金流质量': None, ...}, 'dividend_yield': 2.0, 'final_rating': 'B', ...}
+
+    def _job(it: dict[str, Any]) -> dict[str, Any]:
+        sym = it["symbol"]
+>       return _overlay_one(
+            sym,
+            it.get("name") or "",
+            it.get("composite_score"),
+            peg_map.get(sym),
+        )
+E       TypeError: test_overlay_retries_failed_symbol_and_never_caches_failure.<locals>.flaky() missing 1 required positional argument: 'py'
+
+app\services\market_scan.py:699: TypeError
+_______________ test_overlay_one_without_klines_is_insufficient _______________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000157FCB73050>
+
+    def test_overlay_one_without_klines_is_insufficient(monkeypatch):
+        """无K线（如非主板同步范围）必须如实标注 insufficient_data，不得编造信号。"""
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        mem = sessionmaker(bind=engine)
+        monkeypatch.setattr(ms, "SessionLocal", mem)
+>       row = ms._overlay_one("600999.SH", "无K线", 80.0, 10.0, None)
+E       TypeError: _overlay_one() takes 4 positional arguments but 5 were given
+
+tests\test_market_scan.py:597: TypeError
+__________ test_tech_score_derives_from_combined_and_missing_is_none __________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000157FCCD2590>
+
+    def test_tech_score_derives_from_combined_and_missing_is_none(monkeypatch):
+        """技术面得分必须由信号页共振组合分派生（只截断不重标定），无共振为 None。"""
+        from types import SimpleNamespace
+    
+        from app.services.kline_service import KlineService
+        from app.services.market_confluence_service import MarketConfluenceService
+    
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        monkeypatch.setattr(ms, "SessionLocal", sessionmaker(bind=engine))
+        bars = [
+            SimpleNamespace(close=10.0, volume=10.0, date=f"2026-01-{i:02d}")
+            for i in range(1, 61)
+        ]
+        monkeypatch.setattr(KlineService, "get_recent_klines", lambda self, sym, limit=90: (bars, {}))
+    
+        # 有达标形态共振：组合分 107.2 → 截断到 100
+        monkeypatch.setattr(
+            MarketConfluenceService, "_scan_job",
+            lambda self, job: (
+                {"pattern_name": "启明星", "pattern_score": 88.0,
+                 "confluence_effective": 3.2, "combined_score": 107.2}, "hit"),
+        )
+>       assert ms._overlay_one("600001.SH", "甲", 88.0, 10.0, 20.0)["tech_score"] == 100
+E       TypeError: _overlay_one() takes 4 positional arguments but 5 were given
+
+tests\test_market_scan.py:667: TypeError
+___________ test_overlay_labels_verdicts_and_keeps_scores_untouched ___________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000157FCF03590>
+
+    def test_overlay_labels_verdicts_and_keeps_scores_untouched(monkeypatch):
+        """决策标签只做分类：不改写综合分；阈值可覆盖并自证；换阈值不重算技术面。"""
+        db = _make_db(
+            [
+                ("600001.SH", "核心甲", {"comp": 90.0}),
+                ("600002.SH", "候选乙", {"comp": 75.0}),
+                ("600003.SH", "淘汰丙", {"comp": 55.0}),
+                ("600004.SH", "观察丁", {"comp": 92.0}),
+            ],
+            ["600001.SH", "600002.SH", "600003.SH", "600004.SH"],
+        )
+        tech_score = {"600001.SH": 90, "600002.SH": 72, "600003.SH": 88, "600004.SH": None}
+        try:
+            monkeypatch.setattr(
+                ms, "_overlay_one",
+                lambda sym, name, score, pe, py: {
+                    "symbol": sym, "name": name, "kline_bars": 90,
+                    "buy_signal": "neutral", "buy_label": "中性", "buy_reasons": [],
+                    "pattern_name": None, "tech_score": tech_score[sym],
+                },
+            )
+>           out = ms.technical_overlay(db, top=4)
+
+tests\test_market_scan.py:698: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+app\services\market_scan.py:820: in technical_overlay
+    results, retry_count, computed_count = _compute_tech_map(pool, peg_map, force=force)
+app\services\market_scan.py:735: in _compute_tech_map
+    res = _job(it)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+it = {'composite_score': 92.0, 'dim_scores': {'估值合理性': None, '偿债能力': None, '成长性': None, '现金流质量': None, ...}, 'dividend_yield': 2.0, 'final_rating': 'B', ...}
+
+    def _job(it: dict[str, Any]) -> dict[str, Any]:
+        sym = it["symbol"]
+>       return _overlay_one(
+            sym,
+            it.get("name") or "",
+            it.get("composite_score"),
+            peg_map.get(sym),
+        )
+E       TypeError: test_overlay_labels_verdicts_and_keeps_scores_untouched.<locals>.<lambda>() missing 1 required positional argument: 'py'
+
+app\services\market_scan.py:699: TypeError
+________________ test_resonance_build_and_verdict_ordered_read ________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000157FCAF4490>
+
+    def test_resonance_build_and_verdict_ordered_read(monkeypatch):
+        """共振索引只给 fund≥淘汰线的票算技术面；读层按档位全局排序，不按综合分。"""
+        db = _make_reso_db()
+        try:
+            monkeypatch.setattr(ms, "SessionLocal", sessionmaker(bind=db.get_bind()))
+            monkeypatch.setattr(ms, "_overlay_one", _fake_overlay_one)
+>           summary = ms.resonance_index_build()
+
+tests\test_market_scan.py:774: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+app\services\market_scan.py:994: in resonance_index_build
+    results, retry_count, _computed = _compute_tech_map(
+app\services\market_scan.py:735: in _compute_tech_map
+    res = _job(it)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+it = {'composite_score': 90.0, 'dim_scores': {'估值合理性': None, '偿债能力': None, '成长性': None, '现金流质量': None, ...}, 'dividend_yield': 2.0, 'final_rating': 'B', ...}
+
+    def _job(it: dict[str, Any]) -> dict[str, Any]:
+        sym = it["symbol"]
+>       return _overlay_one(
+            sym,
+            it.get("name") or "",
+            it.get("composite_score"),
+            peg_map.get(sym),
+        )
+E       TypeError: _fake_overlay_one() missing 1 required positional argument: 'py'
+
+app\services\market_scan.py:699: TypeError
+______________________________ test_pinyin_abbr _______________________________
+
+    def test_pinyin_abbr():
+>       assert pinyin_abbr("贵州茅台") == "gzmt"
+E       AssertionError: assert '' == 'gzmt'
+E         
+E         - gzmt
+
+tests\test_symbol_search.py:124: AssertionError
+_________________________ test_search_local_by_pinyin _________________________
+
+    def test_search_local_by_pinyin():
+        db = _memory_db()
+        _upsert(
+            db,
+            [
+                {"symbol": "600519.SH", "code": "600519", "name": "贵州茅台", "market": "SH"},
+                {"symbol": "300750.SZ", "code": "300750", "name": "宁德时代", "market": "SZ"},
+            ],
+        )
+        hits = search_local(db, "gzmt")
+>       assert hits and hits[0].symbol == "600519.SH"
+E       assert ([])
+
+tests\test_symbol_search.py:139: AssertionError
+__________________ test_search_stocks_pinyin_without_network __________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000157FCF1DBD0>
+
+    def test_search_stocks_pinyin_without_network(monkeypatch):
+        """本地库有拼音时，不依赖新浪联想也能搜到。"""
+        db = _memory_db()
+        monkeypatch.setattr("app.services.stock_universe.fetch_sina_suggest", lambda q: [])
+        monkeypatch.setattr("app.services.stock_universe.refresh_universe", lambda db, force=False: 0)
+        _upsert(
+            db,
+            [{"symbol": "600519.SH", "code": "600519", "name": "贵州茅台", "market": "SH"}],
+        )
+        hits = search_stocks(db, "gzmt")
+>       assert hits and hits[0]["symbol"] == "600519.SH"
+E       assert ([])
+
+tests\test_symbol_search.py:156: AssertionError
+_____________________ test_ensure_seeded_backfills_pinyin _____________________
+
+    def test_ensure_seeded_backfills_pinyin():
+        db = _memory_db()
+        db.add(StockInfo(symbol="600519.SH", code="600519", name="贵州茅台", market="SH", pinyin=""))
+        db.commit()
+        ensure_seeded(db)
+        hits = search_local(db, "gzmt")
+>       assert hits and hits[0].symbol == "600519.SH"
+E       assert ([])
+
+tests\test_symbol_search.py:165: AssertionError
+============================== warnings summary ===============================
+venv\Lib\site-packages\pydantic\_internal\_config.py:291
+  D:\candle-flow(2)\candle-flow\candle-flow\backend\venv\Lib\site-packages\pydantic\_internal\_config.py:291: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.9/migration/
+    warnings.warn(DEPRECATION_MESSAGE, DeprecationWarning)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/test_bull_tactics.py::test_scan_market_filters_main_board - asse...
+FAILED tests/test_market_scan.py::test_technical_overlay_merges_and_aggregates
+FAILED tests/test_market_scan.py::test_overlay_covers_whole_page_not_first_n
+FAILED tests/test_market_scan.py::test_overlay_retries_failed_symbol_and_never_caches_failure
+FAILED tests/test_market_scan.py::test_overlay_one_without_klines_is_insufficient
+FAILED tests/test_market_scan.py::test_tech_score_derives_from_combined_and_missing_is_none
+FAILED tests/test_market_scan.py::test_overlay_labels_verdicts_and_keeps_scores_untouched
+FAILED tests/test_market_scan.py::test_resonance_build_and_verdict_ordered_read
+FAILED tests/test_symbol_search.py::test_pinyin_abbr - AssertionError: assert...
+FAILED tests/test_symbol_search.py::test_search_local_by_pinyin - assert ([])
+FAILED tests/test_symbol_search.py::test_search_stocks_pinyin_without_network
+FAILED tests/test_symbol_search.py::test_ensure_seeded_backfills_pinyin - ass...
+12 failed, 318 passed, 1 warning in 26.74s

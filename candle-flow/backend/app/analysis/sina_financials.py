@@ -75,6 +75,10 @@ IS_FIELDS: dict[str, str] = {
     "parent_net_profit": "归属于母公司所有者的净利润",
     "eps": "基本每股收益(元/股)",
 }
+# 说明：新浪利润表**不提供**「扣除非经常性损益后的净利润」行（实测 603519
+# 2025 年报页无任何含「扣」的 <th> 标签）。扣非数据统一走东财
+# ``financials.fetch_deducted_series``（RPT_DMSK_FN_INCOME.DEDUCT_PARENT_NETPROFIT），
+# 不要在本字段表里添加会恒为 None 的「扣非」行。
 
 _TTL = 12 * 3600
 _cache: dict[str, tuple[float, dict[str, dict[str, float | None]]]] = {}
