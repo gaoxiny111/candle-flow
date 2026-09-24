@@ -245,7 +245,9 @@ def test_build_all_caps_batch_and_reports_coverage(monkeypatch, tmp_path):
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     setup = Session()
-    for sym in ("600000.SH", "000001.SZ", "300750.SZ"):
+    # 股票池只含主板：_get_all_symbols 已改为只扫主板（剔除创业板 300/301、
+    # 科创板 688/689），与读层榜单默认 include_gem=False 对齐。
+    for sym in ("600000.SH", "000001.SZ", "600519.SH"):
         setup.add(StockInfo(symbol=sym, code=sym[:6], name="测试", market=sym[-2:]))
     setup.commit()
     setup.close()
@@ -300,7 +302,7 @@ def test_build_all_schema_guard_rebuilds_snapshots_missing_new_keys(monkeypatch,
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     setup = Session()
-    for sym in ("600000.SH", "000001.SZ", "300750.SZ", "000002.SZ"):
+    for sym in ("600000.SH", "000001.SZ", "600519.SH", "000002.SZ"):
         setup.add(StockInfo(symbol=sym, code=sym[:6], name="测试", market=sym[-2:]))
     # 600000：旧 payload 缺 profit_yoy → 应纳入重建
     setup.add(
@@ -373,10 +375,10 @@ def test_build_all_schema_guard_rebuilds_snapshots_missing_new_keys(monkeypatch,
     )
 
     stats = mod.build_all(budget_sec=120)
-    # 600000（缺键）+ 000002（口径版本落后）+ 300750（无快照）→ 3 只；
+    # 600000（缺键）+ 000002（口径版本落后）+ 600519（无快照）→ 3 只；
     # 000001 字段齐全且口径版本一致 → 跳过
     assert stats["built"] == 3
-    assert sorted(built_symbols) == ["000002.SZ", "300750.SZ", "600000.SH"]
+    assert sorted(built_symbols) == ["000002.SZ", "600000.SH", "600519.SH"]
     assert stats["skipped"] == 1
 
 
@@ -430,7 +432,7 @@ def test_technical_overlay_merges_and_aggregates(monkeypatch):
                           "pattern_name": None},
         }
         monkeypatch.setattr(ms, "_overlay_one",
-                            lambda sym, name, score, peg: {"symbol": sym, "name": name, **tech[sym]})
+                            lambda sym, name, score, peg, rw=None: {"symbol": sym, "name": name, **tech[sym]})
         ms._overlay_cache.update({"ts": 0.0, "key": None, "payload": None})
         out = ms.technical_overlay(db, top=3)
         assert out["count"] == 3
@@ -506,7 +508,7 @@ def test_overlay_covers_whole_page_not_first_n(monkeypatch):
     )
     calls: list[str] = []
 
-    def fake_one(sym, name, score, peg):
+    def fake_one(sym, name, score, peg, rw=None):
         calls.append(sym)
         return {"symbol": sym, "name": name, "kline_bars": 90,
                 "buy_signal": "neutral", "buy_label": "中性", "buy_reasons": [],
@@ -547,7 +549,7 @@ def test_overlay_retries_failed_symbol_and_never_caches_failure(monkeypatch):
     calls: list[str] = []
     fail_once = {"600002.SH"}
 
-    def flaky(sym, name, score, peg):
+    def flaky(sym, name, score, peg, rw=None):
         calls.append(sym)
         if sym in fail_once:
             fail_once.discard(sym)
@@ -573,7 +575,7 @@ def test_overlay_retries_failed_symbol_and_never_caches_failure(monkeypatch):
         monkeypatch.setattr(ms, "_overlay_item_cache", {})
         monkeypatch.setattr(
             ms, "_overlay_one",
-            lambda sym, name, score, peg: {"symbol": sym, "name": name, "kline_bars": 0,
+            lambda sym, name, score, peg, rw=None: {"symbol": sym, "name": name, "kline_bars": 0,
                                               "buy_signal": "insufficient_data",
                                               "buy_label": "分析失败", "buy_reasons": [],
                                               "pattern_name": None, "failed": True},
@@ -594,7 +596,7 @@ def test_overlay_one_without_klines_is_insufficient(monkeypatch):
     Base.metadata.create_all(engine)
     mem = sessionmaker(bind=engine)
     monkeypatch.setattr(ms, "SessionLocal", mem)
-    row = ms._overlay_one("600999.SH", "无K线", 80.0, None)
+    row = ms._overlay_one("600999.SH", "无K线", 80.0, None, None)
     assert row["buy_signal"] == "insufficient_data"
     assert row["kline_bars"] == 0
 
@@ -664,13 +666,13 @@ def test_tech_score_derives_from_combined_and_missing_is_none(monkeypatch):
             {"pattern_name": "启明星", "pattern_score": 88.0,
              "confluence_effective": 3.2, "combined_score": 107.2}, "hit"),
     )
-    assert ms._overlay_one("600001.SH", "甲", 88.0, 1.2)["tech_score"] == 100
+    assert ms._overlay_one("600001.SH", "甲", 88.0, 1.2, None)["tech_score"] == 100
 
     # 无达标形态共振 → None（不可评估），绝不赋 0 或中性分
     monkeypatch.setattr(
         MarketConfluenceService, "_scan_job", lambda self, job, diag=None: (None, "ok")
     )
-    assert ms._overlay_one("600002.SH", "乙", 88.0, 1.2)["tech_score"] is None
+    assert ms._overlay_one("600002.SH", "乙", 88.0, 1.2, None)["tech_score"] is None
 
     # 未达 100 时原样保留（不重标定量纲）
     assert ms._tech_score(83.4) == 83 and ms._tech_score(None) is None
@@ -686,7 +688,7 @@ def test_tech_score_derives_from_combined_and_missing_is_none(monkeypatch):
         return None, "left_side_blocked"
 
     monkeypatch.setattr(MarketConfluenceService, "_scan_job", _blocked)
-    blocked_case = ms._overlay_one("600003.SH", "丙", 88.0, 1.2)
+    blocked_case = ms._overlay_one("600003.SH", "丙", 88.0, 1.2, None)
     assert blocked_case["tech_score"] is None
     assert "左侧超跌形态" in (blocked_case["tech_blocker"] or "")
     v, reasons = ms._verdict(
@@ -712,7 +714,7 @@ def test_overlay_labels_verdicts_and_keeps_scores_untouched(monkeypatch):
     try:
         monkeypatch.setattr(
             ms, "_overlay_one",
-            lambda sym, name, score, peg: {
+            lambda sym, name, score, peg, rw=None: {
                 "symbol": sym, "name": name, "kline_bars": 90,
                 "buy_signal": "neutral", "buy_label": "中性", "buy_reasons": [],
                 "pattern_name": None, "tech_score": tech_score[sym],
@@ -756,7 +758,7 @@ _RESO_TECH = {
 }
 
 
-def _fake_overlay_one(sym, name, score, peg):
+def _fake_overlay_one(sym, name, score, peg, rw=None):
     return {
         "symbol": sym, "name": name, "kline_bars": 90,
         "buy_signal": "neutral", "buy_label": "中性", "buy_reasons": [],

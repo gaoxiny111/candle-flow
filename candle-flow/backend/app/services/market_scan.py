@@ -174,7 +174,24 @@ _LIGHT_SQL = text(
            json_extract(payload, '$.profit_yoy')                              AS profit_yoy,
            -- 大股东减持窗口期：供买点信号封顶（强买入→观察）使用。
            -- 只改档位不改分数，因此不参与任何重算，仅随快照透传。
-           json_extract(payload, '$.major_risks.reduce_window')               AS reduce_window
+           json_extract(payload, '$.major_risks.reduce_window')               AS reduce_window,
+           -- ── 质量×价值视图（quality_value.py）所需字段 ──────────────
+           -- 铁律 17：新增读层字段必须同时改 _LIGHT_SQL + _from_payload +
+           -- 使用处（漏 SQL 恒 None → 判据形同虚设；漏回退 → 旧路径炸）。
+           json_extract(payload, '$.market.pb_percentile')                    AS pb_percentile,
+           -- ROIC 固定为盈利能力指标数组第 2 项（ROE/毛利率/ROIC/净利率/股息率）
+           json_extract(payload, '$.modules.profitability.indicators[2].value') AS roic_pct,
+           -- 资产负债率固定为偿债能力数组第 0 项
+           json_extract(payload, '$.modules.solvency.indicators[0].value')    AS debt_ratio_pct,
+           -- 经营现金流/净利润：取【5 年均值】(第 0 项)，**不是**第 1 项的年报值。
+           -- 年报单期值行业间极性相反（江西铜业 -0.97 / 中国神华 1.42），
+           -- 用单年会误杀正常经营的周期股；5 年均值口径更稳（见 quality_value）。
+           json_extract(payload, '$.modules.cashflow.indicators[0].value')    AS ocf_np_5y,
+           -- PEG：valuation.relative.PEG.value（红利资产被口径置空 → 恒 None）
+           json_extract(payload, '$.valuation.relative.PEG.value')            AS peg,
+           -- 展示分成长维（qv）：compute_qv 读 profit_yoy_pct，快照顶层键是
+           -- profit_yoy —— 旧实现漏了这条映射 → growth_pct 恒中性 50（铁律 17）。
+           json_extract(payload, '$.profit_yoy')                              AS profit_yoy_pct
     FROM factor_snapshots
     WHERE composite_score IS NOT NULL
     """
@@ -239,6 +256,14 @@ def _from_payload(row: FactorSnapshot) -> dict[str, Any]:
         # None → 封顶逻辑形同虚设且零报错。旧快照（本版之前构建）该字段为
         # None，_detect_buy_signal 会自然放行，不会炸。
         "reduce_window": (d.get("major_risks") or {}).get("reduce_window"),
+        # 质量×价值视图所需字段（与 _LIGHT_SQL 一一对应，口径必须一致）
+        "pb_percentile": m.get("pb_percentile"),
+        "roic_pct": _ind_value("profitability", 2),
+        "debt_ratio_pct": _ind_value("solvency", 0),
+        "ocf_np_5y": _ind_value("cashflow", 0),
+        "peg": ((val.get("relative") or {}).get("PEG") or {}).get("value"),
+        # 展示分成长维（qv）：快照顶层 profit_yoy → compute_qv 的 profit_yoy_pct
+        "profit_yoy_pct": d.get("profit_yoy"),
     }
     for eng, cn in DIM_KEYS.items():
         out[f"dim_{eng}"] = dims.get(cn)
@@ -954,7 +979,15 @@ def _overlay_one(
             "pattern_date": (best or {}).get("candle_date"),
             # 技术面为 None 时说明「为什么不可评估」：被左侧超跌防守否决的票
             # 与「本来就没有形态」的票，用户看到的文案必须不同。
-            "tech_blocker": diag.get("left_side_blocked") if best is None else None,
+            # 第三类：有达标形态（组合分≥80）但无核心共振（量能/趋势）被
+            # 白名单拦下 —— 属「凑单式共振」，必须与「形态逻辑坏了」区分。
+            "tech_blocker": (
+                diag.get("left_side_blocked")
+                if best is None and diag.get("left_side_blocked")
+                else diag.get("weak_resonance_blocked")
+                if best is None and diag.get("weak_resonance_blocked")
+                else None
+            ),
             # 减持窗口期闸门留痕：signal 被门控时 _detect_buy_signal 会带 gate 字段
             "signal_gate": buy.get("gate"),
         }
@@ -1482,5 +1515,186 @@ def resonance_view(
             "keyword": kw or None,
             "include_gem": include_gem,
         },
+        "notes": notes,
+    }
+
+
+def quality_value_view(
+    db: Session | None = None,
+    *,
+    top: int = DEFAULT_TOP,
+    offset: int = 0,
+    exclude_st: bool = True,
+    include_gem: bool = False,
+    industry: str | None = None,
+    keyword: str | None = None,
+    max_pe: float | None = None,
+    max_pb: float | None = None,
+    min_roe: float | None = None,
+    min_roic: float | None = None,
+    max_debt_ratio: float | None = None,
+    min_gross_margin: float | None = None,
+    min_ocf_np: float | None = None,
+    min_dividend_yield: float | None = None,
+    max_pe_pctile: float | None = None,
+    max_pb_pctile: float | None = None,
+    max_peg: float | None = None,
+    min_market_cap_yi: float | None = None,
+    sort_by: str = "qv_score",
+    with_cycle_price: bool = False,
+) -> dict[str, Any]:
+    """「质量 × 价值」选股视图（读层，**不重算任何分数**）。
+
+    判定链路的完整说明与**四处偏离通用模板的理由**见 ``quality_value.py``
+    模块 docstring（ROIC 阈值下调、毛利率行业中性、现金流用 5 年均值、不建第二总分）。
+
+    本函数只负责：① 读轻量行 ② 交 ``compute_qv`` 判定打分 ③ 排序分页 ④ 组装响应。
+    评分口径集中在 quality_value.py，此处不重复实现（铁律 5：同一判定不两处各算）。
+    """
+    from app.services.quality_value import (
+        QV_SORT_KEYS,
+        compute_qv,
+        sort_qv,
+    )
+
+    if sort_by not in QV_SORT_KEYS:
+        raise ValueError(f"不支持的排序字段：{sort_by}")
+
+    rows, fallback = load_covered(db)
+    # 与榜单/共振视图同一套基础过滤（ST、板块、名称/行业），保证三处口径一致
+    kw = (keyword or "").strip().lower()
+    ind_filter = (industry or "").strip()
+    base = [
+        r
+        for r in rows
+        if _item_passes(
+            r,
+            exclude_st=exclude_st,
+            include_gem=include_gem,
+            keyword=kw,
+            industry=ind_filter,
+            min_composite=None,
+            min_market_cap_yi=None,
+        )
+    ]
+
+    # 只把显式传入的阈值交给 compute_qv，未传的走模块默认值（集中定义，便于调参）
+    overrides: dict[str, Any] = {}
+    for k, v in (
+        ("max_pe", max_pe),
+        ("max_pb", max_pb),
+        ("min_roe", min_roe),
+        ("min_roic", min_roic),
+        ("max_debt_ratio", max_debt_ratio),
+        ("min_gross_margin", min_gross_margin),
+        ("min_ocf_np", min_ocf_np),
+        ("min_dividend_yield", min_dividend_yield),
+        ("max_pe_pctile", max_pe_pctile),
+        ("max_pb_pctile", max_pb_pctile),
+        ("max_peg", max_peg),
+        ("min_market_cap_yi", min_market_cap_yi),
+    ):
+        if v is not None:
+            overrides[k] = v
+
+    passed, rejected = compute_qv(base, **overrides)
+    passed = sort_qv(passed, sort_by)
+
+    cycle_price_attached = 0
+    if with_cycle_price:
+        # 周期品「产品价格拐点」预警：**只读增强**，不改写 qv_score / composite_score，
+        # 也不参与任何硬门槛（理由见 quality_value/cycle_price 模块 docstring）。
+        # 默认关闭：单元测试必须零外网依赖，由 API 层显式开启。
+        from app.services.cycle_price import attach_cycle_price
+
+        cycle_price_attached = attach_cycle_price(passed)
+
+    limit = max(1, min(int(top), MAX_TOP))
+    start = max(0, int(offset or 0))
+    window = passed[start : start + limit]
+
+    notes = [
+        "本视图为**读层筛选**：输入全部取自已有因子快照，不重算任何分数，"
+        "也不产生第二个综合分（准入选股用硬门槛 + 行业内分位；qv_score 仅用于排序展示）。",
+        "质量门槛：ROE ≥ 10、ROIC ≥ 8、毛利率行业中位以上、资产负债率 ≤ 60、"
+        "经营现金流/净利润（**5 年均值**）≥ 0.8。",
+        "价值门槛：PE 或 PB **任一**处于行业内低分位（PE ≤ 40% 或 PB ≤ 50%），"
+        "绝对 PE / PB 上限只作兜底 —— 跨行业直接比 PE 会把银行与科技股放在同一把尺子上。",
+        "毛利率门槛对结构性低毛利行业（工业金属、贸易、建筑、电力等）只认行业内分位，"
+        "绝对阈值不适用（江西铜业毛利率 4.4%，用绝对门槛会误杀整条产业链）。",
+        "PEG 优先级最低且**缺失不淘汰**：红利资产被估值口径置空 PEG（如贵州茅台），"
+        "把 PEG 当硬门槛会整体误杀这类票。缺失项在 qv_missing 里逐票留痕。",
+        "行业分位基准 = 当前筛选命中集（与榜单 industry_pct 同源），"
+        "故叠加地域/行业筛选后分位不会因样本变小而失真。",
+        "「资产负债率 ≤ 60%」对银行/保险/券商**不适用**（负债经营是本业）："
+        "金融股请勿叠加本视图，或自行放宽该阈值。",
+    ]
+    if fallback:
+        notes.append("本次读取走了 Python 解析回退路径（SQLite JSON1 不可用）。")
+    if with_cycle_price:
+        notes.append(
+            "已附加**周期品产品价格拐点预警**（items[].cycle_price，含 products/costs 明细）："
+            "只看产品价（原油等**成本项**不计入预警，故油价回落不会把煤化工/乙烷裂解标成利空）；"
+            "该预警**只读**，不改写任何分数、不参与硬门槛。"
+        )
+
+    # 被硬门槛拦下的样本摘要：让「为什么这只票没进」可自证（按首个原因归并计数）
+    reject_summary: dict[str, int] = {}
+    for r in rejected:
+        head = (r.get("qv_reasons") or ["未达标"])[0].split(":")[0]
+        reject_summary[head] = reject_summary.get(head, 0) + 1
+
+    # 周期品预警的覆盖率自检 + 命中分布（让「为什么这票没预警」可自证）
+    cycle_price_meta: dict[str, Any] | None = None
+    if with_cycle_price:
+        from app.services.cycle_price import coverage_report, grade_of
+
+        grades: dict[str, int] = {}
+        for r in passed:
+            g = grade_of(r)
+            grades[g] = grades.get(g, 0) + 1
+        mapped = sum(v for k, v in grades.items() if k != "na")
+        cycle_price_meta = {
+            "enabled": True,
+            "attached": cycle_price_attached,
+            "mapped": mapped,
+            "grade_summary": grades,
+            "coverage": coverage_report([r.get("industry") for r in passed]),
+        }
+
+    return {
+        "count": len(window),
+        "matched": len(passed),
+        "rejected": len(rejected),
+        "reject_summary": reject_summary,
+        "offset": start,
+        "limit": limit,
+        "has_more": start + len(window) < len(passed),
+        "sort_by": sort_by,
+        "thresholds": {
+            "min_roe": overrides.get("min_roe", 10.0),
+            "min_roic": overrides.get("min_roic", 8.0),
+            "min_gross_margin": overrides.get("min_gross_margin", 15.0),
+            "max_debt_ratio": overrides.get("max_debt_ratio", 60.0),
+            "min_ocf_np": overrides.get("min_ocf_np", 0.8),
+            "max_pe": overrides.get("max_pe", 50.0),
+            "max_pb": overrides.get("max_pb", 8.0),
+            "max_pe_pctile": overrides.get("max_pe_pctile", 40.0),
+            "max_pb_pctile": overrides.get("max_pb_pctile", 50.0),
+            "max_peg": overrides.get("max_peg", 1.5),
+            "min_dividend_yield": overrides.get("min_dividend_yield", 0.0),
+            "min_market_cap_yi": overrides.get("min_market_cap_yi", 50.0),
+        },
+        "filters": {
+            "exclude_st": exclude_st,
+            "include_gem": include_gem,
+            "industry": ind_filter or None,
+            "keyword": kw or None,
+        },
+        "items": window,
+        # 被筛掉的票只回传前 200 只（UI 折叠展示用），避免响应体膨胀
+        "rejected_sample": rejected[:200],
+        "coverage": market_coverage(db),
+        "cycle_price": cycle_price_meta,
         "notes": notes,
     }

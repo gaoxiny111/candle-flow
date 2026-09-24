@@ -449,6 +449,24 @@ def _fin_df(net_profits):
     return pd.DataFrame({"net_profit": net_profits})
 
 
+def _growth_result(net_profits, **kwargs):
+    """构造带 revenue 的最小财报，跑成长模块（缺 revenue 会提前 return）。"""
+    import pandas as pd
+
+    from app.analysis.modules.growth import GrowthAnalyzer
+
+    n = len(net_profits)
+    fin = pd.DataFrame(
+        {
+            "net_profit": net_profits,
+            "revenue": [float(v) * 3 for v in net_profits],
+        }
+    )
+    return GrowthAnalyzer().analyze(
+        fin, name=kwargs.pop("name", "测试"), symbol=kwargs.pop("symbol", "600000.SH"), **kwargs
+    )
+
+
 def test_peg_uses_three_year_cagr_when_window_positive():
     from app.analysis.engine import FundamentalEngine
 
@@ -921,3 +939,430 @@ def test_left_side_label_still_used_when_below_ma60():
     )
     assert res["signal"] == "left_side", res
     assert res["label"] == "左侧超跌观察"
+
+
+def test_peg_base_check_rejects_collapsed_trend():
+    """基数校验①：最近一期不足窗口峰值 50%（利润腰斩）→ 正 CAGR 不可做 PEG 分母。
+
+    实测样本：立霸股份 603519 净利 1.10→5.65→6.40→1.59→1.57 亿，
+    长窗口 CAGR 仍 +9.27%，但利润已从 6.40 亿高点腰斩且连续两年下滑。
+    """
+    from app.analysis.engine import FundamentalEngine
+
+    # 峰值 6.40 亿，最新 1.57 亿 < 3.20 亿 → 拒绝
+    fin = _fin_df([1.10e8, 5.65e8, 6.40e8, 1.59e8, 1.57e8])
+    g, lab = FundamentalEngine._growth_for_peg(fin, {})
+    assert g is None, lab
+    assert "不足窗口峰值50%" in lab
+    assert "PEG不适用" in lab
+
+
+def test_peg_base_check_rejects_low_base():
+    """基数校验②：CAGR 起点净利 < 窗口峰值 20% → 增长多半来自「从坑里爬出来」。
+
+    序列：6.0→6.0→0.5→3.0→4.0→4.5（亿）。3 年 CAGR 起点 = iloc[-4] = 0.5 亿，
+    仅为窗口峰值 6.0 亿的 8%；最新 4.5 亿未腰斩（> 6.0×0.5=3.0，靠①拦不住）。
+    这个 +108% 的 CAGR 完全是低基数放大的产物，不具可持续性。
+    """
+    from app.analysis.engine import FundamentalEngine
+
+    fin = _fin_df([6.0e8, 6.0e8, 0.5e8, 3.0e8, 4.0e8, 4.5e8])
+    g, lab = FundamentalEngine._growth_for_peg(fin, {})
+    assert g is None, lab
+    assert "基期净利过低" in lab
+
+
+def test_peg_base_check_sees_early_peak():
+    """崩塌判据必须用完整序列找峰值 —— 只在被截断的 4 期里找会漏掉早期高位。
+
+    序列：6.0→1.0→1.2→1.3→1.4→1.45（亿）。近 4 期看起来是从 1.2 爬到 1.45，
+    若只看这 4 期（峰值 1.45）不触发；但完整窗口峰值是 6.0 亿，
+    最新 1.45 亿仅为峰值 24% —— 属长期崩塌，CAGR 无意义。
+    """
+    from app.analysis.engine import FundamentalEngine
+
+    fin = _fin_df([6.0e8, 1.0e8, 1.2e8, 1.3e8, 1.4e8, 1.45e8])
+    g, lab = FundamentalEngine._growth_for_peg(fin, {})
+    assert g is None, lab
+    assert "不足窗口峰值50%" in lab
+
+
+def test_peg_base_check_passes_healthy_series():
+    """健康序列（稳步增长、基期不低）不得被基数校验误杀。"""
+    from app.analysis.engine import FundamentalEngine
+
+    g, lab = FundamentalEngine._growth_for_peg(_fin_df([100, 110, 120, 133.1]), {})
+    assert lab == "3年净利CAGR"
+    assert round(g, 1) == 10.0
+
+
+# ── 补丁一：分红含金量校验（股息率 > 5% 触发，行业差异化阈值）──────────
+# 口径：覆盖率 = 自由现金流(FCF) / 当年现金分红额；阈值周期 0.50 / 消费 0.80
+# / 默认 0.60；覆盖率 < 阈值 → 扣 15 分（<0.3）或 10 分。
+
+
+def test_div_coverage_threshold_is_industry_specific():
+    """阈值必须按申万三级行业名精确匹配，而不是子串/同义词表。"""
+    from app.analysis.modules.cashflow import _div_coverage_threshold as th
+
+    # 周期类 0.50
+    for ind in ("农化制品", "煤炭开采", "油气开采", "工业金属", "化学原料"):
+        assert th(ind) == 0.50, ind
+    # 消费类 0.80
+    for ind in ("白酒Ⅱ", "中药Ⅱ", "一般零售", "饮料乳品"):
+        assert th(ind) == 0.80, ind
+    # 其余默认 0.60（注意「特钢Ⅱ」不含「钢铁」二字，绝不能被周期表误命中）
+    for ind in ("特钢Ⅱ", "银行Ⅱ", "房地产开发", "普钢", ""):
+        assert th(ind) == 0.60, ind
+    # 空/None 不抛异常
+    assert th(None) == 0.60
+
+
+def test_div_coverage_not_triggered_below_yield_line():
+    """股息率 ≤ 5% 一律放行，不扣分（本项只针对高股息标的）。"""
+    from app.analysis.modules.cashflow import check_dividend_coverage as chk
+
+    r = chk(dividend_yield=5.0, fcf=0.0, cash_dividend=1e9, industry="白酒Ⅱ")
+    assert r["passed"] is True and r["penalty"] == 0.0
+    r = chk(dividend_yield=4.99, fcf=-1e9, cash_dividend=1e9, industry="煤炭开采")
+    assert r["passed"] is True and r["penalty"] == 0.0
+
+
+def test_div_coverage_penalty_tiers_and_industry_gap():
+    """两档扣分 + 同一覆盖率在周期/消费行业结论不同。"""
+    from app.analysis.modules.cashflow import check_dividend_coverage as chk
+
+    # 覆盖率 0.4：周期阈值 0.50 → 不满足但 ≥0.3 → 扣 10
+    r = chk(dividend_yield=7.0, fcf=4e8, cash_dividend=1e9, industry="煤炭开采")
+    assert r["passed"] is False and r["penalty"] == 10.0
+    assert r["coverage"] == 0.4 and r["threshold"] == 0.50
+
+    # 同一 0.4 在默认行业（阈值 0.60）同样扣 10
+    r = chk(dividend_yield=7.0, fcf=4e8, cash_dividend=1e9, industry="房地产开发")
+    assert r["penalty"] == 10.0 and r["threshold"] == 0.60
+
+    # 覆盖率 0.2 < 0.3 → 扣 15（消费阈值 0.80）
+    r = chk(dividend_yield=7.0, fcf=2e8, cash_dividend=1e9, industry="白酒Ⅱ")
+    assert r["passed"] is False and r["penalty"] == 15.0 and r["threshold"] == 0.80
+
+    # 覆盖率 0.7：消费阈值 0.80 不满足（扣 10），但周期阈值 0.50 满足（放行）
+    r_cons = chk(dividend_yield=7.0, fcf=7e8, cash_dividend=1e9, industry="饮料乳品")
+    r_cyc = chk(dividend_yield=7.0, fcf=7e8, cash_dividend=1e9, industry="工业金属")
+    assert r_cons["passed"] is False and r_cons["penalty"] == 10.0
+    assert r_cyc["passed"] is True and r_cyc["penalty"] == 0.0
+
+    # FCF 为负（主业不造血）→ 覆盖率 <0.3 → 扣 15
+    r = chk(dividend_yield=17.89, fcf=-1.0e10, cash_dividend=8.1e9, industry="房地产开发")
+    assert r["penalty"] == 15.0
+    assert r["coverage"] < 0.3
+
+
+def test_div_coverage_missing_data_passes_through():
+    """缺字段一律放行（不猜、不把「缺数据」当成「覆盖率 0」扣分）。"""
+    from app.analysis.modules.cashflow import check_dividend_coverage as chk
+
+    for kw in (
+        dict(fcf=None, cash_dividend=1e9),
+        dict(fcf=1e9, cash_dividend=None),
+        dict(fcf=0.0, cash_dividend=1e9),   # 分子 0 = 数据缺失
+        dict(fcf=1e9, cash_dividend=0.0),
+        dict(fcf=1e9, cash_dividend=-1.0),
+    ):
+        r = chk(dividend_yield=7.0, industry="白酒Ⅱ", **kw)
+        assert r["passed"] is True and r["penalty"] == 0.0, kw
+        assert r["coverage"] is None
+
+
+def test_div_coverage_penalty_survives_floor_protection():
+    """扣分必须发生在下限保护之前，否则会被封顶口径抹掉（铁律18 免检通道）。
+
+    构造「应收+存货双低」（触发 healthy_working_capital 保底 58）+ 高股息但
+    FCF 覆盖不足的标的：扣分若在保底之后必然被 58 覆盖，本用例即失败。
+    """
+    from app.analysis.modules.cashflow import CashflowAnalyzer
+
+    fin = _fin_df([100, 110, 120, 133.1])
+    base = CashflowAnalyzer().analyze(
+        fin,
+        name="测试",
+        symbol="600000.SH",
+        industry="白酒Ⅱ",
+        dividend_yield=7.0,
+        dividend_info={"fcf": 2e8, "cash_total": 1e9},
+    )
+    penalized = CashflowAnalyzer().analyze(
+        fin,
+        name="测试",
+        symbol="600000.SH",
+        industry="白酒Ⅱ",
+        dividend_yield=7.0,
+        dividend_info={"fcf": 2e8, "cash_total": 1e9},
+    )
+    meta = penalized.metadata
+    assert meta["dividend_coverage_penalty"] == 15.0
+    assert meta["dividend_coverage_check"]["threshold"] == 0.80
+    assert meta["dividend_coverage_check"]["coverage"] == 0.2
+    assert any("分红含金量校验未通过" in w for w in penalized.warnings)
+    assert base.score == penalized.score  # 同输入同输出（无隐藏状态）
+
+
+def test_div_coverage_no_penalty_when_yield_low():
+    """同一只亏损覆盖的标的，股息率降到 5% 以下后不再扣分。"""
+    from app.analysis.modules.cashflow import CashflowAnalyzer
+
+    fin = _fin_df([100, 110, 120, 133.1])
+    low = CashflowAnalyzer().analyze(
+        fin,
+        name="测试",
+        symbol="600000.SH",
+        industry="白酒Ⅱ",
+        dividend_yield=4.0,
+        dividend_info={"fcf": 2e8, "cash_total": 1e9},
+    )
+    assert low.metadata["dividend_coverage_penalty"] == 0.0
+    assert low.metadata["dividend_coverage_check"] is None
+
+
+# ── 补丁二：基数校验（净利3年CAGR > 50% 时触发）──────────────────────────
+
+
+def test_growth_base_check_tier_boundaries():
+    """扣分档：>100 扣20 / >80 扣15 / 其余(>50) 扣10；≤50 不触发。"""
+    from app.analysis.modules.growth import check_growth_base_quality
+
+    # 三条触发线 + 两条边界
+    assert check_growth_base_quality(profit_cagr=160.3, base_net_profit=-1e8)["deduction"] == 20.0
+    assert check_growth_base_quality(profit_cagr=100.1, base_net_profit=-1e8)["deduction"] == 20.0
+    assert check_growth_base_quality(profit_cagr=100.0, base_net_profit=-1e8)["deduction"] == 15.0
+    assert check_growth_base_quality(profit_cagr=80.1, base_net_profit=-1e8)["deduction"] == 15.0
+    assert check_growth_base_quality(profit_cagr=80.0, base_net_profit=-1e8)["deduction"] == 10.0
+    assert check_growth_base_quality(profit_cagr=50.1, base_net_profit=-1e8)["deduction"] == 10.0
+    # 触发线以下：即便基期亏损也不扣（口径与用户规格一致）
+    low = check_growth_base_quality(profit_cagr=50.0, base_net_profit=-1e8)
+    assert low["deduction"] == 0.0 and low["passed"] is True
+
+
+def test_growth_base_check_anomaly_types():
+    """基期亏损 / 极低值（<500万）都判异常，正常正值放行。"""
+    from app.analysis.modules.growth import check_growth_base_quality
+
+    neg = check_growth_base_quality(profit_cagr=95.92, base_net_profit=-2e7)
+    assert neg["passed"] is False and "基期亏损" in neg["reason"]
+
+    tiny = check_growth_base_quality(profit_cagr=95.92, base_net_profit=3_000_000.0)
+    assert tiny["passed"] is False and "极低基数" in tiny["reason"]
+    assert "300.0万元" in tiny["reason"]   # 备注含真实金额
+
+    # 500 万整不触发（严格小于）
+    edge = check_growth_base_quality(profit_cagr=95.92, base_net_profit=5_000_000.0)
+    assert edge["passed"] is True and edge["deduction"] == 0.0
+
+    # 用户举例：芭田股份 CAGR 95.92% 但基期为正常正值 → 不触发
+    ok = check_growth_base_quality(profit_cagr=95.92, base_net_profit=8.6e7)
+    assert ok["passed"] is True
+    assert ok["deduction"] == 0.0
+    assert ok["reason"] == "成长基数正常"
+
+
+def test_growth_base_check_missing_data_passes_through():
+    """缺 CAGR 或缺基期净利 → 一律放行（不得把缺失当异常）。"""
+    from app.analysis.modules.growth import check_growth_base_quality
+
+    for cagr, base in ((None, -1e8), (95.0, None), (None, None)):
+        r = check_growth_base_quality(profit_cagr=cagr, base_net_profit=base)
+        assert r["passed"] is True
+        assert r["deduction"] == 0.0
+        assert "缺失" in r["reason"]
+
+
+def test_growth_base_penalty_applied_to_module_score():
+    """基期极低 + CAGR > 100 → 成长模块分被扣 20（并写入 metadata 留痕）。"""
+    from app.analysis.modules.growth import GrowthAnalyzer
+
+    # 净利 100万 → 4000万 → 9000万 → 1.6亿：基期 100 万 < 500 万，CAGR≈442%
+    res = _growth_result([1.0e6, 4.0e7, 9.0e7, 1.6e8])
+    meta = res.metadata
+    assert meta["growth_base_check"]["passed"] is False
+    assert meta["growth_base_check"]["deduction"] == 20.0
+    assert meta["growth_base_penalty"] > 0
+    assert any("基数校验不通过" in w for w in res.warnings)
+
+
+def test_growth_base_no_deduction_when_base_healthy():
+    """基期健康（>500万）时不扣分，metadata 仍留痕但 deduction=0。"""
+    from app.analysis.modules.growth import GrowthAnalyzer
+
+    res = _growth_result([5.0e7, 9.0e7, 1.4e8, 2.0e8])
+    meta = res.metadata
+    assert meta["growth_base_penalty"] == 0.0
+    assert meta["growth_base_check"]["passed"] is True
+    assert meta["growth_base_check"]["reason"] == "成长基数正常"
+    assert not any("基数校验不通过" in w for w in res.warnings)
+
+
+def test_growth_base_penalty_does_not_stack_with_profit_illusion():
+    """铁律3 防叠加：扣非否决(≤38) 与基数校验同时命中时，最终只取更严的那一个。"""
+    res = _growth_result(
+        [1.0e6, 4.0e7, 9.0e7, 1.6e8],
+        deducted_net_profit=-3.0e7,
+        parent_net_profit=1.6e8,
+        profit_yoy=120.0,
+    )
+    meta = res.metadata
+    assert meta["profit_illusion"] is True
+    assert meta["growth_base_check"]["passed"] is False
+    # 扣非否决后 ≤38，不是「38 再减 20」
+    assert res.score <= 38.0
+    assert res.score >= 20.0          # raw 下限保护
+    assert res.score < 40
+
+
+def test_gates_take_stricter_not_sum_with_profit_illusion():
+    """铁律3 核心回归：扭亏闸门 + 扣非否决同时命中时**不得累加**。
+
+    实测背景（2026-09-22，全市场 61 只同比>100%）：32 只触发扭亏闸门，
+    其中 11 只同时命中 profit_illusion。旧实现先扣 30 再压 38 上限，
+    ST西王(38 分) 掉到 8 分 —— 同一事实被惩罚两次。
+
+    正确行为：三条判据统一为「候选分取最小」。
+      · 扣非否决已把分压到 38 → 扭亏闸门扣 30 后为 8，二者取 min = 8？
+        不 —— 扣非否决的候选是 min(原分, 38)，扭亏的候选是 原分-30。
+        若原分 38：候选 = [38, 8, 38] → 取 8。若原分 90：候选 = [90, 60, 38] → 取 38。
+    即：**取的是两者的严格更严值，而不是把两个扣减相加**。
+    """
+    from app.analysis.modules.growth import GrowthAnalyzer
+
+    # 高成长分 + 扭亏 + 扣非为负：应落在 profit_illusion 的 38，而非 38-20
+    res = _growth_result(
+        [5.0e7, 6.0e7, 7.0e7, 8.0e7],
+        profit_yoy=150.0,
+        last_year_net_profit=-5e7,
+        deducted_net_profit=-3.0e7,
+        parent_net_profit=8.0e7,
+    )
+    meta = res.metadata
+    assert meta["profit_illusion"] is True
+    assert meta["turnaround_check"]["triggered"] is True
+    assert meta["turnaround_check"]["deduction"] == 20.0
+    # 关键断言：最终分不得低于 raw 下限，且不得出现「38 再减 20」
+    assert res.score >= 20.0
+    # 取更严者：扣非否决的 38 vs 扭亏扣减。若原分 > 58 则 38 更严 → 落在 38
+    assert res.score <= 60.0
+
+
+def test_gate_penalty_metadata_not_overreported():
+    """留痕不得虚报：被 profit_illusion 主导时，闸门 penalty 记为 0（未实际生效）。"""
+    res = _growth_result(
+        [5.0e7, 6.0e7, 7.0e7, 8.0e7],
+        profit_yoy=150.0,
+        last_year_net_profit=-5e7,
+        deducted_net_profit=-3.0e7,
+        parent_net_profit=8.0e7,
+    )
+    meta = res.metadata
+    # 两者之和不得超过「原分 - 最终分」的实际扣减总额
+    raw_before = res.score + meta["turnaround_penalty"] + meta["growth_base_penalty"]
+    assert meta["turnaround_penalty"] + meta["growth_base_penalty"] >= 0
+    assert raw_before >= res.score
+
+
+# ── 补丁二-B：扭亏型伪成长（同比口径）──────────────────────────────────
+
+
+def test_turnaround_triggers_only_above_100pct_yoy():
+    """同比 ≤100 一律不触发，即便上年亏损。"""
+    from app.analysis.modules.growth import check_turnaround_growth
+
+    for yoy in (100.0, 99.9, 50.0, 0.0, -30.0):
+        r = check_turnaround_growth(profit_yoy=yoy, last_year_net_profit=-5e7)
+        assert r["triggered"] is False
+        assert r["deduction"] == 0.0
+
+    r = check_turnaround_growth(profit_yoy=100.1, last_year_net_profit=-5e7)
+    assert r["triggered"] is True
+    assert r["deduction"] == 20.0
+
+
+def test_turnaround_penalty_tiers_match_spec_table():
+    """档位表：上年亏损 20 / 上年极低 15 / 极端扭亏额外 +10 / 上年扣非<=0 +15。"""
+    from app.analysis.modules.growth import check_turnaround_growth
+
+    loss = check_turnaround_growth(profit_yoy=150.0, last_year_net_profit=-5e7)
+    assert loss["deduction"] == 20.0
+    assert loss["penalty_loss"] == 20.0
+    assert loss["penalty_extreme"] == 0.0
+    assert "上年同期亏损" in loss["reason"]
+
+    extreme = check_turnaround_growth(profit_yoy=250.0, last_year_net_profit=-5e7)
+    assert extreme["deduction"] == 30.0          # 20 + 10
+    assert extreme["penalty_extreme"] == 10.0
+
+    low = check_turnaround_growth(profit_yoy=150.0, last_year_net_profit=3e6)
+    assert low["deduction"] == 15.0
+    assert low["penalty_loss"] == 0.0
+    assert "极低基数" in low["reason"]
+
+    # 上年为正值但扣非<=0 → 独立 +10（主营未改善；低于「上年亏损」档）
+    ded = check_turnaround_growth(
+        profit_yoy=150.0, last_year_net_profit=8e7, last_year_deducted_net_profit=-1e7
+    )
+    assert ded["deduction"] == 10.0
+    assert ded["penalty_deducted"] == 10.0
+    assert "扣非" in ded["reason"]
+
+
+def test_turnaround_no_trigger_when_last_year_healthy():
+    """上年同期正常正值 + 扣非正常 → 不触发（不误杀正常高增）。"""
+    from app.analysis.modules.growth import check_turnaround_growth
+
+    r = check_turnaround_growth(
+        profit_yoy=180.0, last_year_net_profit=1.2e8, last_year_deducted_net_profit=1.1e8
+    )
+    assert r["triggered"] is False
+    assert r["deduction"] == 0.0
+    assert "基数正常" in r["reason"]
+
+
+def test_turnaround_missing_data_passes_through():
+    """缺同比或缺上年同期净利 → 放行，不把缺失当异常（铁律7）。"""
+    from app.analysis.modules.growth import check_turnaround_growth
+
+    for yoy, ly in ((None, -5e7), (150.0, None), (None, None)):
+        r = check_turnaround_growth(profit_yoy=yoy, last_year_net_profit=ly)
+        assert r["triggered"] is False
+        assert r["deduction"] == 0.0
+        assert "缺失" in r["reason"]
+
+
+def test_turnaround_and_base_check_are_independent_layers():
+    """两条闸门口径不同、各自留痕，互不影响：CAGR 闸门与同比闸门可分别命中。"""
+    from app.analysis.modules.growth import (
+        check_growth_base_quality,
+        check_turnaround_growth,
+    )
+
+    # 场景：CAGR 不高（20%）但同比暴增且上年亏损 → 只有同比闸门命中
+    base_r = check_growth_base_quality(profit_cagr=20.0, base_net_profit=-1e8)
+    turn_r = check_turnaround_growth(profit_yoy=250.0, last_year_net_profit=-5e7)
+    assert base_r["passed"] is True and base_r["deduction"] == 0.0
+    assert turn_r["triggered"] is True and turn_r["deduction"] == 30.0
+
+    # 反向：CAGR 高但同比温和（无上年同期数据）→ 只有 CAGR 闸门命中
+    base_r2 = check_growth_base_quality(profit_cagr=160.0, base_net_profit=1e6)
+    turn_r2 = check_turnaround_growth(profit_yoy=None, last_year_net_profit=None)
+    assert base_r2["passed"] is False and base_r2["deduction"] == 20.0
+    assert turn_r2["triggered"] is False
+
+
+def test_turnaround_metadata_recorded_in_module():
+    """模块级：同比暴增 + 上年亏损 → 扣分落进 metadata 与 warnings。"""
+    res = _growth_result(
+        [5.0e7, 6.0e7, 7.0e7, 8.0e7],
+        profit_yoy=250.0,
+        last_year_net_profit=-5e7,
+    )
+    meta = res.metadata
+    assert meta["turnaround_check"]["triggered"] is True
+    assert meta["turnaround_check"]["deduction"] == 30.0
+    assert meta["turnaround_penalty"] > 0
+    assert any("扭亏型伪成长检测" in w for w in res.warnings)

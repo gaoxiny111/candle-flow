@@ -35,6 +35,11 @@ const marketScanError = ref('')
 const marketScanHint = ref('')
 const marketItems = ref<MarketConfluenceItem[]>([])
 const marketTierFilter = ref<'all' | 'A' | 'B' | 'C' | 'D' | 'E'>('all')
+// 观察池筛选（读层参数，不进分）：右侧信号 / PEG≤1 / 股息率≥3% / 赛道聚焦
+const marketRightSideOnly = ref(false)
+const marketPegMax = ref(false)
+const marketDivMin = ref(false)
+const marketTheme = ref<'all' | 'ai' | 'pharma'>('all')
 const marketStats = ref<{
   scanned: number
   universe_size: number
@@ -209,9 +214,24 @@ const boardEmpty = computed(() => !watchlist.symbols.length)
 const kindEmpty = computed(() => !boardEmpty.value && !displaySymbols.value.length)
 const showFundColumns = computed(() => watchKind.value === 'stock')
 
+// 赛道 → 行业关键词（读层筛选参数，不进分）。行业名是申万三级（如「光模块」
+// 不含「算力」二字），子串匹配只用于展示过滤，不做任何评分判定（铁律 16）。
+const THEME_KEYWORDS: Record<'ai' | 'pharma', string[]> = {
+  ai: ['光模块', 'PCB', '印制电路', '半导体', '通信设备', '元器件', '消费电子'],
+  pharma: ['化学制剂', '生物制品', '生物医药', '中药', '医疗器械'],
+}
+
 const filteredMarketItems = computed(() => {
-  if (marketTierFilter.value === 'all') return marketItems.value
-  return marketItems.value.filter((i) => i.tier === marketTierFilter.value)
+  let items = marketItems.value
+  if (marketTierFilter.value !== 'all') items = items.filter((i) => i.tier === marketTierFilter.value)
+  if (marketRightSideOnly.value) items = items.filter((i) => (i.right_side?.length ?? 0) > 0)
+  if (marketPegMax.value) items = items.filter((i) => i.peg != null && i.peg <= 1)
+  if (marketDivMin.value) items = items.filter((i) => i.dividend_yield != null && i.dividend_yield >= 3)
+  if (marketTheme.value !== 'all') {
+    const kws = THEME_KEYWORDS[marketTheme.value] || []
+    items = items.filter((i) => kws.some((k) => (i.industry || '').includes(k)))
+  }
+  return items
 })
 
 // 按行业分组：在 tier 筛选后，再按 industry 聚合，每组内按基本面评分降序
@@ -232,6 +252,51 @@ const industryGroupedItems = computed(() => {
   groups.sort((a, b) => b.items.length - a.items.length || a.industry.localeCompare(b.industry, 'zh-CN'))
   return groups
 })
+
+function techStateClass(state?: string | null) {
+  if (state === '多头') return 'bull'
+  if (state === '回踩') return 'pullback'
+  if (state === '空头') return 'bear'
+  return 'na'
+}
+
+// ── 三步 N 字结构（2026-09-23 第二版判据，取代旧 EMA 金叉）────────────────
+// stage 取值：①破局 / 滤B-3日 / ②回踩 / ③起爆 / 滤C-共振 / 数据 / 通过
+function nshapeClass(stage?: string | null) {
+  if (!stage) return 'na'
+  if (stage === '通过') return 'pass'
+  if (stage.startsWith('①')) return 's1'
+  if (stage.startsWith('②')) return 's2'
+  if (stage.startsWith('③')) return 's3'
+  if (stage.startsWith('滤')) return 'filtered'
+  return 'na'
+}
+
+// 无 nshape_detail 时用字段拼一句自证文案（口径铁律 4：输出带数值）
+function nshapeTitle(item: MarketConfluenceItem) {
+  const parts: string[] = []
+  if (item.breakout_gap_days != null) parts.push(`破局 T-${item.breakout_gap_days}`)
+  if (item.pullback_days != null) parts.push(`回调 ${item.pullback_days} 日`)
+  if (item.boom_gap_days != null) parts.push(`起爆 T-${item.boom_gap_days}`)
+  if (item.pullback_shrink != null) parts.push(`缩量比 ${item.pullback_shrink.toFixed(2)}`)
+  return parts.length ? parts.join(' / ') : 'N 字三步：①破局 → ②回踩 → ③起爆'
+}
+
+// 主力净流入金额：元 → 亿元/万元
+function flowText(v: number) {
+  const abs = Math.abs(v)
+  const sign = v >= 0 ? '+' : '-'
+  if (abs >= 1e8) return `${sign}${(abs / 1e8).toFixed(2)}亿`
+  if (abs >= 1e4) return `${sign}${(abs / 1e4).toFixed(0)}万`
+  return `${sign}${abs.toFixed(0)}`
+}
+
+function resetMarketPoolFilters() {
+  marketRightSideOnly.value = false
+  marketPegMax.value = false
+  marketDivMin.value = false
+  marketTheme.value = 'all'
+}
 
 function tierLabel(tier?: string) {
   const labels: Record<string, string> = {
@@ -379,6 +444,7 @@ async function loadMarketScan(force = false) {
       if (cachePayload && !cachePayload.empty) {
         marketItems.value = cachePayload.items || []
         marketTierFilter.value = 'all'
+        resetMarketPoolFilters()
         marketStats.value = {
           scanned: cachePayload.scanned,
           universe_size: cachePayload.universe_size,
@@ -412,6 +478,7 @@ async function loadMarketScan(force = false) {
     const payload = data.data
     marketItems.value = payload?.items || []
     marketTierFilter.value = 'all'
+    resetMarketPoolFilters()
     marketStats.value = payload
       ? {
           scanned: payload.scanned,
@@ -625,8 +692,9 @@ async function switchBoardTab(tab: 'watch' | 'market') {
           <div class="progress-track"><div class="progress-fill" :style="{ width: `${marketProgressPct}%` }" /></div>
         </div>
         <p class="market-desc">
-          自动扫描主板非 ST，先做<strong>基本面预筛</strong>（剔除亏损/高负债/低 ROE/净利暴跌/高 PE），再对合格股做 K 线形态扫描，按基本面评分分层：
-          A≥85 优质 / B 70-84 良好 / C 55-69 中等 / D 40-54 偏弱 / E&lt;40 高风险。
+          <strong>基本面打底观察池</strong>：自动扫描主板非 ST，先排雷预筛（剔除亏损/高负债/低 ROE/净利暴跌/高 PE），合格股按基本面评分分层
+          A≥85 / B 70-84 / C 55-69 / D 40-54 / E&lt;40。技术面<strong>不设门槛</strong>——空头/震荡标的保留在池内，仅标记技术状态；
+          出现右侧信号（日线 EMA12 上穿 EMA50 且 RSI≥50，或收盘突破 10 周平台且量能 ≥2 倍）时提示择时。
         </p>
         <p v-if="marketScanHint" class="scan-hint">{{ marketScanHint }}</p>
         <p v-if="marketScanError" class="follow-error">{{ marketScanError }}</p>
@@ -686,6 +754,38 @@ async function switchBoardTab(tab: 'watch' | 'market') {
           </button>
         </div>
 
+        <div v-if="marketItems.length" class="tier-filters rs-filters">
+          <button
+            type="button"
+            class="tier-chip rs-chip"
+            :class="{ active: marketRightSideOnly }"
+            @click="marketRightSideOnly = !marketRightSideOnly"
+          >
+            右侧信号
+          </button>
+          <button
+            type="button"
+            class="tier-chip rs-chip"
+            :class="{ active: marketPegMax }"
+            @click="marketPegMax = !marketPegMax"
+          >
+            PEG ≤ 1
+          </button>
+          <button
+            type="button"
+            class="tier-chip rs-chip"
+            :class="{ active: marketDivMin }"
+            @click="marketDivMin = !marketDivMin"
+          >
+            股息率 ≥ 3%
+          </button>
+          <select v-model="marketTheme" class="theme-select" aria-label="赛道聚焦">
+            <option value="all">全部赛道</option>
+            <option value="ai">AI 算力</option>
+            <option value="pharma">创新药</option>
+          </select>
+        </div>
+
         <div v-if="!marketScanning && !marketItems.length && !marketScanError" class="empty">
           暂无基本面合格股票。可点「重新扫描」，或先在图表页同步更多股票的 K 线。
         </div>
@@ -703,12 +803,16 @@ async function switchBoardTab(tab: 'watch' | 'market') {
                   <th>PE</th>
                   <th>ROE</th>
                   <th>负债率</th>
+                  <th>技术状态</th>
+                  <th>右侧信号</th>
+                  <th>N字阶段</th>
+                  <th>主力净流入</th>
                   <th>操作</th>
                 </tr>
               </thead>
               <tbody v-for="group in industryGroupedItems" :key="group.industry">
                 <tr class="industry-group-header">
-                  <td colspan="10">
+                  <td colspan="14">
                     <span class="industry-group-name">{{ group.industry }}</span>
                     <span class="industry-group-count">{{ group.items.length }}只</span>
                   </td>
@@ -739,6 +843,67 @@ async function switchBoardTab(tab: 'watch' | 'market') {
                   <td>{{ item.pe_ttm?.toFixed(1) ?? '—' }}</td>
                   <td>{{ item.roe?.toFixed(1) ?? '—' }}%</td>
                   <td>{{ item.debt_ratio?.toFixed(1) ?? '—' }}%</td>
+                  <td>
+                    <span
+                      class="tech-state"
+                      :class="'tech-' + techStateClass(item.tech_state)"
+                      :title="item.right_side_detail || ''"
+                    >{{ item.tech_state || '—' }}</span>
+                  </td>
+                  <td>
+                    <span
+                      v-for="sig in item.right_side || []"
+                      :key="sig"
+                      class="rs-badge"
+                      :title="item.right_side_detail || ''"
+                    >{{ sig }}</span>
+                    <span
+                      v-if="item.macd_bullish"
+                      class="macd-badge"
+                      :title="'MACD DIF>DEA（辅助确认，非准入条件）'"
+                    >MACD多头</span>
+                    <span
+                      v-if="item.ma_bullish"
+                      class="ma-badge"
+                      :title="'均线多头排列 MA5>MA10>MA20'"
+                    >均线多头</span>
+                    <span
+                      v-if="!item.right_side?.length"
+                      class="muted"
+                      :title="item.right_side_detail || ''"
+                    >—</span>
+                  </td>
+                  <td>
+                    <span
+                      class="nshape-badge"
+                      :class="'nshape-' + nshapeClass(item.nshape_stage)"
+                      :title="item.nshape_detail || nshapeTitle(item)"
+                    >{{ item.nshape_stage || '—' }}</span>
+                    <span
+                      v-if="item.pullback_days != null"
+                      class="nshape-meta"
+                      :title="'回调段天数（②回踩阶段）'"
+                    >回调{{ item.pullback_days }}日</span>
+                    <span
+                      v-if="item.breakout_gap_days != null"
+                      class="nshape-meta"
+                      :title="'破局日距今天数（①破局阶段）'"
+                    >破局T-{{ item.breakout_gap_days }}</span>
+                    <span
+                      v-if="item.boom_gap_days != null"
+                      class="nshape-meta"
+                      :title="'起爆日距今天数（③起爆阶段）'"
+                    >起爆T-{{ item.boom_gap_days }}</span>
+                  </td>
+                  <td>
+                    <span
+                      v-if="item.main_flow_net != null"
+                      class="flow-badge"
+                      :class="item.main_flow_net >= 0 ? 'flow-in' : 'flow-out'"
+                      :title="'当日主力净流入（东财：超大单+大单），仅展示、不参与判据（口径铁律 13）'"
+                    >{{ flowText(item.main_flow_net) }}</span>
+                    <span v-else class="muted" title="东财资金流快照未取到该股（仅展示、不进判据）">—</span>
+                  </td>
                   <td>
                     <button class="follow-btn" @click="openChart(item.symbol)">图表</button>
                   </td>
@@ -775,6 +940,41 @@ async function switchBoardTab(tab: 'watch' | 'market') {
                   <div><span class="k">ROE</span><span>{{ item.roe?.toFixed(1) ?? '—' }}%</span></div>
                   <div><span class="k">负债率</span><span>{{ item.debt_ratio?.toFixed(1) ?? '—' }}%</span></div>
                 </div>
+                <div class="watch-card-rs">
+                  <span
+                    class="tech-state"
+                    :class="'tech-' + techStateClass(item.tech_state)"
+                  >{{ item.tech_state || '—' }}</span>
+                  <span
+                    v-for="sig in item.right_side || []"
+                    :key="sig"
+                    class="rs-badge"
+                    >{{ sig }}</span>
+                  <span v-if="item.macd_bullish" class="macd-badge">MACD多头</span>
+                  <span v-if="item.ma_bullish" class="ma-badge">均线多头</span>
+                  <span v-if="item.dividend_yield != null" class="muted">股息 {{ item.dividend_yield.toFixed(1) }}%</span>
+                </div>
+                <div class="watch-card-nshape">
+                  <span class="nshape-label">N字</span>
+                  <span
+                    class="nshape-badge"
+                    :class="'nshape-' + nshapeClass(item.nshape_stage)"
+                    :title="item.nshape_detail || nshapeTitle(item)"
+                  >{{ item.nshape_stage || '—' }}</span>
+                  <span v-if="item.pullback_days != null" class="nshape-meta">回调{{ item.pullback_days }}日</span>
+                  <span
+                    v-if="item.pullback_shrink != null"
+                    class="nshape-meta"
+                    :title="'回调段最大量 ÷ 破局日量（仅展示，不卡准入）'"
+                  >缩量{{ item.pullback_shrink.toFixed(2) }}</span>
+                  <span
+                    v-if="item.main_flow_net != null"
+                    class="flow-badge"
+                    :class="item.main_flow_net >= 0 ? 'flow-in' : 'flow-out'"
+                    title="当日主力净流入（东财：超大单+大单），仅展示、不参与判据"
+                  >主力 {{ flowText(item.main_flow_net) }}</span>
+                </div>
+                <div v-if="item.nshape_detail" class="watch-card-nshape-detail">{{ item.nshape_detail }}</div>
                 <div class="watch-card-head market-card-foot">
                   <span class="muted">点按查看图表</span>
                   <button type="button" class="link-btn" @click.stop="openChart(item.symbol)">图表</button>
@@ -928,7 +1128,104 @@ th { color: var(--text-secondary); font-weight: 500; }
 .scan-hint { font-size: 13px; color: var(--text-secondary); margin: 0 0 8px; }
 .scan-meta { font-size: 12px; color: var(--text-secondary); margin: 0 0 var(--space-md); }
 .tier-filters { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 var(--space-md); }
-.tier-chip {
+.rs-filters { align-items: center; }
+.rs-chip.active { border-color: var(--accent-color, #185fa5); color: var(--accent-color, #185fa5); font-weight: 500; }
+.theme-select {
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-primary);
+  border-radius: 999px;
+  padding: 5px 10px;
+  font-size: 13px;
+}
+.tech-state { font-size: 12.5px; white-space: nowrap; }
+.tech-bull { color: #c0392b; }
+.tech-pullback { color: #b8860b; }
+.tech-bear { color: #27864b; }
+.tech-na { color: var(--text-tertiary, #999); }
+.rs-badge {
+  display: inline-block;
+  border: 1px solid #c0392b;
+  color: #c0392b;
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 12px;
+  margin-right: 4px;
+  white-space: nowrap;
+}
+.watch-card-rs { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; font-size: 12.5px; }
+/* MACD 辅助确认标签：中性色（不进分、不做准入），与红色 rs-badge 区分开 */
+.macd-badge {
+  display: inline-block;
+  border: 1px dashed var(--border-color, #ccc);
+  color: var(--text-secondary, #666);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 12px;
+  margin-right: 4px;
+  white-space: nowrap;
+}
+/* 均线多头排列：同为辅助确认，虚线中性色 */
+.ma-badge {
+  display: inline-block;
+  border: 1px dashed var(--border-color, #ccc);
+  color: var(--text-secondary, #666);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 12px;
+  margin-right: 4px;
+  white-space: nowrap;
+}
+/* ── 三步 N 字结构标签 ────────────────────────────────────────────── */
+.nshape-badge {
+  display: inline-block;
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 12px;
+  margin-right: 4px;
+  white-space: nowrap;
+  border: 1px solid var(--border-color, #ccc);
+  color: var(--text-secondary, #666);
+}
+/* 通过：与右侧信号同色系（红=看多） */
+.nshape-badge.nshape-pass { border-style: solid; border-color: #c0392b; color: #c0392b; font-weight: 600; }
+.nshape-badge.nshape-s1 { border-color: #b8860b; color: #b8860b; }
+.nshape-badge.nshape-s2 { border-color: #185fa5; color: #185fa5; }
+.nshape-badge.nshape-s3 { border-color: #d46b08; color: #d46b08; }
+.nshape-badge.nshape-filtered { border-style: dashed; color: var(--text-tertiary, #999); }
+.nshape-badge.nshape-na { border-style: dashed; color: var(--text-tertiary, #999); }
+.nshape-meta {
+  display: inline-block;
+  color: var(--text-tertiary, #999);
+  font-size: 11.5px;
+  margin-right: 5px;
+  white-space: nowrap;
+}
+/* 主力净流入：涨红跌绿（A 股约定）；仅展示、不进判据 */
+.flow-badge {
+  display: inline-block;
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.flow-badge.flow-in { color: #c0392b; background: rgba(192, 57, 43, 0.08); }
+.flow-badge.flow-out { color: #27864b; background: rgba(39, 134, 75, 0.08); }
+.watch-card-nshape {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-top: 6px;
+  font-size: 12px;
+}
+.watch-card-nshape .nshape-label { color: var(--text-tertiary, #999); font-size: 11.5px; }
+.watch-card-nshape-detail {
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--text-tertiary, #999);
+  line-height: 1.5;
+}.tier-chip {
   border: 1px solid var(--border-color);
   background: transparent;
   color: var(--text-secondary);

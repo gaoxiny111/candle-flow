@@ -440,6 +440,10 @@ class FundamentalEngine:
             "deducted_net_profit": meta.get("deducted_net_profit"),
             "parent_net_profit": meta.get("parent_net_profit"),
             "deducted_yoy_pct": meta.get("deducted_yoy_pct"),
+            # 上年同期归母净利：growth 模块「扭亏型伪成长」检测的同比分母。
+            # 同期对同期（中报对去年中报），由 financials 统一产出，模块侧只消费。
+            "last_year_net_profit": meta.get("last_year_net_profit"),
+            "last_year_deducted_net_profit": meta.get("last_year_deducted_net_profit"),
             "single_quarter": meta.get("single_quarter"),
             "ar_metrics": meta.get("ar_metrics"),
             # 营运效率跟踪（应收周转天数变化率 / 存货营收比），供 efficiency
@@ -1497,6 +1501,43 @@ class FundamentalEngine:
         return new_score, valuation, new_composite, new_letter
 
     @staticmethod
+    def _peg_base_check(window, base: float | None = None) -> str | None:
+        """基数校验：正 CAGR 是否由「崩塌趋势」或「过低基期」算出来的。
+
+        ``window`` 用于找**峰值与最新值**（应传完整可用序列，才能看见早期的
+        高位与崩塌）；``base`` 是 CAGR 的实际起点净利（3年CAGR 时 = 倒数第4期），
+        缺省取 ``window`` 最老一期。
+
+        返回不通过原因（字符串），通过则返回 None。
+
+        两个判据都以「窗口内峰值」为参照，而不是相邻两期比较 —— 「利润腰斩」
+        可能是一次性事件（资产减值）也可能是趋势性下滑；与峰值比能同时覆盖，
+        且与「基期过低」共用同一条基线。
+        """
+        try:
+            vals = [float(v) for v in window.dropna()]
+        except (TypeError, ValueError):
+            return None
+        if len(vals) < 2:
+            return None
+        peak = max(vals)
+        if peak <= 0:
+            return None
+        latest = vals[-1]
+        if base is None:
+            base = vals[0]
+        if latest < peak * 0.5:
+            return (
+                f"最近一期净利不足窗口峰值50%"
+                f"（{latest / 1e8:.2f}亿 vs 峰值{peak / 1e8:.2f}亿）"
+            )
+        if 0 < base < peak * 0.2:
+            return (
+                f"基期净利过低（{base / 1e8:.2f}亿 < 峰值{peak / 1e8:.2f}亿的20%）"
+            )
+        return None
+
+    @staticmethod
     def _growth_for_peg(fin_df: pd.DataFrame, meta: dict) -> tuple[float | None, str]:
         """PEG 的分母（全系统唯一来源）。
 
@@ -1516,6 +1557,20 @@ class FundamentalEngine:
 
         仅当完全没有多年窗口（新上市票年报点 <2）时才回退单期同比，
         且拒绝已按极值折减过的同比（那是系统对「该增速不可持续」的自认）。
+
+        **基数校验（2026-09-22 新增）**：即使窗口内存量点全为正、CAGR 为正，
+        仍需校验「这个正 CAGR 是不是被基数效应或崩塌趋势算出来的」。两类陷阱：
+
+          ① **崩塌趋势**：最近一期净利 < 窗口内峰值 × ``_PEG_PEAK_KEEP``(0.5)。
+             立霸股份 603519 净利 6.40亿(2023) → 1.59亿(2024) → 1.57亿(2025)，
+             长窗口 CAGR 仍为 +9.27%（起点 2021 年 1.10 亿偏低），但利润已从
+             高点腰斩且连续两年下滑 —— 用这个分母算出的 PEG 会「越崩越便宜」。
+          ② **基期过低**：起点净利 < 窗口内峰值 × ``_PEG_BASE_KEEP``(0.2)，
+             即 CAGR 的增长几乎全部来自「从坑里爬出来」，不代表可持续增速。
+
+        命中任一 → PEG 不适用（返回 None）。**方向只会更严**：把原本会给出
+        PEG 的票改判 None，而 PEG 为 None 时全站按保守口径处理（不触发强买入），
+        不会产生新的乐观信号。
         """
         if fin_df is not None and not fin_df.empty and "net_profit" in fin_df.columns:
             clean = fin_df["net_profit"].dropna()
@@ -1524,6 +1579,11 @@ class FundamentalEngine:
                 if start > 0 and end > 0:
                     cagr = ((end / start) ** (1 / 3) - 1) * 100
                     if cagr > 0:
+                        # 校验窗口用完整序列（才看得见早期高位与崩塌），
+                        # base 显式传 CAGR 起点（倒数第 4 期）。
+                        reason = FundamentalEngine._peg_base_check(clean, start)
+                        if reason is not None:
+                            return None, f"{reason}，PEG不适用"
                         return round(cagr, 2), "3年净利CAGR"
             if len(clean) >= 2:
                 start, end = float(clean.iloc[0]), float(clean.iloc[-1])
@@ -1531,6 +1591,9 @@ class FundamentalEngine:
                 if start > 0 and end > 0:
                     cagr = ((end / start) ** (1 / span) - 1) * 100
                     if cagr > 0:
+                        reason = FundamentalEngine._peg_base_check(clean, start)
+                        if reason is not None:
+                            return None, f"{reason}，PEG不适用"
                         return round(cagr, 2), f"{span}年净利CAGR"
                 # 年报窗口已存在但不可用（亏损基期 / 负增长）→ PEG 不适用
                 return None, "年报窗口负增长/含亏损，PEG不适用"

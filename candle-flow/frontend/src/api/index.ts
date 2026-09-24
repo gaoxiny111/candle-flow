@@ -314,6 +314,24 @@ export interface MarketConfluenceItem {
     cashflow?: number | null
     valuation?: number | null
   }
+  // 观察池右侧信号（2026-09-23）：技术面不设门槛，仅标记状态与右侧信号
+  tech_state?: string | null
+  right_side?: string[]
+  right_side_detail?: string | null
+  rsi14?: number | null
+  // MACD 辅助确认（DIF > DEA），仅展示；量能不作为准入条件（只在前端展示量比文案）
+  macd_bullish?: boolean | null
+  // ── 三步 N 字结构（2026-09-23 第二版判据）──────────────────────────────
+  // trend_reversal 现由「破局 → 回踩 → 起爆」三步判定，取代旧的 EMA 金叉。
+  nshape_stage?: string | null          // ①破局 / 滤B-3日 / ②回踩 / ③起爆 / 滤C-共振 / 通过
+  nshape_detail?: string | null         // 卡点原因（未通过时）
+  breakout_gap_days?: number | null     // 破局日距今天数
+  pullback_days?: number | null         // 回调段天数
+  pullback_shrink?: number | null       // 回调段最大量/破局日量（仅展示，不卡准入）
+  boom_gap_days?: number | null         // 起爆日距今天数
+  ma_bullish?: boolean | null           // 均线多头排列 MA5>MA10>MA20
+  main_flow_net?: number | null         // 当日主力净流入（元），仅展示（铁律 13）
+  dividend_yield?: number | null
 }
 
 export interface MarketConfluenceScanResult {
@@ -1396,6 +1414,10 @@ export interface MarketScanItem {
 
 export type MarketScanSort =
   | 'resonance'
+  /** 质量×价值选股视图（走 /market-scan/quality-value 独立端点） */
+  | 'quality_value'
+  /** 价量策略视图（走 /strategies/price-volume 读层；只展示，不参与打分） */
+  | 'pv'
   | 'composite_score'
   | 'profitability'
   | 'growth'
@@ -1464,6 +1486,332 @@ export const fetchMarketScan = async (query: MarketScanQuery = {}) => {
 
 export const fetchMarketCoverage = async () => {
   const res = await api.get<ApiResponse<MarketScanCoverage>>('/fundamentals/market-coverage')
+  return { data: checkApi(res) }
+}
+
+/** 单个监测商品的价格状态（期货主力连续，只读展示）。 */
+export interface CyclePriceState {
+  code: string
+  name: string
+  /** 最新交易日 */
+  date: string
+  close: number
+  window: number
+  high: number
+  low: number
+  /** 区间位置：0=区间最低，100=区间最高 */
+  pos_pct: number
+  /** 距区间高点回撤（≤0） */
+  drawdown_pct: number
+  ma20: number | null
+  ma60: number | null
+  trend: 'up' | 'down' | null
+  ret_20_pct: number | null
+  ret_60_pct: number | null
+  /** 数据是否停更（停更品种不参与预警判定） */
+  stale: boolean
+  stale_days: number | null
+}
+
+/** 触发预警的那批产品（``kind`` 指明是按回撤还是按区间位置触发）。 */
+export interface CyclePriceTrigger {
+  kind: 'drawdown' | 'position'
+  /** 实际触发的品种数 */
+  breadth: number
+  /** 篮子里的有效品种总数 */
+  total: number
+  /** 定档所需的共振宽度（过半数） */
+  need: number
+  products: CyclePriceState[]
+}
+
+/**
+ * 周期品「产品价格拐点」预警（**只读**：不改写 qv_score / composite_score，
+ * 也不参与任何硬门槛）。
+ *
+ * `grade`：
+ * - `trap`   周期陷阱预警：报表利润暴增，但**产品**价格已明确回落
+ * - `peak`   景气高位预警：利润暴增且产品价格仍在高位
+ * - `normal` 有映射且无预警
+ * - `na`     无对应商品 / 行业产出无期货 / 数据缺失
+ *
+ * 多品种篮子要求**过半数共振**才定档（见 `trigger`），避免单一离群品种
+ * 产生假归属（例如 5 个金属的篮子让每个工业金属股都顶着「回撤最大的那个」）。
+ */
+export interface CyclePriceAssess {
+  grade: 'trap' | 'peak' | 'normal' | 'na'
+  label: string
+  industry?: string
+  industry_normalized?: string
+  mapped: boolean
+  profit_yoy_pct?: number | null
+  /** 回撤最大的产品（仅作参考，不再用于定档） */
+  worst_product?: CyclePriceState | null
+  /** 实际触发定档的品种与共振宽度 */
+  trigger?: CyclePriceTrigger | null
+  /** 公司**卖出**的东西：下跌 = 利空（预警来源） */
+  products: CyclePriceState[]
+  /** 公司**买入**的东西：下跌 = 成本改善（只作背景，不产生预警） */
+  costs: CyclePriceState[]
+  notes: string[]
+}
+
+/** 质量×价值视图：单只标的的判定明细（全部字段来自已有快照，不重算分数）。 */
+export interface QualityValueItem {
+  symbol: string
+  name: string
+  industry: string
+  /** 权威综合分（全站唯一；本视图不改写它） */
+  composite_score: number | null
+  /** 仅用于本视图排序与展示，**不是**第二个综合分（score_role 恒为 display_only） */
+  qv_score: number
+  score_role: 'display_only'
+  pe_ttm: number | null
+  pb: number | null
+  dividend_yield: number | null
+  market_cap_yi: number | null
+  price: number | null
+  roe_pct: number | null
+  roic_pct: number | null
+  gross_margin_pct: number | null
+  debt_ratio_pct: number | null
+  /** 经营现金流/净利润（5 年均值） */
+  ocf_np_5y: number | null
+  revenue_yoy: number | null
+  peg: number | null
+  /** 质量×价值判定明细（自证用） */
+  qv_components: {
+    quality_pct: number
+    value_pct: number
+    growth_pct: number
+    roe_industry_pct: number | null
+    gross_margin_industry_pct: number | null
+    pe_industry_pct: number | null
+    pb_industry_pct: number | null
+    low_margin_industry: boolean
+    /** 行业内样本数；< 5 时 industry_median 不可信（已置 null） */
+    industry_sample: number
+    industry_median: { pe: number | null; pb: number | null; gross_margin_pct: number | null }
+  }
+  /** 缺失项（缺失≠不达标，仅留痕） */
+  qv_missing: string[]
+  /** 未通过原因（通过者为空数组） */
+  qv_reasons: string[]
+  /** 周期品产品价格拐点预警（只读增强；`with_cycle_price=false` 时为 undefined） */
+  cycle_price?: CyclePriceAssess | null
+}
+
+export interface QualityValueThresholds {
+  min_roe: number
+  min_roic: number
+  min_gross_margin: number
+  max_debt_ratio: number
+  min_ocf_np: number
+  max_pe: number
+  max_pb: number
+  max_pe_pctile: number
+  max_pb_pctile: number
+  max_peg: number
+  min_dividend_yield: number
+  min_market_cap_yi: number
+}
+
+export interface QualityValueData {
+  count: number
+  matched: number
+  rejected: number
+  reject_summary: Record<string, number>
+  offset: number
+  limit: number
+  has_more: boolean
+  sort_by: string
+  thresholds: QualityValueThresholds
+  filters: {
+    exclude_st: boolean
+    include_gem: boolean
+    industry: string | null
+    keyword: string | null
+  }
+  items: QualityValueItem[]
+  rejected_sample: QualityValueItem[]
+  coverage: MarketScanCoverage
+  /** 周期品预警的覆盖率/档位分布自检（未开启时为 null） */
+  cycle_price?: {
+    enabled: boolean
+    attached: number
+    mapped: number
+    grade_summary: Record<string, number>
+    coverage: {
+      /** 有产出物期货、可下结论的行业数 */
+      judged_industries: number
+      /** 只映射到成本项（产品无期货）→ 不判定的行业数 */
+      cost_only_industries: number
+      /** 完全未纳入监测表的行业数 */
+      unmapped_industries: number
+      judged_detail: Record<string, number>
+      cost_only_detail: Record<string, number>
+      unmapped_detail: Record<string, number>
+    }
+  } | null
+  notes: string[]
+}
+
+export type QualityValueSort =
+  | 'qv_score'
+  | 'quality'
+  | 'value'
+  | 'roe_pct'
+  | 'gross_margin_pct'
+  | 'roic_pct'
+  | 'dividend_yield'
+  | 'pe_ttm'
+  | 'pb'
+  | 'composite_score'
+
+export interface QualityValueQuery {
+  top?: number
+  offset?: number
+  exclude_st?: boolean
+  include_gem?: boolean
+  industry?: string
+  keyword?: string
+  min_roe?: number
+  min_roic?: number
+  min_gross_margin?: number
+  max_debt_ratio?: number
+  min_ocf_np?: number
+  max_pe?: number
+  max_pb?: number
+  max_pe_pctile?: number
+  max_pb_pctile?: number
+  min_dividend_yield?: number
+  max_peg?: number
+  min_market_cap_yi?: number
+  sort_by?: QualityValueSort
+  with_cycle_price?: boolean
+}
+
+export const fetchQualityValue = async (query: QualityValueQuery = {}) => {
+  const res = await api.get<ApiResponse<QualityValueData>>(
+    '/fundamentals/market-scan/quality-value',
+    { params: query, timeout: 90000 },
+  )
+  return { data: checkApi(res) }
+}
+
+/** 周期品价格看板（只读，不参与打分）。 */
+export interface CyclePriceBoard {
+  count: number
+  live_count: number
+  stale: { code: string; name: string; date: string; stale_days: number | null }[]
+  unavailable: string[]
+  most_fallen: CyclePriceState[]
+  highest_position: CyclePriceState[]
+  items: CyclePriceState[]
+  thresholds: Record<string, number>
+  notes: string[]
+}
+
+export const fetchCyclePriceBoard = async (force = false) => {
+  const res = await api.get<ApiResponse<CyclePriceBoard>>(
+    '/fundamentals/market-scan/cycle-price',
+    { params: force ? { force: true } : undefined, timeout: 60000 },
+  )
+  return { data: checkApi(res) }
+}
+
+/** 调仓动作（硬编码规则）：买 / 卖 / 持有 / 不介入。 */
+export type RebalanceAction = 'buy' | 'sell' | 'hold' | 'skip'
+
+/**
+ * 单只标的的调仓判定结果 = 完整质量价值条目 + 判定字段。
+ * 后端 `{**item, action/reasons/...}` 合并 —— buy 桶可直接渲染整张选股表
+ * （ROE/毛利率/PE 分位等列全部可用），无需二次查询。
+ */
+export type RebalanceItem = QualityValueItem & {
+  action: RebalanceAction
+  reasons: string[]
+  missing: string[]
+  /** 是否满足调入条件（持仓且仍达标的票会继续留在选股表，徽标「持有」） */
+  meets_buy: boolean
+  entry_price: number | null
+  month_drop_pct: number | null
+  drop_source: '持仓' | '单月' | null
+  /** 随轻量行透传（类型上可选，运行时后端必带） */
+  final_rating?: string | null
+  risk_level_label?: string | null
+}
+
+export interface RebalanceData {
+  buy: RebalanceItem[]
+  sell: RebalanceItem[]
+  hold: RebalanceItem[]
+  skip: RebalanceItem[]
+  buy_count: number
+  sell_count: number
+  hold_count: number
+  skip_count: number
+  thresholds: {
+    buy_score: number
+    min_market_cap_yi: number
+    sell_score: number
+    max_month_drop_pct: number
+  }
+  notes: string[]
+  universe: number | null
+  rejected_by_quality_gate: number | null
+  holdings_parsed: number
+  /** 实际参与判定的候选数（= 全部通过质量门槛者，不受分页 top 截断） */
+  evaluated?: number
+  /** 各桶明细是否因 top 上限被截断（计数仍是全量真值） */
+  truncated?: { buy: boolean; sell: boolean }
+  filters: QualityValueData['filters'] | null
+}
+
+export interface RebalanceQuery {
+  buy_score?: number
+  min_market_cap_yi?: number
+  sell_score?: number
+  max_month_drop_pct?: number
+  /** 持仓基准价，格式 `600519.SH:1500,600036.SH:35` */
+  holdings?: string
+  top?: number
+  exclude_st?: boolean
+  include_gem?: boolean
+  industry?: string
+  keyword?: string
+}
+
+export const fetchRebalance = async (query: RebalanceQuery = {}) => {
+  const res = await api.get<ApiResponse<RebalanceData>>(
+    '/fundamentals/market-scan/quality-value/rebalance',
+    { params: query, timeout: 90000 },
+  )
+  return { data: checkApi(res) }
+}
+
+/** 因子快照口径重建进度：rebuilt = 已按当前 SCORING_VERSION 重判的快照数。 */
+export interface FactorsProgress {
+  scoring_version: string
+  rebuilt: number
+  outdated: number
+  total: number
+  pct: number
+  running: boolean
+  /** build_all 本轮实时游标（重启/续跑后从 0 重计），未运行为 null */
+  run: {
+    started_at: number | null
+    planned: number | null
+    processed: number | null
+    built: number | null
+    failed: number | null
+  } | null
+  latest_built_at: string | null
+  complete: boolean
+}
+
+export const fetchFactorsProgress = async () => {
+  const res = await api.get<ApiResponse<FactorsProgress>>('/fundamentals/factors/progress')
   return { data: checkApi(res) }
 }
 
@@ -1758,6 +2106,308 @@ export interface BroadFlowData {
 
 export const fetchBroadFlow = async () => {
   const res = await api.get<ApiResponse<BroadFlowData>>('/flow/broad', { timeout: 90000 })
+  return { data: checkApi(res) }
+}
+
+// ── 价量策略（趋势确认 / 反转捕捉）────────────────────────────────────
+// **只读**：不参与评分、不改写 composite_score。扫描走后台任务 + 进度轮询。
+
+export interface PvSignalHit {
+  key: string
+  name: string
+  category: 'trend' | 'reversal'
+  category_zh: string
+  direction: 'bullish' | 'bearish'
+  direction_zh: string
+  date: string
+  /** 距最新一根 K 线的交易日数，0 = 当日仍在生效 */
+  bars_ago: number
+  reason: string
+  metrics: Record<string, number | null>
+  /** 回看窗口内该信号的触发次数（去重后被折叠成一条） */
+  hits_in_window?: number
+}
+
+export interface PvRegime {
+  state: 'trend' | 'range' | 'neutral' | 'unknown'
+  adx: number | null
+  plus_di: number | null
+  minus_di: number | null
+}
+
+export interface PvTradable {
+  exec_hint: string
+  pending_next_bar: boolean
+  signal_date: string | null
+  /** null = 未知 / 无需判定；有值 = 一字板封死代码 */
+  blocked: string | null
+  blocked_zh: string | null
+  next_date: string | null
+  limit_pct: number
+}
+
+/** 信号处理流水线的裁决结果（补丁一 优先级仲裁 + 补丁二 ADX 环境分流）。
+ *  **只读**：不影响任何分数与门槛，仅用于本视图展示与筛选。 */
+export interface PvArbItem {
+  key: string
+  name: string
+  category: string
+  direction: string
+  direction_zh: string
+  bars_ago: number | null
+  /** 仲裁优先级：≥5 风险类（看空）、3 趋势类、2 反转类 */
+  priority: number
+  /** 被屏蔽/剔除的原因（仅 dropped 里有） */
+  why?: string
+}
+
+export interface PvArb {
+  /** 策略环境：TREND 趋势市 / RANGE 震荡市 / WEAK 无趋势(空仓) / UNKNOWN 数据不足 */
+  env: string
+  env_zh: string
+  env_known: boolean
+  adx: number | null
+  /** 裁决：SIGNAL 保留信号 / AVOID 规避 / IGNORE 忽略 / STANDBY 空仓观望 */
+  verdict: string
+  verdict_zh: string
+  final: PvArbItem | null
+  priority: number | null
+  kept: PvArbItem[]
+  dropped: PvArbItem[]
+  explain: string
+}
+
+export interface PvItem {
+  symbol: string
+  name: string
+  industry?: string | null
+  market_cap_yi?: number | null
+  bars: number
+  as_of: string | null
+  close: number | null
+  insufficient?: boolean
+  reason?: string
+  regime: PvRegime
+  signals: PvSignalHit[]
+  latest_signals: string[]
+  newest_bars_ago: number | null
+  categories: string[]
+  counts: { trend: number; reversal: number }
+  tradable: PvTradable
+  metrics: Record<string, number | null>
+  signal_score: number
+  limit_pct_used?: number
+  price_history?: { date: string; close: number; volume: number }[]
+  /** 信号处理流水线结果（缺失 = 旧缓存，前端按「未计算」展示而非 0） */
+  arb?: PvArb | null
+  arb_verdict?: string | null
+  arb_env?: string | null
+  arb_signal?: string | null
+  arb_signal_name?: string | null
+}
+
+export interface PvStats {
+  universe: number
+  items: number
+  no_signal: number
+  insufficient: number
+  lookback_days: number
+  signal_counts: Record<string, number>
+  latest_signal_counts: Record<string, number>
+  category_counts: { trend: number; reversal: number }
+  regime_counts: Record<string, number>
+  /** 裁决计数（只覆盖有信号的票；no_signal 的票等同 IGNORE 未计入） */
+  verdict_counts?: Record<string, number>
+  /** 策略环境计数（补丁二分流口径） */
+  env_counts?: Record<string, number>
+  /** 最终裁决命中的信号分布 */
+  priority_counts?: Record<string, number>
+  cost: PvCostBreakdown
+  built_at: string
+}
+
+export interface PvCostBreakdown {
+  commission_rate: number
+  commission_min_cny: number
+  stamp_tax_sell: number
+  transfer_fee: number
+  slippage_one_side: number
+  position_cny: number
+  /** 一买一卖合计费率（**小数**，如 0.00302 = 0.302%） */
+  round_trip: number
+  [k: string]: unknown
+}
+
+export interface PvViewData {
+  empty?: boolean
+  reason?: string
+  total?: number
+  offset?: number
+  top?: number
+  items?: PvItem[]
+  stats?: PvStats
+  index_age_sec?: number
+  cost?: PvCostBreakdown
+  notes?: string[]
+}
+
+export interface PvMeta {
+  signals: {
+    key: string
+    name: string
+    category: string
+    category_zh: string
+    direction: string
+    direction_zh: string
+    /** 仲裁优先级（补丁一） */
+    priority?: number
+  }[]
+  categories: { key: string; name: string; desc: string }[]
+  regimes: { key: string; name: string; desc: string }[]
+  /** 策略环境目录（补丁二：交易分流口径，区别于 regimes 的展示口径） */
+  envs?: { key: string; name: string; desc: string }[]
+  verdicts?: { key: string; name: string; desc: string }[]
+  priority_rule?: { risk: number; trend: number; reversal: number; avoid_at: number }
+  cost: PvCostBreakdown
+  params: Record<string, number>
+  scoring_impact: string
+}
+
+export interface PvValidation {
+  horizons: number[]
+  lookback_days: number
+  symbols_evaluated: number
+  universe: number
+  cost: PvCostBreakdown
+  signals: Record<
+    string,
+    Record<
+      string,
+      {
+        samples: number
+        symbols: number
+        total_events: number
+        blocked: number
+        blocked_pct: number | null
+        net_mean_pct: number | null
+        net_median_pct: number | null
+        win_rate_pct: number | null
+        excess_mean_pct: number | null
+        excess_median_pct: number | null
+        excess_win_rate_pct: number | null
+        no_baseline: number
+        by_regime: Record<string, { n: number; net_mean_pct: number | null; win_rate_pct: number | null }>
+        by_year: Record<string, { n: number; net_mean_pct: number | null; win_rate_pct: number | null }>
+      }
+    >
+  >
+  trades_sample: {
+    symbol: string
+    name: string
+    signal: string
+    signal_name: string
+    direction: string
+    date: string
+    hold: number
+    gross_pct: number
+    net_pct: number
+    excess_pct: number | null
+    regime: string
+  }[]
+  notes: string[]
+}
+
+export interface PvQuery {
+  category?: string
+  signal?: string
+  regime?: string
+  /** 裁决筛选：SIGNAL / AVOID / IGNORE / STANDBY（逗号分隔多值） */
+  verdict?: string
+  /** 策略环境筛选：TREND / RANGE / WEAK / UNKNOWN */
+  env?: string
+  /** 剔除裁决为「规避」的标的（= 只看可买入集合） */
+  exclude_avoid?: boolean
+  latest_only?: boolean
+  sort_by?: string
+  top?: number
+  offset?: number
+  industry?: string
+  keyword?: string
+  min_market_cap_yi?: number | null
+  exclude_st?: boolean
+}
+
+export const fetchPriceVolumeMeta = async () => {
+  const res = await api.get<ApiResponse<PvMeta>>('/strategies/price-volume/meta', { timeout: 20000 })
+  return { data: checkApi(res) }
+}
+
+export const fetchPriceVolumeView = async (query: PvQuery = {}) => {
+  const res = await api.get<ApiResponse<PvViewData>>('/strategies/price-volume', {
+    params: {
+      category: query.category || undefined,
+      signal: query.signal || undefined,
+      regime: query.regime || undefined,
+      verdict: query.verdict || undefined,
+      env: query.env || undefined,
+      exclude_avoid: query.exclude_avoid || undefined,
+      latest_only: query.latest_only || undefined,
+      sort_by: query.sort_by || undefined,
+      top: query.top,
+      offset: query.offset,
+      industry: query.industry || undefined,
+      keyword: query.keyword || undefined,
+      min_market_cap_yi: query.min_market_cap_yi ?? undefined,
+      exclude_st: query.exclude_st,
+    },
+    timeout: 30000,
+  })
+  return { data: checkApi(res) }
+}
+
+export const buildPriceVolume = async (params: { lookback_days?: number; include_gem?: boolean; force?: boolean } = {}) => {
+  const res = await api.post<ApiResponse<{ status: string; job_id?: string; age_sec?: number }>>(
+    '/strategies/price-volume/build',
+    null,
+    {
+      params: {
+        lookback_days: params.lookback_days,
+        include_gem: params.include_gem || undefined,
+        force: params.force || undefined,
+      },
+      timeout: 30000,
+    },
+  )
+  return { data: checkApi(res) }
+}
+
+export const fetchPriceVolumeProgress = async (jobId?: string) => {
+  const res = await api.get<ApiResponse<ResonanceJobStatus | { status: string }>>(
+    '/strategies/price-volume/progress',
+    { params: { job_id: jobId || undefined }, timeout: 15000 },
+  )
+  return { data: checkApi(res) }
+}
+
+export const fetchPriceVolumeValidation = async (
+  params: { refresh?: boolean; horizons?: string; symbol_limit?: number; include_gem?: boolean } = {},
+) => {
+  const res = await api.get<ApiResponse<PvValidation>>('/strategies/price-volume/validation', {
+    params: {
+      refresh: params.refresh || undefined,
+      horizons: params.horizons || undefined,
+      symbol_limit: params.symbol_limit ?? undefined,
+      include_gem: params.include_gem || undefined,
+    },
+    timeout: 180000,
+  })
+  return { data: checkApi(res) }
+}
+
+export const fetchPriceVolumeStock = async (symbol: string) => {
+  const res = await api.get<ApiResponse<PvItem>>(`/strategies/price-volume/stock/${symbol}`, {
+    timeout: 30000,
+  })
   return { data: checkApi(res) }
 }
 

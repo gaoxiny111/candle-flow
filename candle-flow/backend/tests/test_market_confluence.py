@@ -1,6 +1,10 @@
 """Unit tests for market confluence strong-signal helpers."""
 
-from app.core.confluence import SoftConflict
+from app.core.confluence import (
+    CORE_RESONANCE_NAMES,
+    DIMENSION_BY_NAME,
+    SoftConflict,
+)
 from app.services.market_confluence_service import (
     _apply_tiers,
     _combined_score,
@@ -14,6 +18,23 @@ from app.services.market_confluence_service import (
 )
 
 
+def test_core_resonance_names_are_trend_or_volume():
+    """白名单只能含「量能/趋势」维度项 —— 位置/波动率/动量是被动衍生量。
+
+    防止后续维护时把「布林」「低点」这类凑数项误加进白名单，
+    导致硬门槛形同虚设。
+    """
+    for name in CORE_RESONANCE_NAMES:
+        assert name in DIMENSION_BY_NAME, f"{name} 不在维度表中"
+        assert DIMENSION_BY_NAME[name] in ("trend", "volume"), (
+            f"{name} 维度为 {DIMENSION_BY_NAME[name]}，"
+            f"白名单只允许 trend/volume"
+        )
+    # 关键被动项必须**不在**白名单内
+    for filler in ("低点", "布林", "随机指标", "MACD", "RSI", "窗口支撑"):
+        assert filler not in CORE_RESONANCE_NAMES
+
+
 def test_candidate_requires_combined_floor():
     assert _is_candidate(70, 2.0, []) is True  # 82
     assert _is_candidate(60, 2.0, []) is False  # 72
@@ -23,6 +44,31 @@ def test_candidate_requires_combined_floor():
 def test_soft_conflict_blocks_candidate():
     soft = [SoftConflict("emotion_extreme", "高位追涨")]
     assert _is_candidate(90, 4.0, soft) is False
+
+
+def test_core_resonance_whitelist_gate():
+    """组合分达标但无核心共振（量能/趋势）→ 不得判买入候选。
+
+    实测场景：命中 ``['低点','布林','随机指标']``（位置+波动率+动量，
+    无任何资金或趋势确认），形态分 90 + effective 3.0×6 = 108，旧规则判候选。
+    规则：``core_hits`` 传入且为空 → 无论组合分多高都出局。
+    """
+    # 组合分 108，超门槛（80），但无核心共振 → 拦下（这正是「凑单式共振」）
+    assert _is_candidate(90, 3.0, [], core_hits=[]) is False
+    # 含核心共振（如「周线趋势」）→ 正常通过
+    assert _is_candidate(90, 3.0, [], core_hits=["周线趋势"]) is True
+    assert _is_candidate(90, 3.0, [], core_hits=["放量", "RSI"]) is True
+    # 组合分不足时，即使有核心共振也不通过（两道关都要过）
+    assert _is_candidate(60, 2.0, [], core_hits=["周线趋势"]) is False
+    # 软冲突优先级高于白名单：有核心共振也照样出局
+    soft = [SoftConflict("structure_flaw", "左侧超跌形态+无量")]
+    assert _is_candidate(99, 4.0, soft, core_hits=["周线趋势"]) is False
+
+
+def test_core_resonance_whitelist_backcompat():
+    """``core_hits=None``（未传）退化为旧行为，保证既有调用方/单测不变。"""
+    assert _is_candidate(70, 2.0, []) is True
+    assert _is_candidate(70, 2.0, [], core_hits=None) is True
 
 
 def test_low_momentum_penalty():

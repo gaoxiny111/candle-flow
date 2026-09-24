@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,14 @@ _BUILD_PER_STOCK_TIMEOUT = 20.0
 # 默认 1800s 会在 ~1100 只处截断（非披露期只补缺失，故可多日渐进补齐）。
 # 需一次性补齐时可用环境变量放宽，或调 /fundamentals/factors/rebuild?budget_sec=。
 _BUILD_BATCH_DEADLINE = float(os.environ.get("FACTOR_BUILD_DEADLINE_SEC", "1800"))
+
+# 重建实时进度（供 GET /fundamentals/factors/progress 轮询展示）：
+# build_all 在同进程内更新 running/processed 等游标；口径分布计数由
+# rebuild_progress() 查库统计（带 2s 缓存，前端 5s 轮询不放大读压力）。
+_PROGRESS_LOCK = threading.Lock()
+_PROGRESS: dict[str, Any] = {"running": False}
+_VERCOUNT_TTL_SEC = 2.0
+_VERCOUNT_CACHE: dict[str, Any] = {"ts": 0.0, "data": None}
 
 
 def _is_in_disclosure_window(now: datetime | None = None) -> bool:
@@ -138,11 +147,22 @@ def upsert(symbol: str, report: dict[str, Any]) -> None:
 
 
 def _get_all_symbols() -> list[str]:
-    """获取全部 SH/SZ 主板股票代码。"""
+    """获取全部沪深**主板**股票代码（剔除科创板/创业板/北交所）。
+
+    只扫主板的原因：读层榜单默认 ``include_gem=False``（见 market_scan.
+    GEM_STAR_PREFIXES），即用户看到的榜样本就只含主板。若重建仍覆盖全市场，
+    会把一半的构建预算（科创板 616 + 创业板 1410 ≈ 全市场 39%）花在**永远
+    不会出现在默认榜单上**的标的上，重建时间被无谓拉长。
+
+    主板判据复用 ``is_main_board()``（与 K线同步 / 打板策略同源，铁律5：
+    同一判定不两处各算）；北交所 ``.BJ`` 不在 SH/SZ 内，天然被 market 过滤掉。
+    """
+    from app.core.bull_tactics import is_main_board
+
     db = SessionLocal()
     try:
         rows = db.query(StockInfo).filter(StockInfo.market.in_(("SH", "SZ"))).all()
-        return [r.symbol for r in rows]
+        return [r.symbol for r in rows if is_main_board(r.symbol)]
     finally:
         db.close()
 
@@ -231,7 +251,43 @@ _REQUIRED_SNAPSHOT_KEYS: tuple[str, ...] = ("profit_yoy", "scoring_version")
 #        → 风险分改变，经风险乘数传导至 composite，必须全量重建。
 #     ④ 买点信号新增「减持窗口期闸门」：窗口内 strong_buy 封顶为 watch
 #        （market_confluence_service._detect_buy_signal，只改档位不改分数）。
-SCORING_VERSION = "2026.09.22.8"
+# .9（2026-09-22）：① **技术面核心共振白名单**（confluence.CORE_RESONANCE_NAMES
+#        + market_confluence_service._is_candidate）—— 「买入候选」除组合分
+#        ≥80 外，必须含 ≥1 个「量能/趋势」类命中（周线趋势/均线转多/金叉/
+#        上升趋势线/放量/缩量回撤）。拦掉形如 ['低点','布林','随机指标'] 的
+#        「凑单式共振」。实测 400 只：候选 53→43，被拦 10 只全为纯被动组合，
+#        含核心共振者零误杀。**只收紧技术面候选与 tech_score，不改 composite。**
+#     ② **PEG 基数校验**（engine._growth_for_peg / _peg_base_check）——
+#        正 CAGR 之外再校验基数代表性：最近一期 < 窗口峰值 50%（崩塌趋势）
+#        或 CAGR 起点 < 峰值 20%（基期过低）→ PEG 判不适用。实测样本：
+#        立霸股份 603519 净利 6.40亿(2023)→1.59亿(2024)→1.57亿(2025)，
+#        长窗口 CAGR 仍 +9.27% 掩盖腰斩；长白山 603099 因 2021/22 亏损
+#        早已判不适用（本次不受影响）。**PEG 变化经估值分传导 → 需重建。**
+# .10（2026-09-22）：① **分红含金量校验**（cashflow.check_dividend_coverage）——
+#        股息率 > 5% 时校验「自由现金流 / 当年现金分红」覆盖率，按行业差异化
+#        阈值（周期类 0.50 / 消费类 0.80 / 默认 0.60），覆盖率 < 阈值直接扣
+#        现金流模块 15 分（覆盖率<0.3）或 10 分。扣分位于加权后、下限保护前，
+#        避免被 healthy_working_capital(58)/distribution_expanding(52) 抹掉。
+#        **直接改现金流模块分 → 经权重 0.32 传导 composite，必须全量重建。**
+#     ② **重建口径改为只扫主板**（factor_db._get_all_symbols 改用
+#        core.bull_tactics.is_main_board）—— 与读层榜单默认 include_gem=False
+#        对齐，剔除科创板(688/689)与创业板(300/301/302)。SH/SZ 5324 → 3200，
+#        省掉 39.9% 的构建预算（这些标的本就不会出现在默认榜单上）。
+# 口径号：**任何改动 composite_score / 模块分 / 风控判定 / 分类准入 的提交都必须 bump**，
+# 否则 build_all（非 force）会把旧口径快照当「新鲜」跳过 → 榜单与详情页长期两个分数。
+#
+# .10 (2026-09-22) 补丁一「分红含金量校验」：股息率>5% 时按行业阈值校验
+#      自由现金流/现金分红覆盖率，<0.3 扣 15 分、<阈值 扣 10 分（cashflow 模块，落在地板保护之前）。
+#      同时 `_get_all_symbols()` 收敛为**仅沪深主板**（剔除 300/301/302/688/689）。
+# .11 (2026-09-22) 补丁二「基数校验」：净利3年CAGR > 50% 且基期（CAGR 实际起点）
+#      为亏损或 <500 万 → 成长模块扣 20(>100) / 15(>80) / 10，扣后 raw 不低于 20。
+#      与 engine._peg_base_check（只拦 PEG 分母）判据互补、互不叠加；扣非否决 ≤38 仍单独成立。
+# .12 (2026-09-22) 补丁二-B「扭亏型伪成长」（同比口径）：最新报告期净利同比 > 100%
+#      且上年同期（同期对同期）为亏损/极低值 → 成长模块扣 20 / 15，极端扭亏(同比>200%)再 +10，
+#      上年同期扣非 <=0 另 +15。**必须 bump**：`_calc_cagr` 在 start<=0 时返回 0，
+#      故 CAGR 闸门对扭亏票天然免疫（全市场实测 0 触发），本条才是拦扭亏的链路。
+#      与 profit_illusion（当期扣非为负）重叠时只取更严者，不累加。
+SCORING_VERSION = "2026.09.22.12"
 
 
 def _outdated_snapshot_symbols() -> set[str]:
@@ -365,6 +421,17 @@ def build_all(
     failed = 0
     truncated = False
     batch_start = time.time()
+    with _PROGRESS_LOCK:
+        _PROGRESS.update(
+            {
+                "running": True,
+                "started_at": batch_start,
+                "planned": total,
+                "processed": 0,
+                "built": 0,
+                "failed": 0,
+            }
+        )
 
     def _process_one(sym: str) -> bool:
         try:
@@ -378,32 +445,41 @@ def build_all(
             return False
 
     workers = min(_BUILD_WORKERS, max(1, len(to_build)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_process_one, sym): sym for sym in to_build}
-        for fut in as_completed(futures):
-            # 批级 deadline
-            if time.time() - batch_start > deadline:
-                remaining = sum(1 for f in futures if not f.done())
-                if remaining:
-                    logger.warning(
-                        "factor build BATCH DEADLINE %.0fs reached, %d remaining",
-                        deadline,
-                        remaining,
-                    )
-                    truncated = True
-                    for f in futures:
-                        if not f.done():
-                            f.cancel()
-                break
-            sym = futures[fut]
-            try:
-                if fut.result(timeout=_BUILD_PER_STOCK_TIMEOUT):
-                    built += 1
-                else:
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_process_one, sym): sym for sym in to_build}
+            for fut in as_completed(futures):
+                # 批级 deadline
+                if time.time() - batch_start > deadline:
+                    remaining = sum(1 for f in futures if not f.done())
+                    if remaining:
+                        logger.warning(
+                            "factor build BATCH DEADLINE %.0fs reached, %d remaining",
+                            deadline,
+                            remaining,
+                        )
+                        truncated = True
+                        for f in futures:
+                            if not f.done():
+                                f.cancel()
+                    break
+                sym = futures[fut]
+                try:
+                    if fut.result(timeout=_BUILD_PER_STOCK_TIMEOUT):
+                        built += 1
+                    else:
+                        failed += 1
+                except Exception:
                     failed += 1
-            except Exception:
-                failed += 1
-                logger.debug("factor build timeout/error for %s", sym)
+                    logger.debug("factor build timeout/error for %s", sym)
+                with _PROGRESS_LOCK:
+                    _PROGRESS["processed"] = int(_PROGRESS.get("processed") or 0) + 1
+                    _PROGRESS["built"] = built
+                    _PROGRESS["failed"] = failed
+    finally:
+        with _PROGRESS_LOCK:
+            _PROGRESS["running"] = False
+            _PROGRESS["finished_at"] = time.time()
 
     duration = time.time() - t0
     coverage = _coverage(len(all_symbols))
@@ -445,4 +521,82 @@ def _coverage(universe: int) -> dict[str, Any]:
         "universe": universe,
         "remaining": max(0, universe - covered),
         "coverage_pct": round(covered / universe * 100.0, 1) if universe else 0.0,
+    }
+
+
+def _version_counts() -> dict[str, int]:
+    """按口径统计现存快照：total / outdated / rebuilt。
+
+    outdated 直接复用 ``_outdated_snapshot_symbols()`` 的判定 —— 与 build_all
+    的待重建集合**完全同口径**，保证进度条到 100% ⇔ 重建判据全部通过
+    （口径版本落后与缺必需字段的快照都算未重判）。带 2s 缓存：前端 5s
+    轮询时不至于每次都全表 json_extract。
+    """
+    now = time.time()
+    with _PROGRESS_LOCK:
+        cached = _VERCOUNT_CACHE
+        if cached["data"] is not None and now - float(cached["ts"]) < _VERCOUNT_TTL_SEC:
+            return dict(cached["data"])
+    db = SessionLocal()
+    try:
+        total = int(db.query(FactorSnapshot).count())
+    except Exception:
+        logger.debug("factor_db version count failed", exc_info=True)
+        total = 0
+    finally:
+        db.close()
+    outdated = len(_outdated_snapshot_symbols())
+    data = {"total": total, "outdated": outdated, "rebuilt": max(0, total - outdated)}
+    with _PROGRESS_LOCK:
+        _VERCOUNT_CACHE.update({"ts": now, "data": data})
+    return dict(data)
+
+
+def rebuild_progress() -> dict[str, Any]:
+    """因子库口径重建进度：跑出来几条就报几条（前端进度条轮询用）。
+
+    - ``rebuilt/outdated/total``：现存快照按 ``SCORING_VERSION`` 的口径分布；
+    - ``run``：build_all 的实时游标（仅本轮，重启/续跑后从 0 重新计）；
+    - ``complete = outdated == 0``：现存快照全部为当前口径。
+    长期构建失败的票不会进快照，故用「现存快照」做分母而不是 universe，
+    避免进度条永远到不了 100%。
+    """
+    counts = _version_counts()
+    with _PROGRESS_LOCK:
+        running = bool(_PROGRESS.get("running"))
+        run: dict[str, Any] | None = None
+        if running:
+            run = {
+                "started_at": _PROGRESS.get("started_at"),
+                "planned": _PROGRESS.get("planned"),
+                "processed": _PROGRESS.get("processed"),
+                "built": _PROGRESS.get("built"),
+                "failed": _PROGRESS.get("failed"),
+            }
+    latest = None
+    db = SessionLocal()
+    try:
+        latest = (
+            db.query(FactorSnapshot.built_at)
+            .order_by(FactorSnapshot.built_at.desc())
+            .limit(1)
+            .scalar()
+        )
+    except Exception:
+        logger.debug("factor_db latest built_at failed", exc_info=True)
+    finally:
+        db.close()
+
+    total = counts["total"]
+    rebuilt = counts["rebuilt"]
+    return {
+        "scoring_version": SCORING_VERSION,
+        "rebuilt": rebuilt,
+        "outdated": counts["outdated"],
+        "total": total,
+        "pct": round(rebuilt / total * 100.0, 1) if total else 0.0,
+        "running": running,
+        "run": run,
+        "latest_built_at": latest.isoformat() if latest else None,
+        "complete": bool(total) and counts["outdated"] == 0,
     }

@@ -11,6 +11,27 @@ $stage = Join-Path $env:TEMP "candle-flow-stage"
 $key = Join-Path $env:USERPROFILE ".ssh\id_ed25519"
 $common = @("-i", $key, "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=20")
 
+# 运行外部命令，只以 **退出码** 判定成败。
+# Windows PowerShell 5.1 会把外部命令写到 stderr 的任何内容当成终止性错误：
+# ssh 会刷出 `GDBus ... Unit packagekit.service is masked.` 这类无害警告，
+# 旧写法（直接 `& ssh.exe …` + ErrorActionPreference=Stop）会因此让部署**中途 abort**
+# —— tar 已解包、服务却没重启、也没有 SETUP_OK，看起来像成功其实没生效。
+function Invoke-Native {
+  param(
+    [Parameter(Mandatory = $true)][string]$Exe,
+    [Parameter(Mandatory = $true)][string[]]$ArgList,
+    [Parameter(Mandatory = $true)][string]$What
+  )
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    & $Exe @ArgList 2>&1 | ForEach-Object { "$_" }
+  } finally {
+    $ErrorActionPreference = $prev
+  }
+  if ($LASTEXITCODE -ne 0) { throw "$What 失败：exit $LASTEXITCODE" }
+}
+
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
@@ -33,15 +54,14 @@ $unix = [IO.File]::ReadAllText($setup) -replace "`r`n", "`n" -replace "`r", "`n"
 if (Test-Path $pack) { Remove-Item -Force $pack }
 Push-Location $stage
 try {
-  tar -czf $pack *
+  Invoke-Native "tar" @("-czf", $pack, "*") "打包"
 } finally {
   Pop-Location
 }
 
 $target = "${User}@${Server}"
 $remotePack = "~/candle-flow-deploy.tgz"
-& scp.exe @common -P $Port $pack "${target}:${remotePack}"
-if ($LASTEXITCODE -ne 0) { throw "scp failed: $LASTEXITCODE" }
+Invoke-Native "scp.exe" ($common + @("-P", "$Port", $pack, "${target}:${remotePack}")) "scp"
 
 $remote = @"
 set -e
@@ -52,5 +72,4 @@ sudo chmod +x /opt/candle-flow/scripts/deploy/remote-setup.sh
 sudo bash /opt/candle-flow/scripts/deploy/remote-setup.sh
 rm -f `$HOME/candle-flow-deploy.tgz
 "@ -replace "`r`n", "`n"
-& ssh.exe @common -p $Port $target $remote
-if ($LASTEXITCODE -ne 0) { throw "remote setup failed: $LASTEXITCODE" }
+Invoke-Native "ssh.exe" ($common + @("-p", "$Port", $target, $remote)) "远程部署"

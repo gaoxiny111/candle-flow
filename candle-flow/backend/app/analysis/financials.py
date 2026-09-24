@@ -793,6 +793,22 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
             ded_yoy = fetch_deducted_yoy(symbol, latest_ymd)
             if ded_yoy is not None:
                 meta["deducted_yoy_pct"] = ded_yoy
+        # 上年同期归母净利（供 growth 模块「扭亏型伪成长」检测）：
+        # 必须**同期对同期**（中报对去年中报），不得用「中报对上年年报」。
+        # 这是同比口径判据的分母，缺了它整条检测链路失效（铁律17）。
+        if latest_ymd and len(str(latest_ymd)) == 8:
+            _ly_ymd = f"{int(str(latest_ymd)[:4]) - 1}{str(latest_ymd)[4:]}"
+            _ly_row = sina_is_all.get(_ly_ymd) or {}
+            _ly_np = _ly_row.get("parent_net_profit")
+            if _ly_np is not None:
+                meta["last_year_net_profit"] = float(_ly_np)
+                meta["last_year_period"] = _ly_ymd
+                meta["last_year_net_profit_source"] = f"sina 利润表 {_ly_ymd} 同期口径"
+            # 上年同期扣非：东财接口按报告期直取
+            if meta.get("deducted_net_profit") is not None:
+                _ly_ded = fetch_deducted_parent_netprofit(symbol, _ly_ymd)
+                if _ly_ded is not None:
+                    meta["last_year_deducted_net_profit"] = float(_ly_ded)
         meta["ar_metrics"] = _ar_metrics_from_sina(sina_bs_all, sina_is_all, list(fd.index))
         meta["ops_efficiency"] = _ops_efficiency_from_sina(
             sina_bs_all, sina_is_all, latest_ymd

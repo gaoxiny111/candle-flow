@@ -1,9 +1,195 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pandas as pd
 
 from app.analysis.base import AnalysisLevel, BaseAnalyzer, IndicatorResult, ModuleResult, format_report_period, score_to_level
 from app.analysis.config.company_profiles import get_company_profile, get_merger_consolidation
+
+
+# ── 补丁二：基数校验（净利3年CAGR > 50% 时触发）──────────────────────────
+# 核心逻辑：CAGR 高不代表可持续成长。若「基期」是亏损或极低值，则增速的
+# 绝大部分来自「从坑里爬出来」，属扭亏/低基数失真，须对成长性降权。
+# 与 engine._peg_base_check 的分工：那条只拦 PEG 分母（PEG→None），本函数
+# 在成长模块分上做实质扣减，两者判据互补、互不叠加。
+GROWTH_BASE_CAGR_TRIGGER = 50.0          # 触发线：净利3年CAGR > 50%
+GROWTH_BASE_LOW_ABS = 5_000_000.0        # 基期绝对值低于 500 万 = 极低值
+GROWTH_BASE_PENALTY_EXTREME = 20.0       # CAGR > 100 → 扣 20
+GROWTH_BASE_PENALTY_HIGH = 15.0          # CAGR > 80  → 扣 15
+GROWTH_BASE_PENALTY_BASE = 10.0          # 其余      → 扣 10
+GROWTH_BASE_DEDUCT_MIN = 0.0             # 扣分下限
+GROWTH_BASE_RAW_FLOOR = 20.0             # 扣减后 raw 下限（防击穿到负分）
+
+
+def check_growth_base_quality(*, profit_cagr: float | None, base_net_profit: float | None) -> dict[str, Any]:
+    """基数校验：净利3年CAGR > 50% 时，检查基期是否为亏损/极低值。
+
+    参数
+    ----
+    profit_cagr : 净利润3年CAGR（百分数，如 95.92 表示 95.92%）
+    base_net_profit : **CAGR 实际使用的基期净利润**（元）。3年CAGR 时即
+        ``net_profit.dropna().iloc[-4]``；跨度退化时应传 ``iloc[0]``。
+
+    返回
+    ----
+    ``{"passed", "deduction", "reason", "triggered", "base_net_profit", "cagr"}``
+
+    缺数据一律放行：只有 CAGR 与基期净利**都**拿到，且 CAGR > 50 时才判定。
+    """
+    out: dict[str, Any] = {
+        "passed": True,
+        "deduction": 0.0,
+        "reason": "",
+        "triggered": False,
+        "base_net_profit": None,
+        "cagr": None,
+    }
+    if profit_cagr is None or base_net_profit is None:
+        out["reason"] = "基数校验数据缺失，不判定"
+        return out
+    try:
+        cagr = float(profit_cagr)
+        base = float(base_net_profit)
+    except (TypeError, ValueError):
+        out["reason"] = "基数校验数据非数值，不判定"
+        return out
+    out["cagr"] = cagr
+    out["base_net_profit"] = base
+    if cagr <= GROWTH_BASE_CAGR_TRIGGER:
+        out["reason"] = ""
+        return out
+
+    out["triggered"] = True
+    anomaly = ""
+    if base <= 0:
+        anomaly = "基期亏损，同比增速失真"
+    elif abs(base) < GROWTH_BASE_LOW_ABS:
+        anomaly = f"基期净利润仅{base / 1e4:.1f}万元，极低基数推高增速"
+    if not anomaly:
+        out["reason"] = "成长基数正常"
+        return out
+
+    if cagr > 100:
+        deduction = GROWTH_BASE_PENALTY_EXTREME
+    elif cagr > 80:
+        deduction = GROWTH_BASE_PENALTY_HIGH
+    else:
+        deduction = GROWTH_BASE_PENALTY_BASE
+    out["passed"] = False
+    out["deduction"] = float(deduction)
+    out["reason"] = f"基数校验不通过：{anomaly}，成长性降权{deduction:.0f}分"
+    return out
+
+
+# ── 补丁二-B：扭亏型伪成长（同比口径，独立于 CAGR 闸门）─────────────────
+# 为什么必须另起一条链路：`_calc_cagr` 在 `start <= 0` 时**直接返回 0**，
+# 所以「上年亏损、今年扭亏」的票根本进不了 CAGR>50% 的判定 —— 补丁二那
+# 条 CAGR 闸门对「扭亏型」天然免疫（全市场实测 0 触发）。真正能拦住扭亏
+# 的是**单期同比**：同比的分母就是上年同期，上年亏损时同比本身失真。
+#
+# 与既有判据的分工（铁律3 防叠加）：
+#   · 补丁二  check_growth_base_quality —— CAGR 口径，基期 = 倒数第4期
+#   · 补丁二-B 本函数 —— 同比口径，基期 = 上年同期（含同期扣非）
+#   · profit_illusion —— 扣非为负，**当期**口径
+# 三者口径互不重叠；本函数只对 同比>100% 的票生效，且与 profit_illusion 重叠时
+# 只取更严者（不累加），避免同一只票被同一事实扣两次。
+TURNAROUND_YOY_TRIGGER = 100.0           # 触发线：最新报告期净利同比 > 100%
+TURNAROUND_YOY_EXTREME = 200.0           # 极端扭亏线
+TURNAROUND_LOW_ABS = 5_000_000.0         # 上年同期绝对值 < 500 万 = 极低值
+TURNAROUND_PENALTY_LOSS = 20.0           # 上年同期亏损
+TURNAROUND_PENALTY_EXTREME_EXTRA = 10.0  # 同比>200% 且上年亏损 → 额外
+TURNAROUND_PENALTY_LOW = 15.0            # 上年同期极低值
+TURNAROUND_PENALTY_DEDUCTED = 10.0       # 上年扣非 <=0（主营未改善）；低于「上年亏损」档
+
+
+def check_turnaround_growth(
+    *,
+    profit_yoy: float | None,
+    last_year_net_profit: float | None,
+    deducted_net_profit: float | None = None,
+    last_year_deducted_net_profit: float | None = None,
+) -> dict[str, Any]:
+    """扭亏型伪成长检测（同比口径）。
+
+    参数
+    ----
+    profit_yoy : 最新报告期归母净利同比（百分数，如 137.9）
+    last_year_net_profit : **上年同期**归母净利（元）
+    deducted_net_profit : 当期扣非归母净利（元，用于交叉印证，可为 None）
+    last_year_deducted_net_profit : 上年同期扣非归母净利（元）
+
+    返回
+    ----
+    ``{"triggered", "deduction", "reason", "penalty_loss", "penalty_low",
+       "penalty_deducted", "penalty_extreme"}``
+
+    缺数据一律放行。扣分按「档位取严 + 极端叠加」：基础档（亏损20 / 极低15）
+    二者互斥，另加两条**独立**扣减 —— 极端扭亏 +10、上年扣非<=0 +15，各只计一次。
+    """
+    out: dict[str, Any] = {
+        "triggered": False,
+        "deduction": 0.0,
+        "reason": "",
+        "penalty_loss": 0.0,
+        "penalty_low": 0.0,
+        "penalty_deducted": 0.0,
+        "penalty_extreme": 0.0,
+        "profit_yoy": None,
+        "last_year_net_profit": None,
+    }
+    if profit_yoy is None or last_year_net_profit is None:
+        out["reason"] = "扭亏检测数据缺失，不判定"
+        return out
+    try:
+        yoy = float(profit_yoy)
+        ly_np = float(last_year_net_profit)
+    except (TypeError, ValueError):
+        out["reason"] = "扭亏检测数据非数值，不判定"
+        return out
+    out["profit_yoy"] = yoy
+    out["last_year_net_profit"] = ly_np
+    if yoy <= TURNAROUND_YOY_TRIGGER:
+        return out
+
+    out["triggered"] = True
+    reasons: list[str] = []
+
+    # 基础档：亏损 与 极低值 互斥（elif），不叠加
+    if ly_np <= 0:
+        out["penalty_loss"] = TURNAROUND_PENALTY_LOSS
+        reasons.append(f"上年同期亏损（{ly_np / 1e8:.2f}亿），同比增速失真")
+        if yoy > TURNAROUND_YOY_EXTREME:
+            out["penalty_extreme"] = TURNAROUND_PENALTY_EXTREME_EXTRA
+            reasons.append("极端扭亏（同比>200%），额外扣减")
+    elif abs(ly_np) < TURNAROUND_LOW_ABS:
+        out["penalty_low"] = TURNAROUND_PENALTY_LOW
+        reasons.append(f"上年同期净利仅{ly_np / 1e4:.1f}万元，极低基数推高增速")
+
+    # 独立判据：上年扣非<=0 → 主营本身不赚钱（与上面两档并存）
+    if last_year_deducted_net_profit is not None:
+        try:
+            ly_ded = float(last_year_deducted_net_profit)
+        except (TypeError, ValueError):
+            ly_ded = None
+        if ly_ded is not None and ly_ded <= 0 and ly_np > 0:
+            out["penalty_deducted"] = TURNAROUND_PENALTY_DEDUCTED
+            reasons.append("上年同期扣非<=0，主营未改善")
+    _ = deducted_net_profit  # 当期扣非由 profit_illusion 单独处理，此处不重复计
+
+    total = (
+        out["penalty_loss"]
+        + out["penalty_low"]
+        + out["penalty_extreme"]
+        + out["penalty_deducted"]
+    )
+    if not reasons or total <= 0:
+        out["triggered"] = False
+        out["reason"] = "同比高增但上年基数正常，不判定"
+        return out
+    out["deduction"] = float(total)
+    out["reason"] = f"扭亏型伪成长检测：{'；'.join(reasons)}，成长性扣减{total:.0f}分"
+    return out
 
 
 class GrowthAnalyzer(BaseAnalyzer):
@@ -758,9 +944,60 @@ class GrowthAnalyzer(BaseAnalyzer):
             )
 
         module_score = self._weighted_score(indicators)
-        # 扣非否决：成长性强制压至 D 档（≤40）
+
+        # ── 补丁二：基数校验（净利3年CAGR > 50% 且基期亏损/极低 → 成长性降权）──
+        # 基期口径必须与 _calc_cagr 实际使用的一致：3年CAGR 用倒数第4期；
+        # 跨度不足 4 期时 _calc_cagr 退化为 clean.iloc[0]，此处同步退化。
+        _profit_clean = profit.dropna()
+        if len(_profit_clean) >= 4:
+            _base_np = float(_profit_clean.iloc[-4])
+        elif len(_profit_clean) >= 2:
+            _base_np = float(_profit_clean.iloc[0])
+        else:
+            _base_np = None
+        base_check = check_growth_base_quality(
+            profit_cagr=profit_cagr_3y, base_net_profit=_base_np
+        )
+        growth_base_penalty = float(base_check["deduction"] or 0.0)
+
+        # ── 补丁二-B：扭亏型伪成长（同比口径，与 CAGR 闸门平行）──────────────
+        # 同比的分母是上年同期，上年亏损时同比本身失真。
+        turnaround_check = check_turnaround_growth(
+            profit_yoy=yoy_profit,
+            last_year_net_profit=kwargs.get("last_year_net_profit"),
+            deducted_net_profit=deducted,
+            last_year_deducted_net_profit=kwargs.get("last_year_deducted_net_profit"),
+        )
+        turnaround_penalty = float(turnaround_check["deduction"] or 0.0)
+
+        # 两条闸门扣减**取更严者**，不与 profit_illusion 叠加（铁律3）。
+        # 关键：扭亏型票在上年亏损时，当期扣非常常也为负 → 必然同时命中
+        # profit_illusion（11/32）。若先扣分再压 38 上限，ST西王会掉到 8 分，
+        # 属同一事实被惩罚两次。正确做法是三条判据统一成「候选分取最小」。
+        _gate_penalty = max(growth_base_penalty, turnaround_penalty)
+        _candidates = [module_score]
+        if _gate_penalty > 0:
+            _candidates.append(module_score - _gate_penalty)
         if profit_illusion:
-            module_score = min(module_score, 38.0)
+            _candidates.append(min(module_score, 38.0))
+        _final = max(GROWTH_BASE_RAW_FLOOR, min(_candidates))
+
+        growth_base_applied = 0.0
+        turnaround_applied = 0.0
+        if _final < module_score:
+            # 只在「闸门真的比 profit_illusion 更严」时才把差额记到闸门名下，
+            # 否则留痕会虚报扣分（铁律：展示值/得分同口径）。
+            _gap = round(module_score - _final, 1)
+            if _gate_penalty > 0 and growth_base_penalty >= turnaround_penalty:
+                growth_base_applied = _gap
+            elif _gate_penalty > 0:
+                turnaround_applied = _gap
+        module_score = _final
+        if growth_base_applied > 0:
+            warnings.append(base_check["reason"])
+        if turnaround_applied > 0:
+            warnings.append(turnaround_check["reason"])
+
         return ModuleResult(
             module_name="成长性",
             score=round(module_score, 1),
@@ -777,5 +1014,9 @@ class GrowthAnalyzer(BaseAnalyzer):
                 "cyclical_position": cyclical_position,
                 "second_curve": second_curve,
                 "resource_injection": resource_injection,
+                "growth_base_check": base_check,
+                "growth_base_penalty": growth_base_applied,
+                "turnaround_check": turnaround_check,
+                "turnaround_penalty": turnaround_applied,
             },
         )

@@ -2,6 +2,7 @@ from app.models.factor_snapshot import FactorSnapshot
 from app.models.fundamental import FundamentalCandidate
 from app.models.indicator import Indicator
 from app.models.kline import KlineData
+from app.models.market_fund_flow import MarketFundFlowDaily
 from app.models.pattern import PatternRecord
 from app.models.payment import PaymentOrder
 from app.models.payment_claim import PaymentClaim
@@ -24,4 +25,5 @@ __all__ = [
     "FundamentalCandidate",
     "FactorSnapshot",
     "StockFundFlowDaily",
+    "MarketFundFlowDaily",
 ]

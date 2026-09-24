@@ -4,11 +4,18 @@ import { RouterLink } from 'vue-router'
 import {
   apiErrorText,
   buildMarketScanResonance,
+  buildPriceVolume,
+  fetchFactorsProgress,
   fetchMarketRegime,
   fetchMarketScan,
   fetchMarketScanOverlay,
   fetchMarketScanResonance,
+  fetchPriceVolumeProgress,
+  fetchPriceVolumeView,
+  fetchQualityValue,
+  fetchRebalance,
   fetchResonanceProgress,
+  type FactorsProgress,
   type MarketRegimeData,
   type MarketScanCoverage,
   type MarketScanData,
@@ -19,6 +26,14 @@ import {
   type MarketScanSort,
   type MarketScanVerdict,
   type MarketScanVerdictFilter,
+  type PvItem,
+  type PvViewData,
+  type QualityValueData,
+  type CyclePriceAssess,
+  type QualityValueItem,
+  type QualityValueSort,
+  type RebalanceData,
+  type RebalanceItem,
   type ResonanceJobStatus,
 } from '@/api'
 
@@ -33,8 +48,49 @@ const DIMS: { key: Exclude<MarketScanSort, 'composite_score' | 'resonance'>; lab
 
 const SORT_OPTIONS: { value: MarketScanSort; label: string }[] = [
   { value: 'resonance', label: '共振档位（基本面×技术面）' },
+  { value: 'quality_value', label: '质量×价值（好公司好价格）' },
+  { value: 'pv', label: '价量策略（趋势确认×反转捕捉）' },
   { value: 'composite_score', label: '综合分（权威口径）' },
   ...DIMS.map((d) => ({ value: d.key as MarketScanSort, label: `按${d.full}排序` })),
+]
+
+/** 质量×价值视图的排序维度（独立于榜单 sort_by，只在该模式生效） */
+const QV_SORT_OPTIONS: { value: QualityValueSort; label: string }[] = [
+  { value: 'qv_score', label: '质量价值分（默认）' },
+  { value: 'quality', label: '质量优先' },
+  { value: 'value', label: '价值优先' },
+  { value: 'roe_pct', label: 'ROE' },
+  { value: 'roic_pct', label: 'ROIC' },
+  { value: 'gross_margin_pct', label: '毛利率' },
+  { value: 'dividend_yield', label: '股息率' },
+  { value: 'pe_ttm', label: 'PE（低→高）' },
+  { value: 'pb', label: 'PB（低→高）' },
+  { value: 'composite_score', label: '权威综合分' },
+]
+
+/** 价量策略模式（sort_by = 'pv'）：排序由本下拉控制，作用于 /strategies/price-volume 读层 */
+const PV_SORT_OPTIONS: { value: string; label: string }[] = [
+  { value: 'signal_score', label: '信号强度（默认）' },
+  { value: 'verdict', label: '裁决优先（候选→规避→空仓）' },
+  { value: 'newest', label: '最新信号优先' },
+  { value: 'market_cap', label: '市值（大→小）' },
+]
+
+/** 裁决四态（补丁一）：SIGNAL 保留信号 = 买入候选 */
+const PV_VERDICT_OPTIONS: { value: string; label: string; desc: string }[] = [
+  { value: '', label: '全部', desc: '不按裁决过滤' },
+  { value: 'SIGNAL', label: '保留信号（买入候选）', desc: '通过环境分流 + 优先级仲裁，保留唯一信号' },
+  { value: 'AVOID', label: '规避', desc: '风险类信号命中（价量过热/天量滞涨/PVT顶背离）→ 已从买入列表剔除' },
+  { value: 'IGNORE', label: '忽略', desc: '信号被 ADX 环境分流全部屏蔽' },
+  { value: 'STANDBY', label: '空仓观望', desc: 'ADX<20 无趋势，本轮不下注' },
+]
+
+/** 策略环境（补丁二：ADX 交易分流口径，区别于展示用的 ADX 状态） */
+const PV_ENV_OPTIONS: { value: string; label: string; desc: string }[] = [
+  { value: '', label: '全部', desc: '不按环境过滤' },
+  { value: 'TREND', label: '趋势市（只跑趋势类）', desc: 'ADX > 25：屏蔽反转类看多信号' },
+  { value: 'RANGE', label: '震荡市（只跑反转类）', desc: '20 ≤ ADX ≤ 25：屏蔽趋势类看多信号' },
+  { value: 'WEAK', label: '无趋势·空仓', desc: 'ADX < 20：信号全部屏蔽' },
 ]
 
 const loading = ref(false)
@@ -55,8 +111,301 @@ const form = ref({
   min_tech: 70,
 })
 
+/** 质量×价值模式（sort_by = quality_value）的独立参数。
+ *  **不改写任何分数**：qv_score 仅排序展示，准入选股靠这里的硬门槛。 */
+const qvSort = ref<QualityValueSort>('qv_score')
+/** 空输入 → undefined（不提交该参数，让后端用模块默认值） */
+const numOrUndef = (v: number | '') => (v === '' ? undefined : Number(v))
+const qv = ref<QualityValueData | null>(null)
+const qvLoading = ref(false)
+const qvError = ref('')
+/** 可调门槛（默认 = 后端 quality_value.py 的模块默认值，用户改动才提交） */
+const qvForm = ref({
+  min_roe: 10 as number | '',
+  min_roic: 8 as number | '',
+  min_gross_margin: 15 as number | '',
+  max_debt_ratio: 60 as number | '',
+  min_ocf_np: 0.8 as number | '',
+  max_pe: 50 as number | '',
+  max_pb: 8 as number | '',
+  max_pe_pctile: 40 as number | '',
+  max_pb_pctile: 50 as number | '',
+  min_dividend_yield: 0 as number | '',
+  max_peg: 1.5 as number | '',
+  min_market_cap_yi: 50 as number | '',
+})
+
 /** 共振模式（默认）：排序 = 核心持仓 → 买入候选 → 观察 → 淘汰，不再按综合分 */
 const resoMode = computed(() => form.value.sort_by === 'resonance')
+/** 质量×价值模式：走独立端点 /market-scan/quality-value（读层筛选，不重算分数） */
+const qvMode = computed(() => form.value.sort_by === 'quality_value')
+/** 价量策略模式：走 /strategies/price-volume 读层。**只展示，不参与打分**。 */
+const pvMode = computed(() => form.value.sort_by === 'pv')
+
+/** ── 价量策略（趋势确认 × 反转捕捉）──────────────────────────────
+ *  **只读增强**：价量信号不改写任何 composite_score / dim_scores，也不进任何门槛；
+ *  后端 scoring_impact 恒为 none（见 /strategies/price-volume/meta）。
+ *  索引未构建时（empty + reason）自动触发后台全市场扫描并轮询进度。 */
+const pv = ref<PvViewData | null>(null)
+const pvLoading = ref(false)
+const pvError = ref('')
+const pvEmpty = ref(false)
+/** 索引未构建时后端给的原因文案（留痕，不静默） */
+const pvReason = ref('')
+/** 信号类别：'' = 全部 / trend = 趋势确认 / reversal = 反转捕捉 */
+const pvCategory = ref<'' | 'trend' | 'reversal'>('')
+/** 裁决筛选（补丁一流水线产出） */
+const pvVerdict = ref<'' | 'SIGNAL' | 'AVOID' | 'IGNORE' | 'STANDBY'>('')
+/** 策略环境筛选（补丁二 ADX 分流） */
+const pvEnv = ref<'' | 'TREND' | 'RANGE' | 'WEAK'>('')
+const pvSort = ref('signal_score')
+const pvBuilding = ref(false)
+const pvJobError = ref('')
+const pvJobPct = ref(0)
+let pvPollTimer: ReturnType<typeof setInterval> | null = null
+
+const pvItems = computed<PvItem[]>(() => pv.value?.items ?? [])
+
+/** 裁决徽标文案/色调：买入候选=暖色，规避=风险色，忽略/空仓=中性 */
+const PV_VERDICT_LABEL: Record<string, string> = {
+  SIGNAL: '保留信号',
+  AVOID: '规避',
+  IGNORE: '忽略',
+  STANDBY: '空仓',
+}
+
+function pvVerdictTone(v: string | null | undefined): string {
+  switch (v) {
+    // 规避 = 看空 → 绿（A 股习惯：红涨绿跌），与共振模式的「淘汰」灰刻意区分
+    case 'AVOID': return 'down'
+    case 'SIGNAL': return 'strong'
+    case 'STANDBY': return 'medium'
+    default: return 'plain'
+  }
+}
+
+/** 裁决列的主文案：保留信号显示信号名，其余显示裁决档位 */
+function pvVerdictText(row: PvItem): string {
+  const v = row.arb_verdict
+  if (!v) return '未计算'
+  if (v === 'AVOID') return `规避 · ${row.arb_signal_name || '风险信号'}`
+  if (v === 'SIGNAL') return row.arb_signal_name || '保留信号'
+  return PV_VERDICT_LABEL[v] || v
+}
+
+/** 裁决 tooltip：把「环境 → 分流 → 仲裁」链路自证出来（后端 explain 直出） */
+function pvVerdictHint(row: PvItem): string {
+  const a = row.arb
+  if (!a) return '旧索引未含裁决字段，点「重建扫描」后可用'
+  const parts = [a.explain]
+  if ((a.dropped ?? []).length) {
+    parts.push('被屏蔽：' + a.dropped.map((d) => `${d.name}（${d.why || ''}）`).join('；'))
+  }
+  return parts.join('\n')
+}
+
+/** 摘要条计数：直接读后端统计（口径一致，不在前端重算） */
+const pvVerdictCounts = computed<Record<string, number>>(() => pv.value?.stats?.verdict_counts ?? {})
+const pvEnvCounts = computed<Record<string, number>>(() => pv.value?.stats?.env_counts ?? {})
+
+/** 快捷筛选：点摘要 chip = 切换服务端筛选（不重算、不二次判据） */
+function pickPvVerdict(v: string) {
+  pvVerdict.value = pvVerdict.value === v ? '' : (v as typeof pvVerdict.value)
+  applyFilters()
+}
+
+function stopPvPoll() {
+  if (pvPollTimer) {
+    clearInterval(pvPollTimer)
+    pvPollTimer = null
+  }
+}
+onUnmounted(stopPvPoll)
+
+/** 后端按**阶段内** done/total 上报，直接画条会在「读取→判定」切换时回退；
+ *  这里按阶段权重折算并取 max 保证单调（与 PriceVolumeView 同口径）。 */
+const PV_PHASE_RANGE: Record<string, [number, number]> = {
+  starting: [0, 0.02],
+  load: [0.02, 0.35],
+  scan: [0.35, 1],
+  cache: [1, 1],
+}
+
+async function pollPvJob() {
+  try {
+    const { data } = await fetchPriceVolumeProgress()
+    const job = data.data as unknown as {
+      status?: string
+      phase?: string
+      done?: number
+      total?: number
+      pct?: number
+      error?: string | null
+    }
+    if (!job || !job.status || job.status === 'empty') return
+    const range = PV_PHASE_RANGE[job.phase ?? '']
+    const frac = job.total ? (job.done ?? 0) / job.total : 0
+    const overall = range ? (range[0] + (range[1] - range[0]) * frac) * 100 : (job.pct ?? 0)
+    pvJobPct.value = Math.max(pvJobPct.value, Math.min(100, Math.round(overall)))
+    if (job.status === 'done') {
+      stopPvPoll()
+      pvBuilding.value = false
+      pvJobPct.value = 100
+      page.value = 1
+      await loadPv()
+    } else if (job.status === 'error') {
+      stopPvPoll()
+      pvBuilding.value = false
+      pvJobError.value = job.error || '价量扫描失败'
+    }
+  } catch {
+    /* 轮询失败不打断，下一轮继续 */
+  }
+}
+
+async function startPvBuild(force: boolean) {
+  if (pvBuilding.value) return
+  pvBuilding.value = true
+  pvJobError.value = ''
+  pvJobPct.value = 0
+  try {
+    const { data } = await buildPriceVolume({ force })
+    if (data.data.status === 'cached') {
+      pvBuilding.value = false
+      await loadPv()
+      return
+    }
+    stopPvPoll()
+    pvPollTimer = setInterval(() => void pollPvJob(), 1500)
+  } catch (e) {
+    const msg = apiErrorText(e, '启动价量扫描失败')
+    // 409：已有扫描在跑（例如从「价量策略」页触发的）→ 不当作错误，直接轮询
+    if (msg.includes('正在进行')) {
+      stopPvPoll()
+      pvPollTimer = setInterval(() => void pollPvJob(), 1500)
+      return
+    }
+    pvBuilding.value = false
+    pvJobError.value = msg
+  }
+}
+
+/** 价量策略读层（未构建返回 empty → 自动触发扫描） */
+async function loadPv() {
+  pvLoading.value = true
+  pvError.value = ''
+  const q = form.value
+  const offset = Math.max(0, (page.value - 1) * pageSize.value)
+  try {
+    const { data } = await fetchPriceVolumeView({
+      top: pageSize.value,
+      offset,
+      category: pvCategory.value || undefined,
+      verdict: pvVerdict.value || undefined,
+      env: pvEnv.value || undefined,
+      sort_by: pvSort.value,
+      keyword: q.keyword.trim() || undefined,
+      industry: q.industry.trim() || undefined,
+      min_market_cap_yi: q.min_market_cap_yi === '' ? undefined : Number(q.min_market_cap_yi),
+      exclude_st: q.exclude_st,
+    })
+    const payload = data.data
+    if (payload.empty) {
+      pvEmpty.value = true
+      pvReason.value = payload.reason || ''
+      pv.value = null
+      await startPvBuild(false)
+    } else {
+      pvEmpty.value = false
+      pvReason.value = ''
+      pv.value = payload
+    }
+  } catch (e) {
+    pv.value = null
+    pvError.value = apiErrorText(e, '价量策略榜单加载失败')
+  } finally {
+    pvLoading.value = false
+  }
+}
+
+/** ── 质量×价值选股（调入条件硬编码：qv_score>80 且 市值>50亿）────────
+ *  主表**只展示**满足调入条件的票；调仓参数面板已按用户要求移除，
+ *  loadRules 仅作为主表数据源静默拉取（默认阈值，不可调）。
+ *  **只产出信号，不落持仓、不下单**。 */
+const rules = ref<RebalanceData | null>(null)
+const rulesLoading = ref(false)
+const rulesError = ref('')
+
+/** 规则表模式：主表 = 满足调入条件的票（buy + 持仓仍达标者），未达标**不展示**（用户口径）。
+ *  ★ 上一版整表空白的根因不在本口径，而在切换模式/点查询的路径只调了
+ *  loadQualityValue() 漏了 loadRules() → rules 恒 null。已改为 loadQvAll() 并行拉取。 */
+const rulesTableMode = computed(() => qvMode.value && !!rules.value && !rulesError.value)
+
+/** 调入条件达标行 = 未持仓的 buy + 已持仓仍达标的 hold（徽标「持有」）；即主表数据源 */
+const targetRows = computed<RebalanceItem[]>(() => {
+  if (!rules.value) return []
+  const rows = [...rules.value.buy, ...(rules.value.hold ?? []).filter((x) => x.meets_buy)]
+  const key = qvSort.value
+  const get = (r: RebalanceItem): number | null => {
+    switch (key) {
+      case 'quality': return r.qv_components?.quality_pct ?? null
+      case 'value': return r.qv_components?.value_pct ?? null
+      case 'roe_pct': return r.roe_pct ?? null
+      case 'gross_margin_pct': return r.gross_margin_pct ?? null
+      case 'roic_pct': return r.roic_pct ?? null
+      case 'dividend_yield': return r.dividend_yield ?? null
+      case 'pe_ttm': { const v = r.pe_ttm; return v != null && v > 0 ? v : null }
+      case 'pb': { const v = r.pb; return v != null && v > 0 ? v : null }
+      case 'composite_score': return r.composite_score ?? null
+      default: return r.qv_score ?? null
+    }
+  }
+  const asc = key === 'pe_ttm' || key === 'pb'
+  return [...rows].sort((a, b) => {
+    const va = get(a)
+    const vb = get(b)
+    if (va == null && vb == null) return 0
+    if (va == null) return 1
+    if (vb == null) return -1
+    return asc ? va - vb : vb - va
+  })
+})
+
+/** 调入/持有集合：把调仓动作贴到榜单行上（榜单行本身不含 action 字段）。
+ *  规则未加载时集合为空 → 「信号」列显示「—」，不会误标。 */
+const buySet = computed(() => new Set((rules.value?.buy ?? []).map((r) => r.symbol)))
+const holdSet = computed(() => new Set((rules.value?.hold ?? []).map((r) => r.symbol)))
+
+/** 榜单行的调入信号：命中调入集合=调入，命中持仓集合（仍达标）=持有，否则无信号。
+ *  规则接口未加载/失败时一律返回 null → 表格照常展示，只是「信号」列为「—」。 */
+const rebAction = (r: DisplayRow): RebalanceItem['action'] | null => {
+  if (buySet.value.has(r.symbol)) return 'buy'
+  if (holdSet.value.has(r.symbol)) return 'hold'
+  return null
+}
+
+async function loadRules() {
+  if (!qvMode.value) return
+  rulesLoading.value = true
+  rulesError.value = ''
+  try {
+    const { data } = await fetchRebalance({
+      buy_score: 80,
+      min_market_cap_yi: 50,
+      exclude_st: form.value.exclude_st,
+      include_gem: form.value.include_gem,
+      industry: form.value.industry.trim() || undefined,
+      keyword: form.value.keyword.trim() || undefined,
+    })
+    rules.value = data.data
+  } catch (e) {
+    rules.value = null
+    rulesError.value = apiErrorText(e, '选股列表加载失败')
+  } finally {
+    rulesLoading.value = false
+  }
+}
+
 const reso = ref<MarketScanResonanceData | null>(null)
 const resoEmpty = ref(false)
 const resoError = ref('')
@@ -194,7 +543,7 @@ onUnmounted(stopPoll)
 const page = ref(1)
 const pageSize = computed(() => Number(form.value.top) || 50)
 
-/** 分页/总数口径统一：共振模式读 reso，普通榜单读 report。 */
+/** 分页/总数口径统一：共振模式读 reso，质量价值模式读 qv，价量模式读 pv，普通榜单读 report。 */
 const view = computed(() => {
   if (resoMode.value) {
     return {
@@ -203,6 +552,27 @@ const view = computed(() => {
       count: reso.value?.count ?? 0,
       has_more: reso.value?.has_more ?? false,
       hasData: !!reso.value,
+    }
+  }
+  if (pvMode.value) {
+    const total = pv.value?.total ?? 0
+    const off = pv.value?.offset ?? 0
+    const cnt = pvItems.value.length
+    return {
+      matched: total,
+      offset: off,
+      count: cnt,
+      has_more: off + cnt < total,
+      hasData: !!pv.value,
+    }
+  }
+  if (qvMode.value) {
+    return {
+      matched: qv.value?.matched ?? 0,
+      offset: qv.value?.offset ?? 0,
+      count: qv.value?.count ?? 0,
+      has_more: qv.value?.has_more ?? false,
+      hasData: !!qv.value,
     }
   }
   return {
@@ -218,6 +588,8 @@ const totalPages = computed(() =>
   view.value.matched ? Math.max(1, Math.ceil(view.value.matched / pageSize.value)) : 1,
 )
 const rangeText = computed(() => {
+  // 规则表模式：整表一次返回，无分页语义
+  if (rulesTableMode.value) return `共 ${targetRows.value.length} 条`
   const v = view.value
   if (!v || !v.matched) return '0 条'
   const from = v.offset + 1
@@ -247,6 +619,18 @@ async function goPage(p: number) {
     // 共振读层毫秒级：直接翻页（索引内过滤/切片）
     page.value = target
     await loadResonance()
+    return
+  }
+  if (qvMode.value) {
+    // 质量价值读层同为毫秒级（本地 SQL + 纯函数判定，无技术面计算）
+    page.value = target
+    await loadQualityValue()
+    return
+  }
+  if (pvMode.value) {
+    // 价量读层：读最近一次扫描结果，无重算
+    page.value = target
+    await loadPv()
     return
   }
   // 翻页时保持「已叠加」状态：新页同样逐票做技术分析（单票 10 分钟缓存，
@@ -287,6 +671,54 @@ const coverageTone = computed(() => {
   if (!c.complete || (c.stale_days ?? 0) > 3) return 'warn'
   return 'ok'
 })
+
+/** 因子库口径重建进度：跑出来几条就显示几条；重建活跃时 5s 轮询，完成即停。 */
+const factorsProgress = ref<FactorsProgress | null>(null)
+const rebuildRateText = ref('')
+let progressTimer: number | undefined
+let lastProgressSample: { t: number; rebuilt: number } | null = null
+
+async function loadProgress() {
+  try {
+    const { data } = await fetchFactorsProgress()
+    const p = data.data ?? null
+    if (p) {
+      const now = Date.now()
+      const prev = lastProgressSample
+      // 速率只在本进程连续运行时计算（跨重启/续跑的 rebuilt 跳变不算速率）
+      if (p.running && prev && p.rebuilt >= prev.rebuilt && now - prev.t < 120_000) {
+        const perMin = ((p.rebuilt - prev.rebuilt) / Math.max(1, now - prev.t)) * 60_000
+        if (perMin > 0.01) {
+          const remainMin = p.outdated / perMin
+          const eta =
+            remainMin >= 60
+              ? `剩余约 ${(remainMin / 60).toFixed(1)} 小时`
+              : `剩余约 ${Math.max(1, Math.round(remainMin))} 分钟`
+          rebuildRateText.value = `约 ${Math.max(1, Math.round(perMin))} 只/分钟 · ${eta}`
+        }
+      } else if (!p.running) {
+        rebuildRateText.value = ''
+      }
+      lastProgressSample = { t: now, rebuilt: p.rebuilt }
+      factorsProgress.value = p
+    }
+  } catch {
+    /* 进度是辅助信息，读取失败不打扰主视图 */
+  }
+  if (progressTimer) window.clearTimeout(progressTimer)
+  progressTimer = undefined
+  const active =
+    factorsProgress.value &&
+    (factorsProgress.value.running || factorsProgress.value.outdated > 0)
+  if (active) progressTimer = window.setTimeout(loadProgress, 5000)
+}
+
+function stopProgressPoll() {
+  if (progressTimer) window.clearTimeout(progressTimer)
+  progressTimer = undefined
+}
+
+onUnmounted(stopProgressPoll)
 
 function num(v: number | null | undefined): string {
   return v == null ? '—' : Number(v).toFixed(1)
@@ -334,9 +766,27 @@ function pctWidth(v: number | null | undefined): string {
   return `${Math.max(0, Math.min(100, Number(v)))}%`
 }
 
+async function refreshAll() {
+  await Promise.all([load(), loadProgress()])
+}
+
+/** 质量×价值模式：榜单 + 调入信号**一起**拉（互不依赖，并行）。
+ *  历史 bug：只调 loadQualityValue() → rules 恒 null → 信号列全空、且旧实现整表空白。 */
+async function loadQvAll() {
+  await Promise.all([loadQualityValue(), loadRules()])
+}
+
 async function load() {
   if (resoMode.value) {
     await loadResonance()
+    return
+  }
+  if (qvMode.value) {
+    await loadQvAll()
+    return
+  }
+  if (pvMode.value) {
+    await loadPv()
     return
   }
   loading.value = true
@@ -383,10 +833,72 @@ function applyFilters() {
     loadResonance()
     return
   }
+  if (qvMode.value) {
+    overlayOn.value = false
+    overlay.value = null
+    loadQvAll()
+    return
+  }
+  if (pvMode.value) {
+    overlayOn.value = false
+    overlay.value = null
+    loadPv()
+    return
+  }
   overlayOn.value = false
   overlay.value = null
   load()
 }
+
+/** 质量×价值视图加载（读层筛选，无索引依赖，毫秒级） */
+async function loadQualityValue() {
+  qvLoading.value = true
+  qvError.value = ''
+  const q = form.value
+  const offset = Math.max(0, (page.value - 1) * pageSize.value)
+  q.offset = offset
+  const f = qvForm.value
+  try {
+    const { data } = await fetchQualityValue({
+      top: pageSize.value,
+      offset,
+      keyword: q.keyword.trim() || undefined,
+      industry: q.industry.trim() || undefined,
+      exclude_st: q.exclude_st,
+      include_gem: q.include_gem,
+      sort_by: qvSort.value,
+      min_roe: numOrUndef(f.min_roe),
+      min_roic: numOrUndef(f.min_roic),
+      min_gross_margin: numOrUndef(f.min_gross_margin),
+      max_debt_ratio: numOrUndef(f.max_debt_ratio),
+      min_ocf_np: numOrUndef(f.min_ocf_np),
+      max_pe: numOrUndef(f.max_pe),
+      max_pb: numOrUndef(f.max_pb),
+      max_pe_pctile: numOrUndef(f.max_pe_pctile),
+      max_pb_pctile: numOrUndef(f.max_pb_pctile),
+      min_dividend_yield: numOrUndef(f.min_dividend_yield),
+      max_peg: numOrUndef(f.max_peg),
+      min_market_cap_yi: numOrUndef(f.min_market_cap_yi),
+    })
+    qv.value = data.data
+    // 命中数缩水时回退页码，避免停在空页
+    if (qv.value && qv.value.matched > 0 && page.value > qvTotalPages.value) {
+      page.value = qvTotalPages.value
+      qvLoading.value = false
+      await loadQualityValue()
+      return
+    }
+  } catch (e) {
+    qv.value = null
+    qvError.value = apiErrorText(e, '质量价值视图加载失败')
+  } finally {
+    qvLoading.value = false
+  }
+}
+
+const qvTotalPages = computed(() =>
+  qv.value ? Math.max(1, Math.ceil(qv.value.matched / pageSize.value)) : 1,
+)
 
 function resetFilters() {
   const sortBy = form.value.sort_by
@@ -402,13 +914,40 @@ function resetFilters() {
     offset: 0,
     min_tech: 70,
   }
+  qvSort.value = 'qv_score'
+  qvForm.value = {
+    min_roe: 10,
+    min_roic: 8,
+    min_gross_margin: 15,
+    max_debt_ratio: 60,
+    min_ocf_np: 0.8,
+    max_pe: 50,
+    max_pb: 8,
+    max_pe_pctile: 40,
+    max_pb_pctile: 50,
+    min_dividend_yield: 0,
+    max_peg: 1.5,
+    min_market_cap_yi: 50,
+  }
   page.value = 1
   overlayOn.value = false
   overlay.value = null
   verdictFilter.value = ''
   onlySignaled.value = false
+  pvCategory.value = ''
+  pvVerdict.value = ''
+  pvEnv.value = ''
+  pvSort.value = 'signal_score'
   if (resoMode.value) {
     loadResonance()
+    return
+  }
+  if (qvMode.value) {
+    loadQvAll()
+    return
+  }
+  if (pvMode.value) {
+    loadPv()
     return
   }
   load()
@@ -451,8 +990,11 @@ function pickVerdict(v: MarketScanVerdictFilter) {
 }
 
 /** 显示列数据源：共振模式 = 索引读层（已含技术字段与档位）；
- *  普通榜单叠加后 = overlay items（榜单 items + 技术字段），综合分不变。 */
-type DisplayRow = MarketScanItem & Partial<MarketScanOverlayFields>
+ *  普通榜单叠加后 = overlay items（榜单 items + 技术字段），综合分不变；
+ *  质量价值模式 = quality-value items（读层筛选，qv_score 仅排序展示）。 */
+type DisplayRow = MarketScanItem &
+  Partial<MarketScanOverlayFields> &
+  Partial<Omit<QualityValueItem, 'composite_score' | 'name' | 'symbol' | 'industry'>>
 const showTechCols = computed(() => resoMode.value || overlayOn.value)
 
 const displayItems = computed<DisplayRow[]>(() => {
@@ -462,6 +1004,14 @@ const displayItems = computed<DisplayRow[]>(() => {
       rows = rows.filter(hasSignal)
     }
     return rows
+  }
+  if (qvMode.value) {
+    // ★ 用户口径：只展示满足调入条件的票（未持仓 buy + 已持仓仍达标 hold），
+    //   未达标不展示。loadRules 与榜单并行（loadQvAll），规则失败 → 空表 + 明确提示。
+    if (rulesTableMode.value) {
+      return targetRows.value as unknown as DisplayRow[]
+    }
+    return []
   }
   if (overlayOn.value && overlay.value) {
     let rows = overlay.value.items as DisplayRow[]
@@ -478,6 +1028,21 @@ const displayItems = computed<DisplayRow[]>(() => {
   return items.value
 })
 
+/** 当前生效的筛选条件（三种模式各自的数据源），供结果摘要统一展示。 */
+const activeFilters = computed(() => {
+  if (resoMode.value) {
+    return reso.value?.filters ?? { keyword: null, industry: null, include_gem: false }
+  }
+  if (qvMode.value) {
+    return qv.value?.filters ?? { keyword: null, industry: null, include_gem: false }
+  }
+  if (pvMode.value) {
+    const q = form.value
+    return { keyword: q.keyword.trim() || null, industry: q.industry.trim() || null, include_gem: false }
+  }
+  return report.value?.filters ?? { keyword: null, industry: null, include_gem: false }
+})
+
 const overlayStats = computed(() => overlay.value?.stats ?? null)
 const signalCounts = computed(() => overlay.value?.signal_counts ?? {})
 const verdictCounts = computed(() =>
@@ -488,8 +1053,95 @@ const verdictThresholds = computed(() =>
 )
 const industryConfluence = computed(() => overlay.value?.industry_confluence ?? [])
 
-const SIGNAL_LABELS: Record<string, string> = {
-  strong_buy: '强买入',
+/** 质量价值行：DisplayRow 复用了榜单行类型，此处按需取 qv 专属字段（缺失给安全兜底）。 */
+function qvRow(row: DisplayRow): QualityValueItem {
+  return row as unknown as QualityValueItem
+}
+
+/** 行业内分位的 tooltip 文案（让「分位」到底怎么算的可自证）。 */
+function pctHint(pct: number | null | undefined): string {
+  if (pct == null) return '行业内分位不可用（该行业样本不足或字段缺失）'
+  return `行业内分位 ${pct}（0~100，越高越好；基准 = 当前筛选命中集内同行业标的）`
+}
+
+/** 行业中位数是否可信：样本 < 5 时后端已置 null，此处给用户一句明确提示。 */
+function medianHint(c: QualityValueItem['qv_components']): string {
+  const s = c.industry_sample
+  if (s < 5) return `行业内样本仅 ${s} 只，行业中位数不可信（已置空）`
+  const m = c.industry_median
+  return `行业样本 ${s} 只 · PE 中位 ${m.pe ?? '—'} · PB 中位 ${m.pb ?? '—'} · 毛利率中位 ${m.gross_margin_pct ?? '—'}%`
+}
+
+/**
+ * 周期品「产品价格拐点」预警（**只读**：不改写 qv_score / 综合分，也不参与硬门槛）。
+ *
+ * - `trap` 周期陷阱：报表利润暴增，但**产品**价格已明确回落（周期股盈利顶峰 PE 最低的陷阱）
+ * - `peak` 景气高位：利润暴增且产品价仍在区间高位（未见回落，但在顶部区域）
+ * 只认**产品价**：原油/煤等**成本项**回落是成本改善，不计入预警。
+ */
+const CYCLE_LABELS: Record<string, string> = {
+  trap: '周期陷阱',
+  peak: '景气高位',
+}
+
+function cycleOf(row: DisplayRow): CyclePriceAssess | null {
+  return (row as unknown as QualityValueItem).cycle_price ?? null
+}
+
+function cycleGrade(row: DisplayRow): string {
+  return cycleOf(row)?.grade ?? ''
+}
+
+function cycleTone(g: string): string {
+  if (g === 'trap') return 'risk'
+  if (g === 'peak') return 'medium'
+  return 'plain'
+}
+
+function cycleText(row: DisplayRow): string {
+  return CYCLE_LABELS[cycleGrade(row)] ?? '—'
+}
+
+function cycleHint(row: DisplayRow): string {
+  const cp = cycleOf(row)
+  if (!cp) return '未获取周期品价格预警（可在请求中开启 with_cycle_price）'
+  const lines: string[] = [cp.label]
+  if (cp.profit_yoy_pct != null) lines.push(`利润增速 ${cp.profit_yoy_pct}%`)
+  // 多品种篮子必须显示「实际触发的是哪几个」，否则会误以为是公司主营品种
+  const tg = cp.trigger
+  if (tg?.products?.length) {
+    const what = tg.kind === 'drawdown' ? '已回落' : '处高位'
+    lines.push(
+      `触发（${tg.breadth}/${tg.total} 个产品${what}，需 ${tg.need} 个共振）：` +
+        tg.products
+          .map((p) => `${p.name} 距高点${p.drawdown_pct}%／区间位${p.pos_pct}%`)
+          .join('；'),
+    )
+  }
+  if (cp.products?.length) {
+    lines.push(
+      '产品篮子：' +
+        cp.products
+          .map((p) => `${p.name} ${p.close}（距高点 ${p.drawdown_pct}%${p.stale ? '，已停更' : ''}）`)
+          .join('；'),
+    )
+  }
+  if (cp.costs?.length) {
+    lines.push(
+      '原料价（跌 = 成本改善，不计入预警）：' +
+        cp.costs.map((p) => `${p.name} ${p.drawdown_pct}%`).join('；'),
+    )
+  }
+  if (cp.notes?.length) lines.push(cp.notes.join('；'))
+  return lines.join('\n')
+}
+
+/** 周期预警档位计数（摘要条用）：只统计已映射的票。 */
+const cycleCounts = computed<Record<string, number>>(
+  () => qv.value?.cycle_price?.grade_summary ?? {},
+)
+
+const SIGNAL_LABELS: Record<string, string> = {  strong_buy: '强买入',
   bottom_confirm: '右侧底部企稳',
   watch: '观察',
   left_side: '左侧超跌观察',
@@ -591,6 +1243,7 @@ function toggleOverlay() {
 onMounted(() => {
   load()
   loadRegime()
+  loadProgress()
 })
 </script>
 
@@ -639,7 +1292,7 @@ onMounted(() => {
     <section class="card coverage" :class="coverageTone">
       <div class="coverage-head">
         <h2>因子库覆盖</h2>
-        <button class="btn-secondary" type="button" :disabled="loading" @click="load">
+        <button class="btn-secondary" type="button" :disabled="loading" @click="refreshAll">
           {{ loading ? '加载中…' : '刷新' }}
         </button>
       </div>
@@ -664,6 +1317,21 @@ onMounted(() => {
         </div>
         <div class="bar">
           <div class="bar-fill" :style="{ width: pctWidth(coverage.coverage_pct) }" />
+        </div>
+        <div v-if="factorsProgress && factorsProgress.total > 0" class="rebuild-progress">
+          <p v-if="factorsProgress.outdated > 0 || factorsProgress.running" class="rebuild-note">
+            新口径 <code>{{ factorsProgress.scoring_version }}</code> 重建中：已重判
+            <b>{{ factorsProgress.rebuilt }}</b> / {{ factorsProgress.total }} 只（{{ factorsProgress.pct }}%）
+            <span v-if="rebuildRateText">· {{ rebuildRateText }}</span>
+            <span v-else-if="!factorsProgress.running" class="dim">· 重建未在运行，等待续跑任务触发</span>
+          </p>
+          <p v-else class="rebuild-note done">
+            全部 {{ factorsProgress.total }} 只快照已按
+            <code>{{ factorsProgress.scoring_version }}</code> 口径重判 ✓
+          </p>
+          <div v-if="factorsProgress.outdated > 0" class="bar slim">
+            <div class="bar-fill rebuild" :style="{ width: pctWidth(factorsProgress.pct) }" />
+          </div>
         </div>
         <p v-if="coverageWarning" class="coverage-warn">{{ coverageWarning }}</p>
         <p v-else class="coverage-ok">已覆盖全部沪深标的，榜单即为全市场排序。</p>
@@ -703,11 +1371,11 @@ onMounted(() => {
           @keyup.enter="applyFilters"
         />
       </label>
-      <label class="field">
+      <label v-if="!pvMode" class="field">
         <span>综合分 ≥</span>
         <input v-model="form.min_composite" type="number" min="0" max="100" placeholder="不限" />
       </label>
-      <label class="field">
+      <label v-if="!qvMode" class="field">
         <span>市值 ≥（亿）</span>
         <input v-model="form.min_market_cap_yi" type="number" min="0" placeholder="不限" />
       </label>
@@ -719,6 +1387,54 @@ onMounted(() => {
           <option :value="60">60（放宽·仍不吃淘汰线）</option>
         </select>
       </label>
+      <label v-if="qvMode" class="field">
+        <span>质量价值排序</span>
+        <select v-model="qvSort" @change="applyFilters">
+          <option v-for="opt in QV_SORT_OPTIONS" :key="opt.value" :value="opt.value">
+            {{ opt.label }}
+          </option>
+        </select>
+      </label>
+      <template v-if="pvMode">
+        <label class="field">
+          <span>信号类别</span>
+          <select v-model="pvCategory" @change="applyFilters">
+            <option value="">全部</option>
+            <option value="trend">趋势确认（顺势）</option>
+            <option value="reversal">反转捕捉（逆势）</option>
+          </select>
+        </label>
+        <label
+          class="field"
+          title="裁决 = ADX 环境分流 → 信号优先级仲裁 的唯一结论。规避的票已从买入列表剔除（也可点摘要条上的 chip 快速筛选）。"
+        >
+          <span>裁决</span>
+          <select v-model="pvVerdict" @change="applyFilters">
+            <option v-for="opt in PV_VERDICT_OPTIONS" :key="opt.value" :value="opt.value" :title="opt.desc">
+              {{ opt.label }}
+            </option>
+          </select>
+        </label>
+        <label
+          class="field"
+          title="ADX 交易分流口径：>25 趋势市（只跑趋势类）；20~25 震荡市（只跑反转类）；<20 无趋势 → 空仓观望。风险类（看空）信号不受环境过滤。"
+        >
+          <span>ADX 环境</span>
+          <select v-model="pvEnv" @change="applyFilters">
+            <option v-for="opt in PV_ENV_OPTIONS" :key="opt.value" :value="opt.value" :title="opt.desc">
+              {{ opt.label }}
+            </option>
+          </select>
+        </label>
+        <label class="field">
+          <span>价量排序</span>
+          <select v-model="pvSort" @change="applyFilters">
+            <option v-for="opt in PV_SORT_OPTIONS" :key="opt.value" :value="opt.value">
+              {{ opt.label }}
+            </option>
+          </select>
+        </label>
+      </template>
       <label class="field">
         <span>每页条数</span>
         <select v-model.number="form.top" @change="applyFilters">
@@ -729,27 +1445,109 @@ onMounted(() => {
         <input v-model="form.exclude_st" type="checkbox" />
         <span>剔除 ST / 退市</span>
       </label>
-      <label class="field checkbox" title="勾选后纳入创业板(300/301/302)与科创板(688/689)；注意这两板不在K线同步范围内，叠加技术面时无K线">
+      <label v-if="!pvMode" class="field checkbox" title="勾选后纳入创业板(300/301/302)与科创板(688/689)；注意这两板不在K线同步范围内，叠加技术面时无K线">
         <input v-model="form.include_gem" type="checkbox" />
         <span>含创业板/科创板</span>
       </label>
       <div class="actions">
-        <button class="btn-primary" type="button" :disabled="loading" @click="applyFilters">
-          {{ loading ? '加载中…' : '查询' }}
+        <button class="btn-primary" type="button" :disabled="loading || qvLoading || pvLoading" @click="applyFilters">
+          {{ loading || qvLoading || pvLoading ? '加载中…' : '查询' }}
         </button>
-        <button class="btn-secondary" type="button" :disabled="loading" @click="resetFilters">
+        <button class="btn-secondary" type="button" :disabled="loading || qvLoading || pvLoading" @click="resetFilters">
           重置
         </button>
       </div>
     </section>
 
+    <!-- 质量×价值门槛面板：只在该模式展开，避免干扰共振/普通榜单 -->
+    <section v-if="qvMode" class="card filters qv-filters">
+      <div class="qv-head">
+        <h3>质量 × 价值门槛（读层筛选，不改写任何分数）</h3>
+        <span class="qv-role">qv_score 仅用于排序展示</span>
+      </div>
+      <div class="qv-groups">
+        <div class="qv-group">
+          <p class="qv-group-title">质量 · 好公司</p>
+          <label class="field inline">
+            <span>ROE ≥(%)</span>
+            <input v-model.number="qvForm.min_roe" type="number" step="1" />
+          </label>
+          <label class="field inline" title="本项目 ROIC 口径下 15% 会误杀多数制造业：茅台 42.75 / 江西铜业 6.49 / 万科 -12.56">
+            <span>ROIC ≥(%)</span>
+            <input v-model.number="qvForm.min_roic" type="number" step="1" />
+          </label>
+          <label class="field inline" title="对工业金属/贸易/建筑/电力等结构性低毛利行业不适用，该行业只认行业内分位">
+            <span>毛利率 ≥(%)</span>
+            <input v-model.number="qvForm.min_gross_margin" type="number" step="5" />
+          </label>
+          <label class="field inline" title="银行/保险/券商为负债经营，本阈值不适用">
+            <span>资产负债率 ≤(%)</span>
+            <input v-model.number="qvForm.max_debt_ratio" type="number" step="5" />
+          </label>
+          <label class="field inline" title="取【5 年均值】口径；单年年报值行业间极性相反（江西铜业 -0.97 / 中国神华 1.42），用单年会误杀周期股">
+            <span>现金流/净利润 ≥</span>
+            <input v-model.number="qvForm.min_ocf_np" type="number" step="0.1" />
+          </label>
+        </div>
+        <div class="qv-group">
+          <p class="qv-group-title">价值 · 好价格</p>
+          <label class="field inline" title="与 PB 分位互为兜底：任一达标即可，避免单因子一刀切">
+            <span>PE 分位 ≤(%)</span>
+            <input v-model.number="qvForm.max_pe_pctile" type="number" step="5" />
+          </label>
+          <label class="field inline">
+            <span>PB 分位 ≤(%)</span>
+            <input v-model.number="qvForm.max_pb_pctile" type="number" step="5" />
+          </label>
+          <label class="field inline" title="绝对 PE 上限只作兜底（跨行业比 PE 不可比）">
+            <span>PE ≤</span>
+            <input v-model.number="qvForm.max_pe" type="number" step="5" />
+          </label>
+          <label class="field inline">
+            <span>PB ≤</span>
+            <input v-model.number="qvForm.max_pb" type="number" step="1" />
+          </label>
+          <label class="field inline" title="默认 0 = 不限。设 >0 会与质量主判据部分重复，仅在需要红利倾斜时调高">
+            <span>股息率 ≥(%)</span>
+            <input v-model.number="qvForm.min_dividend_yield" type="number" step="0.5" />
+          </label>
+        </div>
+        <div class="qv-group">
+          <p class="qv-group-title">成长 · 规模</p>
+          <label class="field inline" title="PEG 缺失不淘汰：红利资产被估值口径置空 PEG（如贵州茅台）">
+            <span>PEG ≤</span>
+            <input v-model.number="qvForm.max_peg" type="number" step="0.1" />
+          </label>
+          <label class="field inline">
+            <span>市值 ≥(亿)</span>
+            <input v-model.number="qvForm.min_market_cap_yi" type="number" step="10" />
+          </label>
+        </div>
+      </div>
+      <p class="qv-hint">
+        与通用「质量40+价值30+成长30」模板的四处刻意偏离：① ROIC 阈值按本项目会计口径下调（模板 15% → 8%）；
+        ② 毛利率改**行业内分位**（模板绝对 30% 会切掉工业金属/贸易/建筑整条链）；
+        ③ 现金流用 **5 年均值**而非单年（单年行业间极性相反）；
+        ④ **不新建第二总分**，qv_score 仅排序展示，composite_score 仍是唯一权威分。
+        缺失项不等于坏值（记入每票的缺失清单，不淘汰）。
+      </p>
+    </section>
+
     <p v-if="error" class="error">{{ error }}</p>
+    <p v-if="qvError" class="error">{{ qvError }}</p>
+    <!-- 调入信号是本表数据源，拉取失败必须明示（不静默空表） -->
+    <p v-if="qvMode && rulesError" class="qv-note-line">
+      <span class="overlay-note dim">调入信号加载失败（{{ rulesError }}）：表格暂空，点击「查询」重试。</span>
+    </p>
 
     <section v-if="view.hasData" class="card result">
       <div class="result-head">
         <div>
           <h2>
             <template v-if="resoMode">共振榜单（按档位排序）</template>
+            <template v-else-if="qvMode && rulesTableMode">选股结果（调入条件过滤）</template>
+            <template v-else-if="qvMode">质量 × 价值榜单（好公司 × 好价格）</template>
+            <template v-else-if="pvMode">价量策略信号（趋势 × 反转）</template>
             <template v-else>
               榜单
               <template v-if="isDimSort">（按{{ dimSortLabel }}排序）</template>
@@ -757,14 +1555,33 @@ onMounted(() => {
             </template>
           </h2>
           <p class="sub">
-            {{ rangeText }}<template v-if="!resoMode"> · 分位基准 {{ report?.percentile_base ?? '—' }} 只</template>
-            <template v-if="(reso || report)?.filters.keyword"> · 名称/代码含「{{ (reso || report)?.filters.keyword }}」</template>
-            <template v-if="(reso || report)?.filters.industry"> · 行业含「{{ (reso || report)?.filters.industry }}」</template>
-            <template v-if="!(reso || report)?.filters.include_gem"> · 仅沪深主板</template>
+            {{ rangeText }}
+            <template v-if="qvMode && rulesTableMode">
+              · 满足调入条件 {{ targetRows.length }} 只（未达标的不展示）
+            </template>
+            <template v-else-if="qvMode && qv">
+              · 通过门槛 {{ qv.matched }} 只{{ rulesError ? '（调入信号加载失败，表格暂空）' : '，正在按调入条件筛选…' }}
+            </template>
+            <template v-else-if="pvMode">
+              · 命中 {{ pv?.total ?? 0 }} 只（共扫描 {{ pv?.stats?.universe ?? 0 }} 只）
+              <template v-if="pvCategory === 'trend'"> · 仅趋势确认</template>
+              <template v-else-if="pvCategory === 'reversal'"> · 仅反转捕捉</template>
+              <template v-if="pvVerdict"> · 裁决=
+                {{ PV_VERDICT_OPTIONS.find((o) => o.value === pvVerdict)?.label }}
+              </template>
+              <template v-if="pvEnv"> · 环境=
+                {{ PV_ENV_OPTIONS.find((o) => o.value === pvEnv)?.label }}
+              </template>
+              · 只展示，不参与打分
+            </template>
+            <template v-if="!resoMode && !qvMode && !pvMode"> · 分位基准 {{ report?.percentile_base ?? '—' }} 只</template>
+            <template v-if="activeFilters.keyword"> · 名称/代码含「{{ activeFilters.keyword }}」</template>
+            <template v-if="activeFilters.industry"> · 行业含「{{ activeFilters.industry }}」</template>
+            <template v-if="!activeFilters.include_gem"> · 仅沪深主板</template>
           </p>
         </div>
         <button
-          v-if="!resoMode"
+          v-if="!resoMode && !qvMode && !pvMode"
           class="btn-secondary"
           type="button"
           :disabled="overlayLoading"
@@ -775,7 +1592,17 @@ onMounted(() => {
           {{ overlayLoading ? '共振计算中…' : overlayOn ? '已叠加技术面 ✓ 关闭' : `叠加技术面（本页 ${report?.count} 只）` }}
         </button>
         <button
-          v-else
+          v-else-if="pvMode"
+          class="btn-secondary"
+          type="button"
+          :disabled="pvBuilding"
+          title="重建价量信号索引：全市场扫描最近 N 个交易日的价量信号（趋势确认 / 反转捕捉）"
+          @click="startPvBuild(true)"
+        >
+          {{ pvBuilding ? '扫描中…' : '重建扫描' }}
+        </button>
+        <button
+          v-else-if="resoMode"
           class="btn-secondary"
           type="button"
           :disabled="!!resoJob"
@@ -784,6 +1611,8 @@ onMounted(() => {
         >
           {{ resoJob ? '索引重建中…' : reso?.index_stale ? '索引已过期，点击重建' : '重建索引' }}
         </button>
+        <!-- 质量价值模式不放「被筛掉」入口：选股结果只展示达标票（用户口径），
+             被筛掉的明细仍在 API 响应里（rejected_sample / reject_summary）可查。 -->
       </div>
 
       <p v-if="resoError" class="error overlay-error">{{ resoError }}</p>
@@ -800,6 +1629,104 @@ onMounted(() => {
         </div>
       </div>
       <p v-else-if="resoEmpty" class="coverage-warn">共振索引未构建，正在自动触发后台构建…</p>
+
+      <!-- 价量索引扫描进度（在页内读层模式下触发，与「价量策略」页共用同一后台任务） -->
+      <div v-if="pvMode && (pvBuilding || pvJobError)" class="overlay-summary">
+        <p v-if="pvJobError" class="error">{{ pvJobError }}</p>
+        <p v-else class="overlay-note">
+          价量索引扫描中：读取 K 线 → 逐票判定（{{ pvJobPct }}%）。完成后本页自动刷新；
+          全市场约需 1 分钟，索引 10 分钟内复用。
+        </p>
+        <div v-if="!pvJobError" class="bar">
+          <div class="bar-fill" :style="{ width: pctWidth(pvJobPct) }" />
+        </div>
+      </div>
+
+      <!-- 价量裁决摘要（补丁一+二流水线产出；chip 可点击筛选，口径全部来自后端计数） -->
+      <div v-if="pvMode && pv && Object.keys(pvVerdictCounts).length" class="overlay-summary">
+        <div class="sig-counts">
+          <span
+            class="verdict-chip"
+            :class="pvVerdictTone('SIGNAL')"
+            :style="{ cursor: 'pointer', outline: pvVerdict === 'SIGNAL' ? '2px solid currentColor' : 'none' }"
+            title="通过 ADX 环境分流 + 优先级仲裁，保留唯一信号 → 即「买入候选」集合"
+            @click="pickPvVerdict('SIGNAL')"
+          >买入候选 {{ pvVerdictCounts.SIGNAL || 0 }}</span>
+          <span
+            class="verdict-chip"
+            :class="pvVerdictTone('AVOID')"
+            :style="{ cursor: 'pointer', outline: pvVerdict === 'AVOID' ? '2px solid currentColor' : 'none' }"
+            title="风险类信号命中（价量过热 / 天量滞涨 / PVT顶背离，优先级 ≥5）→ 已从买入列表剔除"
+            @click="pickPvVerdict('AVOID')"
+          >规避 {{ pvVerdictCounts.AVOID || 0 }}</span>
+          <span
+            class="verdict-chip"
+            :class="pvVerdictTone('IGNORE')"
+            :style="{ cursor: 'pointer', outline: pvVerdict === 'IGNORE' ? '2px solid currentColor' : 'none' }"
+            title="信号全被环境分流屏蔽（趋势市里的反转类看多信号，或反之）→ 本轮不参与"
+            @click="pickPvVerdict('IGNORE')"
+          >忽略 {{ pvVerdictCounts.IGNORE || 0 }}</span>
+          <span
+            class="verdict-chip"
+            :class="pvVerdictTone('STANDBY')"
+            :style="{ cursor: 'pointer', outline: pvVerdict === 'STANDBY' ? '2px solid currentColor' : 'none' }"
+            title="ADX < 20 无趋势 → 空仓观望，信号全部屏蔽"
+            @click="pickPvVerdict('STANDBY')"
+          >空仓 {{ pvVerdictCounts.STANDBY || 0 }}</span>
+          <span class="dim" style="align-self: center">
+            环境：趋势市 {{ pvEnvCounts.TREND || 0 }} / 震荡市 {{ pvEnvCounts.RANGE || 0 }}
+            / 无趋势 {{ pvEnvCounts.WEAK || 0 }}<template v-if="pvEnvCounts.UNKNOWN"> / 数据不足 {{ pvEnvCounts.UNKNOWN }}</template>
+            · 计数只覆盖有信号的票
+          </span>
+        </div>
+        <p class="overlay-note dim">
+          流水线：ADX 判环境（&gt;25 趋势市只跑趋势类；20~25 震荡市只跑反转类；&lt;20 无趋势空仓）
+          → 按优先级仲裁取唯一结论（风险类 ≥5 直接判规避）。<b>风险类信号不受环境过滤</b>，
+          否则趋势市会把「价量过热」这类风险提示一起屏蔽。
+        </p>
+      </div>
+
+      <!-- 质量×价值摘要：准入门槛 + 被筛掉原因（自证用，不是黑箱） -->
+      <div v-if="qvMode && qv" class="overlay-summary">
+        <div class="sig-counts">
+          <span class="verdict-chip strong">通过门槛 {{ qv.matched }} 只</span>
+          <!-- 被筛掉的数量/原因明细不在页面展示（选股结果只放达标票），
+               数据仍在 qv.rejected / qv.reject_summary / qv.rejected_sample 供排查 -->
+          <span
+            v-if="cycleCounts.trap"
+            class="sig-chip risk"
+            title="周期陷阱预警：报表利润暴增，但产品价格已从区间高位明确回落（周期股盈利顶峰 PE 最低的陷阱）。只读提示，不参与打分与门槛。"
+          >周期陷阱 {{ cycleCounts.trap }}</span>
+          <span
+            v-if="cycleCounts.peak"
+            class="sig-chip medium"
+            title="景气高位预警：利润暴增且产品价格仍在区间高位（尚未回落，但在顶部区域，需盯拐点）。"
+          >景气高位 {{ cycleCounts.peak }}</span>
+          <span
+            v-if="qv.cycle_price"
+            class="sig-chip plain"
+            :title="`可下结论（行业产出有期货）${qv.cycle_price.coverage.judged_industries} 个行业；仅成本项可看（产品无期货，不判定）${qv.cycle_price.coverage.cost_only_industries} 个；未纳入 ${qv.cycle_price.coverage.unmapped_industries} 个；已映射标的 ${qv.cycle_price.mapped} 只`"
+          >周期品可判定 {{ qv.cycle_price.mapped }}</span>
+        </div>
+        <p v-if="qv.thresholds" class="overlay-note">
+          准入门槛（全部为**硬门槛**，与通用「质量40+价值30+成长30」总分模板不同）：
+          质量 ROE ≥{{ qv.thresholds.min_roe }} / ROIC ≥{{ qv.thresholds.min_roic }} /
+          毛利率 ≥{{ qv.thresholds.min_gross_margin }}（低毛利行业只认行业内分位）/
+          资产负债率 ≤{{ qv.thresholds.max_debt_ratio }} / 现金流÷净利润（5年均值）≥{{ qv.thresholds.min_ocf_np }}；
+          价值 PE 或 PB **任一**处于行业内低分位（PE ≤{{ qv.thresholds.max_pe_pctile }}% 或 PB ≤{{ qv.thresholds.max_pb_pctile }}%），
+          绝对 PE ≤{{ qv.thresholds.max_pe }} / PB ≤{{ qv.thresholds.max_pb }} 只作兜底；
+          PEG ≤{{ qv.thresholds.max_peg }}（**缺失不淘汰**）；市值 ≥{{ qv.thresholds.min_market_cap_yi }} 亿。
+        </p>
+        <p class="overlay-note dim">
+          排序分 qv_score（质量 {{ Math.round(40) }}% + 价值 {{ Math.round(30) }}% + 成长 {{ Math.round(30) }}%）
+          <b>仅用于排序与展示</b>，不改写综合分 —— 列表中「综合分」列仍是全站唯一权威分。
+          行业分位基准 = 当前筛选命中集，叠加行业/地域筛选后分位不会失真。
+        </p>
+      </div>
+
+      <div v-for="note in (qvMode ? qv?.notes ?? [] : [])" :key="note" class="qv-note-line">
+        <p class="overlay-note dim">{{ note }}</p>
+      </div>
 
       <!-- 共振模式摘要：档位分布（点击筛选，服务端过滤）+ 口径说明 -->
       <div v-if="resoMode && reso" class="overlay-summary">
@@ -898,7 +1825,90 @@ onMounted(() => {
         </p>
       </div>
 
-      <div v-if="displayItems.length" class="table-wrap">
+      <!-- 价量策略表：信号维度与基本面表完全不同，独立成表（只展示，不改分） -->
+      <div v-if="pvMode && pvItems.length" class="table-wrap">
+        <table class="scan-table">
+          <thead>
+            <tr>
+              <th class="col-rank">#</th>
+              <th>标的</th>
+              <th class="col-industry">行业</th>
+              <th class="col-num" title="信号强度分：窗口内信号的类别/方向/强度加权（仅用于本视图排序展示）">强度</th>
+              <th
+                class="col-verdict"
+                title="信号处理流水线唯一结论：先按 ADX 判策略环境（>25 趋势市 / 20~25 震荡市 / <20 空仓），再按优先级仲裁取唯一信号（风险类 ≥5 直接判规避）。只影响本视图筛选，不进任何评分与门槛。"
+              >裁决</th>
+              <th class="col-signal" title="回看窗口内触发的价量信号（原始判据，未过滤）；带 · 标记 = 当日仍在生效">信号</th>
+              <th class="col-num" title="最新信号距最新一根K线的交易日数；「当日」= 仍在生效">最近</th>
+              <th
+                class="col-num"
+                title="ADX：环境分流口径为 >25 趋势市（只跑趋势类）/ 20~25 震荡市（只跑反转类）/ <20 无趋势（空仓）。括号内为展示口径的强弱标签，两者刻意不同。"
+              >环境 / ADX</th>
+              <th class="col-num" title="取自扫描时刻的行情，非实时报价">收盘价</th>
+              <th class="col-num hide-mobile">市值(亿)</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(row, idx) in pvItems" :key="row.symbol">
+              <td class="col-rank rank">{{ (pv?.offset ?? 0) + idx + 1 }}</td>
+              <td class="col-symbol">
+                <div class="sym-cell">
+                  <span class="code">{{ row.symbol.split('.')[0] }}</span>
+                  <span class="name">{{ row.name || '—' }}</span>
+                </div>
+              </td>
+              <td class="col-industry industry">{{ row.industry || '—' }}</td>
+              <td class="col-num">
+                <span class="score" :class="scoreTone(row.signal_score)">{{ Math.round(row.signal_score) }}</span>
+              </td>
+              <td class="col-verdict">
+                <span
+                  class="sig-chip"
+                  :class="pvVerdictTone(row.arb_verdict)"
+                  :title="pvVerdictHint(row)"
+                >{{ pvVerdictText(row) }}</span>
+              </td>
+              <td class="col-signal">
+                <span
+                  v-for="s in row.signals.slice(0, 4)"
+                  :key="s.key + s.date"
+                  class="sig-chip"
+                  :class="s.direction === 'bearish' ? 'plain' : s.category === 'trend' ? 'strong' : 'medium'"
+                  :title="`${s.date} · ${s.category_zh}/${s.direction_zh} · ${s.reason}`"
+                >
+                  {{ s.name }}<template v-if="s.bars_ago === 0"> ·</template>
+                </span>
+                <span v-if="row.signals.length > 4" class="dim"> +{{ row.signals.length - 4 }}</span>
+                <span v-if="!row.signals.length" class="dim">—</span>
+              </td>
+              <td class="col-num">
+                <span :class="row.newest_bars_ago === 0 ? 'up' : 'dim'">
+                  {{ row.newest_bars_ago === 0 ? '当日' : `${row.newest_bars_ago}日前` }}
+                </span>
+              </td>
+              <td class="col-num">
+                <template v-if="row.arb">
+                  <span
+                    class="sig-chip"
+                    :class="row.arb.env === 'WEAK' ? 'plain' : row.arb.env === 'TREND' ? 'strong' : 'medium'"
+                    :title="`${row.arb.env_zh}：ADX ${num(row.arb.adx)}（补丁二口径）`"
+                  >{{ row.arb.env_zh }}</span>
+                  <span class="dim">{{ num(row.arb.adx) }}</span>
+                </template>
+                <span v-else>{{ num(row.regime?.adx ?? null) }}</span>
+              </td>
+              <td class="col-num">{{ priceText(row.close) }}</td>
+              <td class="col-num hide-mobile">{{ num(row.market_cap_yi) }}</td>
+              <td class="col-action">
+                <RouterLink class="detail-link" :to="`/chart/${row.symbol}`">详情</RouterLink>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div v-else-if="!pvMode && displayItems.length" class="table-wrap">
         <table class="scan-table">
           <thead>
             <tr>
@@ -907,6 +1917,7 @@ onMounted(() => {
               <th class="col-industry">行业</th>
               <th class="col-score">综合分</th>
               <th>评级</th>
+              <th v-if="qvMode" class="col-num" title="调入 = 满足调入条件且未持仓；持有 = 已持仓且仍达标（继续持有，不是加仓信号）">信号</th>
               <th
                 v-if="showTechCols"
                 class="col-verdict"
@@ -932,6 +1943,18 @@ onMounted(() => {
               <th v-if="showTechCols" class="col-pattern" title="bullish 形态 × 趋势/动量/波动/量价/结构正交共振（含周线趋势多周期确认）；组合分=形态分+有效共振数×6，与信号页同源">
                 形态共振
               </th>
+              <th v-if="qvMode" class="col-num" title="仅用于本视图排序展示，不是第二个综合分（后端 score_role=display_only）">质量价值分</th>
+              <th v-if="qvMode" class="col-num" title="净资产收益率；括号内为行业内分位">ROE%</th>
+              <th v-if="qvMode" class="col-num" title="投入资本回报率（本项目会计口径，剔除杠杆影响）">ROIC%</th>
+              <th v-if="qvMode" class="col-num" title="毛利率；结构性低毛利行业只认行业内分位。括号内为行业内分位">毛利%</th>
+              <th v-if="qvMode" class="col-num" title="资产负债率；银行/保险/券商为负债经营，本项不适用">负债%</th>
+              <th v-if="qvMode" class="col-num" title="经营现金流 ÷ 净利润（5 年均值口径；单年年报值行业间极性相反，已弃用）">现金/利润</th>
+              <th v-if="qvMode" class="col-num" title="PE 的 5 年历史分位；低 = 相对自身历史便宜">PE分位%</th>
+              <th
+                v-if="qvMode"
+                class="col-num"
+                title="周期品「产品价格拐点」预警（只读：不改写任何分数、不参与硬门槛）。只看**产品价** —— 原油/煤等成本项回落是成本改善，不计入预警。"
+              >周期价</th>
               <th class="col-pct">分位</th>
               <th class="col-num hide-mobile">PE</th>
               <th class="col-num hide-mobile">PB</th>
@@ -959,6 +1982,25 @@ onMounted(() => {
                 <span class="rating" :class="ratingTone(row.final_rating)">
                   {{ row.final_rating || '—' }}
                 </span>
+              </td>
+              <td v-if="qvMode" class="col-num">
+                <span
+                  v-if="rebAction(row)"
+                  class="rules-badge"
+                  :class="rebAction(row) === 'buy' ? 'up' : 'flat'"
+                  :title="rebAction(row) === 'buy'
+                    ? `满足调入条件：qv_score > ${rules?.thresholds.buy_score ?? 80} 且 市值 > ${rules?.thresholds.min_market_cap_yi ?? 50} 亿（未持仓）`
+                    : '已持仓且仍达标，继续持有（不是加仓信号）'"
+                >
+                  {{ rebAction(row) === 'buy' ? '调入' : '持有' }}
+                </span>
+                <span
+                  v-else
+                  class="dim"
+                  :title="rules
+                    ? `未满足调入条件（qv_score ≤ ${rules.thresholds.buy_score} 或 市值 ≤ ${rules.thresholds.min_market_cap_yi} 亿）：仅展示，不产生调入信号`
+                    : '调入信号未加载（不影响本表展示）'"
+                >—</span>
               </td>
               <td v-if="showTechCols" class="col-verdict">
                 <div class="verdict-cell">
@@ -995,6 +2037,34 @@ onMounted(() => {
                 </template>
                 <span v-else class="pattern-none">—</span>
               </td>
+              <template v-if="qvMode">
+                <td class="col-num">
+                  <span class="score qv" :title="`质量 ${qvRow(row).qv_components.quality_pct} · 价值 ${qvRow(row).qv_components.value_pct} · 成长 ${qvRow(row).qv_components.growth_pct}`">
+                    {{ num(qvRow(row).qv_score) }}
+                  </span>
+                </td>
+                <td class="col-num" :title="pctHint(qvRow(row).qv_components.roe_industry_pct)">
+                  {{ num(row.roe_pct) }}<em v-if="qvRow(row).qv_components.roe_industry_pct != null" class="dim">({{ num(qvRow(row).qv_components.roe_industry_pct) }})</em>
+                </td>
+                <td class="col-num">{{ num(row.roic_pct) }}</td>
+                <td class="col-num" :title="pctHint(qvRow(row).qv_components.gross_margin_industry_pct)">
+                  {{ num(row.gross_margin_pct) }}<em v-if="qvRow(row).qv_components.gross_margin_industry_pct != null" class="dim">({{ num(qvRow(row).qv_components.gross_margin_industry_pct) }})</em>
+                </td>
+                <td class="col-num">{{ num(row.debt_ratio_pct) }}</td>
+                <td class="col-num">{{ num(row.ocf_np_5y) }}</td>
+                <td class="col-num" :title="medianHint(qvRow(row).qv_components)">
+                  {{ num(row.pe_ttm != null && row.pe_ttm > 0 ? row.pe_ttm : null) }}
+                </td>
+                <td class="col-num">
+                  <span
+                    v-if="cycleText(row) !== '—'"
+                    class="sig-chip"
+                    :class="cycleTone(cycleGrade(row))"
+                    :title="cycleHint(row)"
+                  >{{ cycleText(row) }}</span>
+                  <span v-else class="dim" :title="cycleHint(row)">—</span>
+                </td>
+              </template>
               <td class="col-pct">
                 <div class="pct">
                   <span class="pct-num">{{ num(row.market_pct) }}</span>
@@ -1013,15 +2083,28 @@ onMounted(() => {
           </tbody>
         </table>
       </div>
-      <p v-if="!displayItems.length" class="empty">
+      <p v-if="pvMode && pvLoading" class="empty">正在读取价量信号…</p>
+      <p v-else-if="pvMode && pv && !pvItems.length" class="empty">
+        当前筛选条件（类别/关键词/行业/市值）下没有命中的价量信号。可放宽条件或点「重建扫描」刷新索引。
+      </p>
+      <p v-else-if="!pvMode && !displayItems.length && (loading || qvLoading || resoLoading || rulesLoading)" class="empty">
+        正在按调入条件筛选（得分 &gt; 80 且 市值 &gt; 50 亿）…
+      </p>
+      <p v-else-if="!pvMode && !displayItems.length && qvMode && rulesError" class="empty">
+        调入信号加载失败，表格暂空（详见上方错误）。可点击「查询」重试。
+      </p>
+      <p v-else-if="!pvMode && !displayItems.length && qvMode && rules" class="empty">
+        当前规则（得分 &gt; 80 且 市值 &gt; 50 亿）下没有满足调入条件的股票。
+      </p>
+      <p v-else-if="!pvMode && !displayItems.length" class="empty">
         当前条件下无命中。可放宽综合分/市值下限，或确认因子库是否已构建。
       </p>
 
-      <div v-if="view.matched > 0" class="pager">
+      <div v-if="view.matched > 0 && !rulesTableMode" class="pager">
         <span class="pager-info">{{ rangeText }}</span>
         <div class="pager-btns">
-          <button class="pg" type="button" :disabled="loading || resoLoading || page <= 1" @click="goPage(1)">« 首页</button>
-          <button class="pg" type="button" :disabled="loading || resoLoading || page <= 1" @click="goPage(page - 1)">上一页</button>
+          <button class="pg" type="button" :disabled="loading || resoLoading || qvLoading || pvLoading || page <= 1" @click="goPage(1)">« 首页</button>
+          <button class="pg" type="button" :disabled="loading || resoLoading || qvLoading || pvLoading || page <= 1" @click="goPage(page - 1)">上一页</button>
           <template v-for="(p, i) in pageButtons" :key="`p${i}`">
             <span v-if="p === '…'" class="pg-gap">…</span>
             <button
@@ -1029,21 +2112,24 @@ onMounted(() => {
               class="pg"
               type="button"
               :class="{ active: p === page }"
-              :disabled="loading || resoLoading"
+              :disabled="loading || resoLoading || qvLoading || pvLoading"
               @click="goPage(p as number)"
             >
               {{ p }}
             </button>
           </template>
-          <button class="pg" type="button" :disabled="loading || resoLoading || !view.has_more" @click="goPage(page + 1)">下一页</button>
-          <button class="pg" type="button" :disabled="loading || resoLoading || !view.has_more" @click="goPage(totalPages)">末页 »</button>
+          <button class="pg" type="button" :disabled="loading || resoLoading || pvLoading || !view.has_more" @click="goPage(page + 1)">下一页</button>
+          <button class="pg" type="button" :disabled="loading || resoLoading || pvLoading || !view.has_more" @click="goPage(totalPages)">末页 »</button>
         </div>
       </div>
       <p v-if="overlayOn && displayItems.length < (overlay?.count ?? 0)" class="pager-hint">
         「仅看有信号/共振」已隐藏 {{ (overlay?.count ?? 0) - displayItems.length }} 只本页无信号的标的。
       </p>
 
-      <ul v-if="resoMode && reso && reso.notes.length" class="notes">
+      <ul v-if="pvMode && pv && (pv.notes ?? []).length" class="notes">
+        <li v-for="(note, i) in pv.notes" :key="`pv${i}`">{{ note }}</li>
+      </ul>
+      <ul v-else-if="resoMode && reso && reso.notes.length" class="notes">
         <li v-for="(note, i) in reso.notes" :key="`r${i}`">{{ note }}</li>
       </ul>
       <ul v-else-if="overlayOn && overlay && overlay.notes.length" class="notes">
@@ -1053,6 +2139,25 @@ onMounted(() => {
         <li v-for="(note, i) in report.notes" :key="i">{{ note }}</li>
       </ul>
     </section>
+
+    <!-- 价量索引未构建 / 扫描中 / 读取失败：结果区被隐藏，这里给出明确出口 -->
+    <template v-if="pvMode && !view.hasData">
+      <section class="card">
+        <h3 style="margin: 0 0 8px">价量策略索引未就绪</h3>
+        <p v-if="pvError" class="error">{{ pvError }}</p>
+        <template v-else-if="pvBuilding || pvJobError">
+          <p class="overlay-note">
+            <template v-if="pvJobError">价量扫描失败：{{ pvJobError }}</template>
+            <template v-else>正在扫描全市场价量信号（{{ pvJobPct }}%）…完成后本页自动刷新。</template>
+          </p>
+          <div v-if="!pvJobError" class="bar">
+            <div class="bar-fill" :style="{ width: pctWidth(pvJobPct) }" />
+          </div>
+        </template>
+        <p v-else-if="pvEmpty" class="coverage-warn">{{ pvReason || '正在触发全市场扫描…' }}</p>
+        <p v-else class="coverage-warn">正在读取价量信号…</p>
+      </section>
+    </template>
   </div>
 </template>
 
@@ -1103,6 +2208,8 @@ onMounted(() => {
 .verdict-chip.medium { background: rgba(250, 140, 22, 0.14); color: #d46b08; }
 .verdict-chip.plain { background: var(--border-color); color: var(--text-secondary); }
 .verdict-chip.risk { background: rgba(140, 140, 140, 0.16); color: var(--text-secondary); }
+/* 规避 = 看空信号 → 绿（A 股习惯红涨绿跌） */
+.verdict-chip.down { background: rgba(82, 196, 26, 0.16); color: var(--color-down); }
 .verdict-chip.risk.picked { text-decoration: line-through; }
 button.verdict-chip { border: 1px solid transparent; cursor: pointer; }
 .verdict-chip.picked { border-color: currentColor; box-shadow: 0 0 0 1px currentColor inset; }
@@ -1156,6 +2263,21 @@ button.verdict-chip { border: 1px solid transparent; cursor: pointer; }
   margin-bottom: var(--space-sm);
 }
 .bar-fill { height: 100%; background: var(--color-primary); transition: width 0.25s ease; }
+/* 口径重建进度条：与覆盖率主条区分（琥珀色），更细 */
+.rebuild-progress { margin-top: 2px; }
+.rebuild-note { margin: 4px 0 6px; font-size: 13px; line-height: 1.6; color: var(--text-primary); }
+.rebuild-note b { font-variant-numeric: tabular-nums; }
+.rebuild-note .dim { color: var(--text-secondary); }
+.rebuild-note.done { color: var(--text-secondary); }
+.rebuild-note code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--bg-page);
+  border: 1px solid var(--border-color);
+  font-size: 12px;
+}
+.bar.slim { height: 6px; margin-bottom: 6px; }
+.bar-fill.rebuild { background: var(--color-warning, #c47b1a); }
 .coverage-warn,
 .coverage-ok,
 .coverage-hint { margin: 0; font-size: 13px; line-height: 1.6; }
@@ -1345,6 +2467,43 @@ button.verdict-chip { border: 1px solid transparent; cursor: pointer; }
 .pg-gap { padding: 0 2px; color: var(--text-secondary); }
 .pager-hint { margin: var(--space-sm) 0 0; font-size: 12px; color: var(--text-secondary); }
 
+/* ── 质量 × 价值视图 ─────────────────────────────────── */
+.qv-filters { flex-direction: column; align-items: stretch; gap: var(--space-sm); }
+.qv-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.qv-head h3 { margin: 0; font-size: 14px; font-weight: 600; }
+.qv-role {
+  font-size: 12px;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: 10px;
+  padding: 1px 8px;
+}
+.qv-groups { display: flex; flex-wrap: wrap; gap: var(--space-lg); }
+.qv-group { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; }
+.qv-group-title {
+  margin: 0 0 4px;
+  width: 100%;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  letter-spacing: 0.3px;
+}
+.qv-group .field.inline input[type='number'] { width: 78px; }
+.qv-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--color-primary) 6%, transparent);
+  border-left: 2px solid var(--color-primary);
+  padding: 8px 10px;
+  border-radius: 4px;
+}
+.score.qv { color: var(--color-primary); }
+.scan-table td em.dim { font-style: normal; font-size: 11px; color: var(--text-secondary); margin-left: 2px; }
+.qv-note-line p { margin: 4px 0; }
+/* .reject-list 样式已随「被筛掉名单」展示一起移除（选股结果只放达标票） */
+
 .notes {
   margin: var(--space-md) 0 0;
   padding-left: 1.1rem;
@@ -1352,6 +2511,17 @@ button.verdict-chip { border: 1px solid transparent; cursor: pointer; }
   font-size: 12px;
   line-height: 1.7;
 }
+
+/* 选股表「信号」列徽标：调入（红）/持有（蓝） */
+.rules-badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 9px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.rules-badge.up { background: rgba(192, 57, 43, 0.12); color: var(--color-danger, #c0392b); }
+.rules-badge.flat { background: rgba(37, 99, 235, 0.1); color: var(--link-color, #2563eb); }
 
 @media (max-width: 768px) {
   .actions { margin-left: 0; width: 100%; }

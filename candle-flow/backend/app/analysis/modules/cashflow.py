@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pandas as pd
 
@@ -16,6 +18,106 @@ def _fmt_yi(value: float) -> str:
     """
     v = float(value or 0)
     return f"{v:.1f}" if abs(v) < 10 else f"{v:.0f}"
+
+
+# ── 分红含金量校验（股息率 > 5% 触发）─────────────────────────────
+#
+# 口径：覆盖率 = 自由现金流(FCF) / 当年现金分红额。分子分母同为「现金」口径，
+# 比值 < 1 表示当期分红超过主业当期自由现金流创造，只能靠存量现金/融资补足。
+#
+# 阈值必须行业差异化 —— 同一条绝对阈值对不同商业模式含义完全不同：
+#   · 周期类（农化制品/煤炭开采/油气开采/工业金属/化学原料）：盈利与资本开支
+#     随景气大幅波动，低谷年 FCF 天然为负，要求 0.6 倍等于在低谷年集体扣分。
+#   · 消费类（白酒Ⅱ/中药Ⅱ/一般零售/饮料乳品）：轻资产、现金流稳定且分红率高，
+#     若 FCF 覆盖不足 0.8 倍，基本可断定分红在消耗存量或依赖一次性收益。
+#   · 其余默认 0.60。
+#
+# **行业名必须精确匹配**（铁律16）：线上行业名来自申万三级（`白酒Ⅱ`/`中药Ⅱ`/
+# `农化制品`…），不是同义词表 —— 子串匹配会漏掉 `特钢Ⅱ` 这类不含上位词的名称。
+DIV_YIELD_TRIGGER_PCT = 5.0
+DIV_COVERAGE_THRESHOLD_CYCLE = 0.50
+DIV_COVERAGE_THRESHOLD_CONSUMER = 0.80
+DIV_COVERAGE_THRESHOLD_DEFAULT = 0.60
+DIV_COVERAGE_PENALTY_SEVERE = 15.0
+DIV_COVERAGE_PENALTY_MILD = 10.0
+DIV_COVERAGE_SEVERE_LINE = 0.30
+
+DIV_COVERAGE_CYCLE_INDUSTRIES = frozenset(
+    {"农化制品", "煤炭开采", "油气开采", "工业金属", "化学原料"}
+)
+DIV_COVERAGE_CONSUMER_INDUSTRIES = frozenset(
+    {"白酒Ⅱ", "中药Ⅱ", "一般零售", "饮料乳品"}
+)
+
+
+def _div_coverage_threshold(industry: str) -> float:
+    """按行业返回分红覆盖率阈值（精确匹配申万三级行业名）。"""
+    ind = str(industry or "").strip()
+    if ind in DIV_COVERAGE_CYCLE_INDUSTRIES:
+        return DIV_COVERAGE_THRESHOLD_CYCLE
+    if ind in DIV_COVERAGE_CONSUMER_INDUSTRIES:
+        return DIV_COVERAGE_THRESHOLD_CONSUMER
+    return DIV_COVERAGE_THRESHOLD_DEFAULT
+
+
+def check_dividend_coverage(
+    *,
+    dividend_yield: float | None,
+    fcf: float | None,
+    cash_dividend: float | None,
+    industry: str,
+) -> dict[str, float | bool | str | None]:
+    """分红含金量校验（股息率 > 5% 时触发）。
+
+    返回 ``{passed, penalty, threshold, coverage, reason}``；未触发或缺数据
+    一律 ``passed=True, penalty=0``（**缺字段放行**，不猜、不误伤）。
+
+    覆盖率取 ``FCF / 现金分红``；与存量 ``fcf_coverage_3y``（近3年累计FCF/
+    当年分红）是**两个不同口径**，此处按用户口径用**当年** FCF。
+    """
+    out: dict[str, float | bool | str | None] = {
+        "passed": True,
+        "penalty": 0.0,
+        "threshold": _div_coverage_threshold(industry),
+        "coverage": None,
+        "reason": "",
+    }
+    if dividend_yield is None or float(dividend_yield) <= DIV_YIELD_TRIGGER_PCT:
+        return out
+
+    th = out["threshold"]
+    assert isinstance(th, float)
+    # 分子为 0 = 数据缺失（铁律7），不得当成「覆盖率 0」直接扣分。
+    # 判据是 fcf/fcf 是否为 None **或 0**：FCF 恰好为 0 在真实财报里几乎不可能
+    # 出现（OCF 与 capex 完全相等），实践中 0 只来自「该年度现金流科目缺失、
+    # 被填充为 0」——把它当作「主业完全不造血」会误杀一批只是缺数据的标的。
+    if (
+        fcf is None
+        or cash_dividend is None
+        or float(fcf) == 0
+        or float(cash_dividend) <= 0
+    ):
+        out["reason"] = "分红覆盖率数据缺失，不判定"
+        return out
+
+    coverage = float(fcf) / float(cash_dividend)
+    out["coverage"] = round(coverage, 3)
+    if coverage >= th:
+        out["reason"] = "分红由主业自由现金流覆盖"
+        return out
+
+    penalty = (
+        DIV_COVERAGE_PENALTY_SEVERE
+        if coverage < DIV_COVERAGE_SEVERE_LINE
+        else DIV_COVERAGE_PENALTY_MILD
+    )
+    out["passed"] = False
+    out["penalty"] = penalty
+    out["reason"] = (
+        f"股息率{float(dividend_yield):.2f}%>5%，但分红/自由现金流覆盖率仅"
+        f"{coverage:.2f}倍（行业阈值{th:.2f}倍）"
+    )
+    return out
 
 
 class CashflowAnalyzer(BaseAnalyzer):
@@ -551,6 +653,45 @@ class CashflowAnalyzer(BaseAnalyzer):
                 )
             )
 
+        # ── 补丁一：分红含金量校验（股息率 > 5% 触发，行业差异化阈值）──────
+        #
+        # 与上面「分红含金量」（回溯3年、看非经常性损益占比与累计FCF覆盖）的
+        # 分工：那一条是**质量提示指标**，权重 1.5、不下调模块分；这一条是
+        # **直接扣分项**，只对「高股息」标的生效，专门拦「股息率很诱人、但当
+        # 期自由现金流根本覆盖不住当期分红」的伪红利。
+        #
+        # 为什么必须叠加扣分而不能只留提示：股息率 > 5% 的票在红利框架下会拿
+        # 到很高的估值分（`_dividend_valuation_factors` 里股息率利差权重 0.4），
+        # 只提示不足以约束综合分；而这类票正是最容易被当成「稳定红利资产」买入的。
+        #
+        # 防叠加（铁律3）：本项只降「现金流模块分」，且与 cashflow_veto /
+        # 微利稀释封顶 / 下限保护各自独立 —— 扣分发生在加权之后、封顶之前，
+        # 不参与三重计数；同时**只降不升**，不给任何模块加分。
+        _dy_v = kwargs.get("dividend_yield")
+        _div_check = check_dividend_coverage(
+            dividend_yield=float(_dy_v) if _dy_v is not None else None,
+            fcf=div_info2.get("fcf"),
+            cash_dividend=div_info2.get("cash_total"),
+            industry=str(kwargs.get("industry") or ""),
+        )
+        div_coverage_penalty = 0.0
+        div_coverage_meta: dict[str, Any] | None = None
+        if not _div_check["passed"]:
+            div_coverage_penalty = float(_div_check["penalty"] or 0.0)
+            div_coverage_meta = {
+                "dividend_yield": round(float(_dy_v), 2),
+                "coverage": _div_check["coverage"],
+                "threshold": _div_check["threshold"],
+                "penalty": div_coverage_penalty,
+                "industry": str(kwargs.get("industry") or ""),
+                "reason": _div_check["reason"],
+            }
+            warnings.append(
+                f"分红含金量校验未通过：{_div_check['reason']}；"
+                f"当期分红超出主业自由现金流创造，高股息可持续性存疑，"
+                f"现金流评分扣减 {div_coverage_penalty:.0f} 分"
+            )
+
         if len(ocf.dropna()) and ocf.iloc[-1] > 0:
             capex_ratio = float(capex.iloc[-1] / ocf.iloc[-1]) if ocf.iloc[-1] else 999.0
             if paper_wealth or single_loss_ocf:
@@ -917,6 +1058,16 @@ class CashflowAnalyzer(BaseAnalyzer):
         # 下限保护前的真实加权分：必须留痕，否则「模块分为何停在 52.0 不动」
         # 在报告里无法解释（原始加权可能远低于下限，指标级再加分也纹丝不动）。
         raw_module_score = round(module_score, 1)
+
+        # ── 补丁一：分红含金量校验扣分（股息率 > 5% 且 FCF 覆盖不住分红）──
+        # 位置刻意放在「下限保护之前」：本项是惩罚项，若放在保底之后会被
+        # healthy_working_capital(58) / distribution_expanding(52) 直接抹掉，
+        # 变成对这类标的完全无效的免检通道（铁律18）。
+        div_coverage_capped = False
+        if div_coverage_penalty > 0:
+            module_score -= div_coverage_penalty
+            div_coverage_capped = True
+
         floor_applied: str | None = None
         # ── 应收+存货双低 → 现金流评分保底 55-60（仅调分，不作为风险提示） ──
         if healthy_wc and module_score < 55.0:
@@ -964,6 +1115,10 @@ class CashflowAnalyzer(BaseAnalyzer):
                 "floor_applied": floor_applied,
                 "micro_profit_diluted": bool(micro_profit_diluted),
                 "micro_profit_cap_applied": bool(micro_profit_cap_applied),
+                # 补丁一留痕：分红含金量校验（股息率>5% 触发）的扣分明细。
+                # 无扣分时为 None，有扣分时给出覆盖率/阈值/行业/理由自证口径。
+                "dividend_coverage_penalty": div_coverage_penalty,
+                "dividend_coverage_check": div_coverage_meta,
                 "scoring_note": "；".join(_wc_note_parts) if _wc_note_parts else None,
             },
         )

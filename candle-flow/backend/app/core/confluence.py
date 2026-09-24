@@ -50,6 +50,36 @@ DIMENSION_BY_NAME: dict[str, Dimension] = {
 # 金叉/死叉新鲜度权重
 CROSS_WEIGHT_BY_AGE = {0: 1.0, 1: 0.8, 2: 0.8, 3: 0.8, 4: 0.5, 5: 0.5}
 
+# ── 核心共振白名单（量能 / 趋势 = 资金与方向的确认）─────────────────
+# 为什么需要这个白名单：``combined_score = 形态分 + effective*6``，
+# effective 上限 5.0（五维各留一项）→ 30 分。仅靠「被动项」凑数即可越过
+# 候选门槛（80）：实测 400 只样本中 10 只命中形如
+# ``['低点','布林','随机指标']``（空间位置 + 波动率 + 动量，**无任何资金或
+# 趋势确认**），形态分 85~90 经 +12~18 后达 86~108，被判「买入候选」。
+# 这正是用户所指的「凑单式共振」。
+#
+# 白名单口径：只有「资金进场」（放量/缩量回撤）与「方向确立」
+# （周线趋势/均线转多/金叉/上升趋势线）才是真共振的地基；
+# 位置类（低点/窗口/极性/回撤支撑）、波动率类（布林/波动率拐点）与
+# 单一动量读数（MACD/RSI/随机指标）都是**被动衍生量**，不能单独支撑一次
+# 「共振」定性。故规定：组合分达标之外，**必须含 ≥1 个白名单命中**。
+#
+# 注意：这不是「权重减半」。实测（400 只 A/B 对照）「非白名单减半」与
+# 「不减半」的候选集合**完全一致**（都是 43），减半只改数字不改档位；
+# 且「非白名单减半」会把含核心共振的样本（如
+# ``['MACD','周线趋势','均线支撑']``）从 85 压到 79 → **误杀真共振**。
+# 故本处**只加硬门槛，不改权重、不改 combined_score 数值**。
+CORE_RESONANCE_NAMES: frozenset[str] = frozenset({
+    # trend：方向确立
+    "周线趋势",
+    "均线转多",
+    "金叉",
+    "上升趋势线",
+    # volume：资金进场
+    "放量",
+    "缩量回撤",
+})
+
 # 同维度同权重时的优先级（越大越优先保留）
 HIT_PRIORITY: dict[str, int] = {
     "周线趋势": 50,
@@ -132,6 +162,22 @@ class ConfluenceResult:
     @property
     def ok(self) -> bool:
         return not self.blocked and self.effective_count >= MIN_HITS
+
+    @property
+    def core_resonance_hits(self) -> list[str]:
+        """命中的「核心共振」名称（量能/趋势），供候选门槛判定与文案自证。"""
+        self._ensure_finalized()
+        return [h.name for h in self.hits if h.name in CORE_RESONANCE_NAMES]
+
+    @property
+    def has_core_resonance(self) -> bool:
+        """是否至少含 1 个核心共振（资金进场或方向确立）。
+
+        仅有位置类（低点/窗口/极性/回撤支撑）、波动率类（布林/波动率拐点）
+        与单一动量读数（MACD/RSI/随机指标）的组合**不算真共振** —— 它们是
+        价格与指标的被动衍生量，不构成「资金 × 方向」的双重确认。
+        """
+        return bool(self.core_resonance_hits)
 
     @property
     def label(self) -> str:

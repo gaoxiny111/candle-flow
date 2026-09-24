@@ -201,7 +201,24 @@ class KlineService:
         low: float,
         close: float,
         volume: int,
+        allow_history_overwrite: bool = False,
     ) -> bool:
+        """写/更新一根 K 线。
+
+        ``allow_history_overwrite=False``（默认）时**拒绝覆盖已完成交易日**：
+        日线源的历史数据是权威值，只有当日 bar 允许被后续同步修正。
+        旧行为下 ``merge_today_spot`` 的盘中 spot 曾把 09-22 的正确收盘价
+        与成交量覆盖成 09:31 的实时快照（实测焦作万方 09-22 量 3805万→31.9万）。
+        历史回补脚本（``allow_history_overwrite=True``）是唯一例外。
+        """
+        if not allow_history_overwrite and d < trading_today():
+            logger.warning(
+                "refuse history overwrite for %s: bar_date=%s today=%s",
+                symbol,
+                d,
+                trading_today(),
+            )
+            return False
         existing = (
             self.db.query(KlineData)
             .filter(KlineData.symbol == symbol, KlineData.date == d)
@@ -242,10 +259,38 @@ class KlineService:
         latest = self.get_latest(symbol)
         return latest is None or latest.date < today
 
-    def merge_today_spot(self, symbol: str) -> bool:
-        """日线源常不含当天，用现价补一根今日 K 线（东财 / 腾讯 / 新浪）。"""
+    @staticmethod
+    def _is_after_close(now: datetime | None = None) -> bool:
+        """实时行情是否已可视为「今日日线」（收盘后）。
+
+        盘中（09:30~15:00）的 spot 是**未完成的当日快照**：close 是当时价、
+        volume 是当时累计量。把它写成日线会让 EMA/RSI/量比全部失真
+        （实测：焦作万方今日 09:31 写入假 bar close=11.21，真实午盘 10.94；
+        全库 09-23 均量因此塌 -95%）。所以只允许 15:00 之后合并。
+
+        用 ``Asia/Shanghai`` 而非服务器本地时区（线上是 UTC，否则 15:00
+        会被判成 07:00 之前）。
+        """
+        from app.services.akshare_client import CN_TZ
+
+        now = now or datetime.now(CN_TZ)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=CN_TZ)
+        now = now.astimezone(CN_TZ)
+        return (now.hour, now.minute) >= (15, 0)
+
+    def merge_today_spot(self, symbol: str, force: bool = False) -> bool:
+        """日线源常不含当天，**收盘后**用现价补一根今日 K 线（东财 / 腾讯 / 新浪）。
+
+        两条硬约束（防盘中污染）：
+        1. 仅在 **15:00 之后** 调用（``force=True`` 可绕过，仅供离线回补脚本）；
+        2. **绝不回写已完成交易日** —— ``spot_date < trading_today()`` 直接拒绝，
+           否则会把历史日（如 09-22）的正确收盘/成交量覆盖成实时快照。
+        """
         today = trading_today()
         if not is_cn_weekday(today):
+            return False
+        if not force and not self._is_after_close():
             return False
         spot = akshare_client.fetch_spot(symbol)
         if not spot:
@@ -263,8 +308,23 @@ class KlineService:
             )
             return False
         latest = self.get_latest(symbol)
+        # 历史数据保护：spot 只能写「今天」，不能回头改已完成交易日。
+        if spot_date < today:
+            logger.warning(
+                "refuse to overwrite finished session for %s: spot_date=%s today=%s",
+                symbol,
+                spot_date,
+                today,
+            )
+            return False
         vol = int(spot["volume"] or 0)
-        if latest and latest.volume and vol > 0 and vol * 50 < int(latest.volume):
+        # 量纲对齐：日线源的成交量单位是「手」，部分 spot 通道返回「股」，差 100 倍。
+        # 判据必须是「与昨日量的**量级**差 100 倍」而不是「差 50 倍就乘」——
+        # 旧实现写 `vol * 50 < latest.volume`，对「今日缩量到 1%」的正常情形会
+        # 误判为量纲不符并乘 100，把**真实成交量灌水 100 倍**（实测线上 09-22：
+        # 3048 只中 1212 只（39.8%）的当日量被放大到 100 倍，avg 冲高到
+        # 一个量级失真的 3794 万/50.6 亿）。改为「小于昨日量的 1%」才补乘。
+        if latest and latest.volume and vol > 0 and vol < int(latest.volume) / 100:
             vol *= 100
         # Keep previous volume when spot reports 0 but we already have today's bar.
         if vol <= 0 and latest and latest.date == spot_date:
@@ -311,6 +371,7 @@ class KlineService:
 
         if df is None or df.empty:
             if self.get_latest(symbol) is not None:
+                # merge_today_spot 自带收盘门槛，盘中会直接返回 False。
                 self.merge_today_spot(symbol)
                 if hist_error and not self.get_latest(symbol):
                     raise hist_error
@@ -337,6 +398,7 @@ class KlineService:
                 float(row["low"]),
                 float(row["close"]),
                 int(float(row["volume"])),
+                allow_history_overwrite=True,  # 日线源是历史数据的权威值
             )
             if created:
                 count += 1

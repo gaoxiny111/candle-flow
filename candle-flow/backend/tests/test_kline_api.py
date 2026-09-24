@@ -14,6 +14,7 @@ from app.api.v1 import kline as kline_api
 from app.database import Base, get_db
 from app.models.kline import KlineData
 from app.services import akshare_client as ak_mod
+from app.services.kline_service import KlineService
 
 
 def _client() -> tuple[TestClient, sessionmaker]:
@@ -83,7 +84,14 @@ def test_kline_backfills_missing_history_when_stale(monkeypatch):
             [(date(2026, 8, 28), 1450.0), (date(2026, 8, 31), 1462.0), (date(2026, 9, 1), 1470.0)]
         ),
     )
-    # 盘中实时价补今天 9/2
+    # 盘中实时价补今天 9/2（注意：merge_today_spot 只在 15:00 后允许合并，
+    # 见 kline_service._is_after_close —— 盘中 spot 是未完成快照，会污染日线）。
+    # 本用例测「图表陈旧时能补今日 bar」，因此把时钟推到收盘后。
+    monkeypatch.setattr(
+        KlineService,
+        "_is_after_close",
+        staticmethod(lambda now=None: True),
+    )
     monkeypatch.setattr(
         ak_mod.akshare_client,
         "fetch_spot",

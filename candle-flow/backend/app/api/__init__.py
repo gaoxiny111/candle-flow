@@ -11,6 +11,7 @@ from app.api.v1 import (
     pay,
     risk,
     signals,
+    strategies,
     symbols,
     system,
     ws,
@@ -26,6 +27,7 @@ api_router.include_router(fundamentals.router, tags=["fundamentals"])
 api_router.include_router(holdings.router, tags=["holdings"])
 api_router.include_router(patterns.router, tags=["patterns"])
 api_router.include_router(signals.router, tags=["signals"])
+api_router.include_router(strategies.router, tags=["strategies"])
 api_router.include_router(risk.router, tags=["risk"])
 api_router.include_router(system.router, tags=["system"])
 api_router.include_router(pay.router, tags=["pay"])

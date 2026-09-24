@@ -14,6 +14,8 @@ from app.core.bull_tactics import is_st_name
 from app.core.confluence import SoftConflict, evaluate_confluence
 from app.core.nison_rules import LEFT_SIDE_BULLISH, WESTERN_NOT_CANDLES
 from app.core.pattern_engine import PatternEngine, kline_to_candles
+from app.core.right_side import detect_right_side
+from app.services.market_flow import fetch_market_flow, flow_of
 from app.database import SessionLocal
 from app.models.stock import StockInfo
 from app.services.fundamental_screen import (
@@ -54,9 +56,17 @@ ROE_MIN = 5.0  # 过低盈利能力（如 ROE 1.5%）剔除
 PROFIT_YOY_MIN = -30.0  # 最新净利同比暴跌剔除
 PE_MAX = 80.0  # 估值极端（PE>80 且为正）剔除
 CACHE_TTL_SEC = 600
-CACHE_VERSION = 6
+# 8：观察池改造——enrichment 新增 tech_state/right_side（右侧信号检测），
+# _extract_fundamental_fields 新增 dividend_yield。旧缓存缺这些字段，必须失效重算。
+# 9：新增 macd_bullish 辅助确认字段（B 方案落地：MACD 纳入、量能降级为展示）。
+# 10：趋势反转判据重做为「三步 N 字结构」（破局→回踩→起爆 + 3日原则/均线MACD
+# 共振），取代旧的 EMA 金叉+RSI（旧判据把超跌反弹误判成趋势反转，焦作万方
+# 000612 实测证伪）；enrichment 新增 nshape_stage/nshape_detail/breakout_gap_days/
+# pullback_days/pullback_shrink/boom_gap_days/ma_bullish/main_flow_net。
+# 旧缓存缺这些字段，必须失效重算。
+CACHE_VERSION = 10
 
-Outcome = Literal["hit", "ok", "skipped", "error"]
+Outcome = Literal["hit", "ok", "skipped", "error", "left_side_blocked", "weak_resonance"]
 Tier = Literal["A", "B", "C", "D", "E"]
 ProgressCb = Callable[[int, int, str], None]
 
@@ -78,11 +88,37 @@ def _combined_score(pattern_score: float, effective: float, soft_items: list[Sof
     return score
 
 
-def _is_candidate(pattern_score: float, effective: float, soft_items: list[SoftConflict]) -> bool:
+def _is_candidate(
+    pattern_score: float,
+    effective: float,
+    soft_items: list[SoftConflict],
+    core_hits: list[str] | None = None,
+) -> bool:
+    """是否够格「买入候选」。
+
+    两道关：
+      1. **软冲突**：``emotion_extreme`` / ``structure_flaw``（含左侧超跌防守）
+         任一命中即出局；
+      2. **核心共振白名单**：组合分 ≥ ``CANDIDATE_COMBINED`` **且** 至少含 1 个
+         「量能/趋势」类核心共振（``confluence.CORE_RESONANCE_NAMES``）。
+
+    为什么必须有第 2 道关：``combined_score = 形态分 + effective*6``，effective
+    上限 5.0（30 分），仅靠位置类 + 波动率类 + 单一动量读数即可从形态分 85
+    凑到 100+ 越过门槛。实测 400 只样本中 10 只形如
+    ``['低点','布林','随机指标']`` 的纯被动组合被判候选，正是「凑单式共振」；
+    加白名单后这 10 只全部拦下，而含 ``周线趋势/放量/缩量回撤/均线转多``
+    的样本零误杀（A/B 实测候选 53 → 43）。
+
+    ``core_hits=None``（未传）时退化为旧行为，保证既有单测与其他调用方不变。
+    """
     for sc in soft_items:
         if sc.kind in ("emotion_extreme", "structure_flaw"):
             return False
-    return _combined_score(pattern_score, effective, soft_items) >= CANDIDATE_COMBINED
+    if _combined_score(pattern_score, effective, soft_items) < CANDIDATE_COMBINED:
+        return False
+    if core_hits is not None and not core_hits:
+        return False
+    return True
 
 
 def _tier_of(fundamental_score: float) -> Tier:
@@ -393,6 +429,8 @@ def _extract_fundamental_fields(result: dict[str, Any]) -> dict[str, Any]:
         ),
         "cycle_trap_note": (result.get("valuation") or {}).get("cycle_trap_note"),
         "is_growth_stock": bool((result.get("valuation") or {}).get("is_growth_stock")),
+        # 股息率：市场段自带（无分红数据时为 None，读层显示 —，不阻塞筛选）
+        "dividend_yield": market.get("dividend_yield"),
     }
 
 
@@ -557,9 +595,24 @@ class MarketConfluenceService:
                     for sc in conf.soft_conflict_items
                     if sc.kind == "structure_flaw" and "左侧超跌形态" in sc.message
                 ]
-                if not _is_candidate(float(r.score), conf.effective_count, conf.soft_conflict_items):
+                if not _is_candidate(
+                    float(r.score),
+                    conf.effective_count,
+                    conf.soft_conflict_items,
+                    conf.core_resonance_hits,
+                ):
                     if diag is not None and left_side_flaws:
                         diag["left_side_blocked"] = left_side_flaws[0].message
+                    elif (
+                        diag is not None
+                        and not conf.core_resonance_hits
+                        and _combined_score(
+                            float(r.score), conf.effective_count, conf.soft_conflict_items
+                        ) >= CANDIDATE_COMBINED
+                    ):
+                        # 组合分够格但无核心共振（量能/趋势）→ 记「凑数被拦」，
+                        # 供读层区分「本来就没形态」与「有形态但共振质量不足」。
+                        diag["weak_resonance_blocked"] = conf.label or "无核心共振"
                     continue
                 combined = _combined_score(float(r.score), conf.effective_count, conf.soft_conflict_items)
                 if combined <= best_score:
@@ -591,6 +644,10 @@ class MarketConfluenceService:
             # 入选失败但确实被左侧防守拦下 → 诊断出参留给 _overlay_one 用
             if diag is not None and diag.get("left_side_blocked"):
                 return None, "left_side_blocked"
+            # 有达标形态但与「决策」口径不符（无核心共振）→ 单列状态，
+            # 避免读层把「共振质量不足」误读成「形态逻辑坏了」。
+            if diag is not None and diag.get("weak_resonance_blocked"):
+                return None, "weak_resonance"
             return None, "ok"
         except Exception as exc:
             logger.debug("market confluence scan failed for %s: %s", job.symbol, exc)
@@ -798,6 +855,20 @@ class MarketConfluenceService:
             progress(len(universe), len(universe), "prescreen")
 
         # ── 第二层：对合格股跑完整基本面分析 ──
+        # 资金面快照：一次拉全市场（东财 datacenter，约 11 请求 / 3.5s），
+        # 供 enrichment 展示「当日主力净流入」。**仅展示不进判据**（铁律 13）。
+        # 失败不影响扫描（返回空表 → main_flow_net 全为 None）。
+        _flow_table: dict[str, Any] = {}
+        try:
+            _flow_table = fetch_market_flow(days=1)
+            logger.info(
+                "market flow prefetch: %d symbols @ %s",
+                len(_flow_table.get("latest") or {}),
+                _flow_table.get("dates"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("market flow prefetch failed: %s", exc)
+
         fund_scores: dict[str, dict[str, Any]] = {}
         fund_symbols = [sym for sym, _ in qualified_universe]
         total = len(fund_symbols)
@@ -874,6 +945,7 @@ class MarketConfluenceService:
                 "profit_yoy": profit_yoy,
                 "roe": fund.get("roe"),
                 "debt_ratio": fund.get("debt_ratio"),
+                "dividend_yield": fund.get("dividend_yield"),
                 "fund_modules": {
                     "profitability": fund.get("profitability"),
                     "growth": fund.get("growth"),
@@ -881,6 +953,52 @@ class MarketConfluenceService:
                     "valuation": fund.get("valuation_score"),
                 },
             }
+            # ── 观察池右侧信号标记（读本地 K 线，不设技术面门槛，铁律 14：只标记不打脸）──
+            try:
+                kl, _bar_count = KlineService(self.db).get_recent_klines(sym, limit=180)
+                # 资金面：当日主力净流入，**仅展示不进判据**（铁律 13）。
+                # 取不到时传 None，判据不受影响。
+                flow_row = flow_of(sym, _flow_table) if _flow_table else None
+                mf = (
+                    None
+                    if flow_row is None or flow_row.get("main") is None
+                    else float(flow_row["main"])
+                )
+                rs = detect_right_side(kl, main_flow=mf)
+                enriched["tech_state"] = rs.tech_state
+                enriched["right_side"] = rs.signals
+                enriched["right_side_detail"] = rs.detail
+                enriched["rsi14"] = round(rs.rsi14, 1) if rs.rsi14 is not None else None
+                # MACD / 均线辅助确认：只展示，不做准入门槛（量能维度实测会
+                # 砍掉高分优质股，见 core/right_side.py docstring 第 6、7 条）。
+                enriched["macd_bullish"] = rs.macd_bullish
+                enriched["ma_bullish"] = rs.ma_bullish
+                # ── 三步 N 字结构明细（自证：卡在哪一步、各步数值）──
+                enriched["nshape_stage"] = rs.nshape_stage
+                enriched["nshape_detail"] = rs.nshape_detail
+                enriched["breakout_gap_days"] = rs.breakout_gap_days
+                enriched["pullback_days"] = rs.pullback_days
+                enriched["pullback_shrink"] = (
+                    round(rs.pullback_shrink, 2) if rs.pullback_shrink is not None else None
+                )
+                enriched["boom_gap_days"] = rs.boom_gap_days
+                # 资金面只展示（铁律 13：不进分、不作门槛）
+                enriched["main_flow_net"] = mf
+            except Exception as exc:
+                logger.debug("right-side detect failed for %s: %s", sym, exc)
+                enriched["tech_state"] = "数据不足"
+                enriched["right_side"] = []
+                enriched["right_side_detail"] = "K线读取失败"
+                enriched["rsi14"] = None
+                enriched["macd_bullish"] = False
+                enriched["ma_bullish"] = False
+                enriched["nshape_stage"] = ""
+                enriched["nshape_detail"] = "K线读取失败"
+                enriched["breakout_gap_days"] = None
+                enriched["pullback_days"] = None
+                enriched["pullback_shrink"] = None
+                enriched["boom_gap_days"] = None
+                enriched["main_flow_net"] = None
             enriched_items.append(enriched)
 
         # 按基本面评分分层 A/B/C/D/E
@@ -911,10 +1029,11 @@ class MarketConfluenceService:
             "cached": False,
             "cache_age_sec": 0,
             "description": (
-                "基本面预筛 → 完整基本面分析 → 按评分分层；"
+                "基本面打底观察池：排雷预筛 → 完整基本面分析 → 按评分分层；"
                 f"全量 {prescreen_stats['total']} 只 → 基本面合格 {prescreen_stats['qualified']} 只 → "
                 f"展示 {len(items)} 只；"
-                "分层 A(≥85)/B(70-84)/C(55-69)/D(40-54)/E(<40)"
+                "分层 A(≥85)/B(70-84)/C(55-69)/D(40-54)/E(<40)；"
+                "技术面不设门槛，仅标记多头/空头状态与右侧信号（EMA12金叉+RSI≥50 / 周线平台突破+量2倍）"
             ),
         }
         _cache["ts"] = now
