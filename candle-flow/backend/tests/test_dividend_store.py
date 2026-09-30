@@ -89,7 +89,7 @@ def test_attach_profiles_merges_into_light_rows():
     hit = ds.attach_profiles(rows, db)
     assert hit == 1
     assert rows[0]["div_years"] == 25 and rows[0]["dps_3y_avg"] == pytest.approx(27.6)
-    # div_latest_fy 是「档案新鲜度闸门」（market_scan.hd_required_fy）的输入，
+    # div_latest_fy 是「档案新鲜度闸门」（high_dividend.hd_required_fy）的输入，
     # 漏写会让闸门恒判「档案年度缺」→ 整张名单清空，故必须由测试钉住。
     assert rows[0]["div_latest_fy"] == 2025
     # 无档案的行不得被写入任何键（缺失 != 0，判据按「缺数据」处理）

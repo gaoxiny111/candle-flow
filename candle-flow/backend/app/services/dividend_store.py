@@ -189,7 +189,7 @@ def attach_profiles(rows: list[dict[str, Any]], db: Session | None = None) -> in
     ``div_latest_fy``（档案最新会计年度）是「真高股息」判据的**新鲜度闸门**输入：
     分红记录停更的标的（股价崩塌型，如金科股份 latest_fy=2020 却因分母塌陷显示
     36.58% 股息率）必须按「缺数据」处理，不能凭冻结的历史每股分红入选。
-    判据侧见 ``market_scan.hd_required_fy``。
+    判据侧见 ``high_dividend.hd_required_fy``。
     """
     profiles = load_all(db)
     if not profiles:

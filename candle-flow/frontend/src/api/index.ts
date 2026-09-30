@@ -794,6 +794,48 @@ export const fetchFundamentalPool = async () => {
   return { data: checkApi(res) }
 }
 
+export interface HighDividendItem {
+  code: string
+  symbol: string
+  name: string
+  price?: number | null
+  avg_div_yield_5y?: number | null
+  consecutive_div_years?: number | null
+  last_year_div?: number | null
+  pe_ttm?: number | null
+  pb?: number | null
+  market_cap?: number | null
+  market_cap_yi?: number | null
+}
+
+export interface HighDividendReport {
+  count: number
+  total_matched?: number
+  scanned?: number
+  universe?: string
+  pool_note?: string
+  cached?: boolean
+  items: HighDividendItem[]
+  notes?: string[]
+  thresholds?: Record<string, number>
+}
+
+export const fetchHighDividend = (params?: {
+  universe?: 'csi_div' | 'all'
+  top?: number
+  limit?: number
+  refresh?: boolean
+}) =>
+  api.get<ApiResponse<HighDividendReport>>('/fundamentals/high-dividend', {
+    params: {
+      universe: params?.universe ?? 'csi_div',
+      top: params?.top ?? 50,
+      limit: params?.limit,
+      refresh: params?.refresh ?? false,
+    },
+    timeout: 300000,
+  })
+
 export interface WatchFundamental {
   symbol: string
   name: string

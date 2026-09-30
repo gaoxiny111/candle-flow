@@ -41,6 +41,12 @@ const router = createRouter({
       meta: { title: '主板战法', requiresAuth: false },
     },
     {
+      path: '/high-dividend',
+      name: 'high-dividend',
+      component: () => import('@/views/HighDividendView.vue'),
+      meta: { title: '高股息选股', requiresAuth: false },
+    },
+    {
       // 基本面榜单功能已下线；保留旧路径重定向，避免历史链接 404
       path: '/market-scan',
       redirect: '/',

@@ -172,3 +172,25 @@ def run_screen(body: ScreenRequest, db: Session = Depends(get_db)):
     )
 
 
+@router.get("/fundamentals/high-dividend")
+def get_high_dividend(
+    universe: str = Query(default="csi_div", pattern="^(csi_div|all)$"),
+    top: int = Query(default=50, ge=1, le=500),
+    limit: int | None = Query(default=None, ge=1, le=500),
+    refresh: bool = Query(default=False),
+):
+    """高股息选股（AkShare：行情 + 分红历史 → 多条件过滤）。"""
+    from app.services.high_dividend import scan_high_dividend
+
+    try:
+        data = scan_high_dividend(
+            universe=universe,
+            limit=limit,
+            refresh=refresh,
+            top=top,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"高股息筛选失败：{e}") from e
+    return ApiResponse(data=data)
+
+
