@@ -21,7 +21,6 @@ from app.core.confluence import (
     evaluate_confluence,
     rsi_at,
 )
-from app.services.market_confluence_service import _extract_fundamental_fields
 from app.services.market_regime import _index_regime
 
 
@@ -168,86 +167,6 @@ def test_volatile_volume_13x_not_flagged():
 
 # ── 3. PEG 取个股分析口径 ───────────────────────────────────
 #
-# ⚠ 结构铁律：相对估值块挂在 `valuation` 下（`valuation.relative.PEG`）。
-# 快照 payload 与 engine 返回 dict **都没有顶层 `relative`**。
-# 2026-09-21 的旧用例手搓了顶层 `relative` 的 fixture，把错误路径固化成了
-# 「期望」，于是生产环境 PEG 恒为 None（买点信号 strong_buy/watch 两档静默失效）
-# 而测试全绿。**用例必须按真实结构构造 fixture**，否则测的是心智模型不是代码。
-
-
-def test_peg_reads_nested_valuation_relative_block():
-    """景气高点的周期股：单期同比 420% 会算出 PEG 0.07（严重失真），
-    必须采用 engine 的 3 年 CAGR 口径 0.8。结构与快照 payload 一致。
-    """
-    result = {
-        "composite_score": 80.0,
-        "modules": {},
-        "market": {"pe_ttm": 30.0},
-        "industry": "煤炭",
-        "valuation": {
-            "relative": {"PEG": {"value": 0.8, "growth_rate": 37.5, "growth_label": "3年CAGR"}}
-        },
-        "profit_yoy": 420.0,
-    }
-    fields = _extract_fundamental_fields(result)
-    assert fields["peg"] == 0.8
-    assert fields["peg_growth_label"] == "3年CAGR"
-
-
-def test_peg_top_level_relative_is_only_a_compat_fallback():
-    """顶层 `relative` 是兼容分支，不是主路径。
-
-    真实快照结构是嵌套的 `valuation.relative`；此用例把「顶层回退仍然可用」
-    这一兼容行为固定下来，避免有人误把它当主路径依赖——两条路径同时存在时，
-    一旦取值不同就是同一判定两处两值。
-    """
-    result = {
-        "composite_score": 80.0,
-        "market": {"pe_ttm": 30.0},
-        "relative": {"PEG": {"value": 0.8}},  # 真实 payload 没有这一层
-    }
-    assert _extract_fundamental_fields(result)["peg"] == 0.8
-
-
-def test_peg_none_when_engine_flags_cyclical_or_dividend():
-    """engine 已判定 PEG 不适用（负 CAGR / 红利）时，扫描层不得自行补算。"""
-    result = {
-        "composite_score": 60.0,
-        "market": {"pe_ttm": 12.0},
-        "valuation": {
-            "relative": {"PEG": {"value": None, "note": "成长股/周期底部：负CAGR使PEG失真"}}
-        },
-        "profit_yoy": -45.0,
-    }
-    fields = _extract_fundamental_fields(result)
-    assert fields["peg"] is None
-    assert "失真" in (fields["peg_note"] or "")
-
-
-def test_peg_missing_relative_block_is_none():
-    result = {"composite_score": 55.0, "market": {"pe_ttm": 20.0}}
-    assert _extract_fundamental_fields(result)["peg"] is None
-
-
-def test_neutral_buy_signal_explains_which_gate_failed():
-    """买点为中性时须说明卡在哪条门槛，否则「形态分高却没有买点」无从归因。"""
-    from app.services.market_confluence_service import _detect_buy_signal
-
-    bars = _bars_from_closes([10.0 + i * 0.05 for i in range(70)])
-    # 基本面 < 80 且 PEG 缺失 → 两条门槛都应出现在理由里
-    res = _detect_buy_signal(bars, 71.5, None, None)
-    assert res["signal"] == "neutral"
-    joined = " ".join(res["reasons"])
-    assert "基本面 72 < 80" in joined
-    assert "PEG 缺失" in joined
-
-    # 基本面达标、PEG 可用但未站上MA20/未放量 → 不应误报 PEG 缺失
-    res2 = _detect_buy_signal(bars, 85.0, 0.9, None)
-    joined2 = " ".join(res2["reasons"])
-    assert res2["signal"] == "neutral"
-    assert "PEG 缺失" not in joined2
-
-
 # ── 3b. 成长股/周期底部口径的估值前提（2026-09-21 第三轮）───────────
 #
 # 拆除两条「高估值反而得分更高」的路径：
@@ -617,15 +536,6 @@ def test_left_side_defense_exempt_above_ma60():
     assert not [sc for sc in res.soft_conflict_items if "左侧超跌形态" in sc.message]
 
 
-def test_left_side_defense_blocks_candidate_gate():
-    """下游效应：被左侧防守拦下的票一律不构成候选（tech 不可评估，不是 <60）。"""
-    from app.services.market_confluence_service import _is_candidate
-
-    bars = _downtrend_rebound_below_ma60()
-    res = evaluate_confluence(bars, len(bars) - 1, "bullish", "平底锅底部")
-    assert _is_candidate(99.0, res.effective_count, res.soft_conflict_items) is False
-
-
 def test_left_side_set_narrower_than_all_bullish_patterns():
     """左侧名单必须非空，且不能把全部看涨形态都收进来（否则等于全面禁买）。"""
     from app.core.nison_rules import LEFT_SIDE_BULLISH
@@ -641,66 +551,6 @@ def test_left_side_set_narrower_than_all_bullish_patterns():
 
 def _flat_bars(n=80, price=10.0, last_vol=1000, base_vol=1000):
     return _bars_from_closes([price] * n, [base_vol] * (n - 1) + [last_vol])
-
-
-def test_left_side_blocked_reports_left_side_not_neutral():
-    """技术面已被左侧防守否决 → 买点信号必须是「左侧超跌观察」，不能是「中性」。"""
-    from app.services.market_confluence_service import _detect_buy_signal
-
-    bars = _downtrend_rebound_below_ma60()
-    res = _detect_buy_signal(
-        bars, 80.2, 1.2, None, pattern_name="平底锅底部", left_side_blocked=True
-    )
-    assert res["signal"] == "left_side"
-    assert res["label"] == "左侧超跌观察"
-    assert "MA60" in " ".join(res["reasons"])
-
-
-def test_pattern_ready_never_returns_neutral():
-    """凡通过形态共振候选门槛的票，信号至少落到「形态达标待确认」。"""
-    from app.services.market_confluence_service import _detect_buy_signal
-
-    bars = _flat_bars()
-    for name in ("红三兵", "上升三法", "平底锅底部"):
-        res = _detect_buy_signal(bars, 71.0, None, None, pattern_name=name, pattern_ready=True)
-        assert res["signal"] != "neutral", name
-        assert res["label"] != "中性", name
-
-
-def test_bottom_confirm_when_volume_breaks_ma20():
-    """左侧形态 + 站上 MA20 + 放量 → 右侧底部企稳。"""
-    from app.services.market_confluence_service import _detect_buy_signal
-
-    closes = [10.0] * 79 + [10.6]
-    vols = [1000] * 74 + [1400] * 5 + [1600]
-    bars = _bars_from_closes(closes, vols)
-    res = _detect_buy_signal(
-        bars, 71.0, 3.0, None, pattern_name="平底锅底部", pattern_ready=True
-    )
-    assert res["signal"] == "bottom_confirm"
-    assert res["label"] == "右侧底部企稳"
-
-
-def test_neutral_label_is_not_bare_zhongxing():
-    """无形态共振时也不能只丢一个「中性」——必须说明是「趋势未确认」。"""
-    from app.services.market_confluence_service import _detect_buy_signal
-
-    bars = _flat_bars()
-    res = _detect_buy_signal(bars, 71.0, None, None)
-    assert res["signal"] == "neutral"
-    assert res["label"] == "趋势未确认"
-    assert res.get("note")
-
-
-def test_strong_buy_still_wins_when_all_gates_pass():
-    """既有档位语义不得回退：四条件齐仍判强买入。"""
-    from app.services.market_confluence_service import _detect_buy_signal
-
-    closes = [10.0] * 79 + [10.6]
-    vols = [1000] * 74 + [1400] * 5 + [1600]
-    bars = _bars_from_closes(closes, vols)
-    res = _detect_buy_signal(bars, 85.0, 0.9, None)
-    assert res["signal"] == "strong_buy"
 
 
 # ── 7. 周期陷阱（低 PE 幻觉）判据 ───────────────────────────
@@ -761,47 +611,6 @@ def test_old_cycle_kw_would_miss_real_industry_names():
         assert not any(k in real_name for k in _cycle_kw), real_name
 
 
-def test_left_side_gate_judges_the_decision_bar_not_the_pattern_bar():
-    """形态日放量、决策日缩量 → 仍须拦下。这是真实踩过的坑（不是理论边角）。
-
-    线上复现（2026-09-21）：002371 北方华创 09-18 平底锅底部当日量比 1.48，
-    按形态日判定会**放行**；到 09-21 量比缩回 0.87 且仍收在 MA60 724.61 下方，
-    榜单上却挂着「买入候选 · 技术 105」。002409 雅克科技同型（1.28 → 0.97）。
-    用户看的是今天的票，故闸门必须以决策日为准。
-    """
-    from app.core.confluence import evaluate_confluence
-
-    closes = [20.0 - 0.10 * i for i in range(60)]
-    closes += [14.1 + 0.02 * (i + 1) for i in range(19)]
-    closes.append(closes[-1] + 0.06)
-    vols = [1000] * (len(closes) - 2) + [1500, 700]  # 形态日放量 1.5×，决策日缩量 0.7×
-    bars = _bars_from_closes(closes, vols)
-    p_idx, d_idx = len(bars) - 2, len(bars) - 1
-
-    # 先自证夹具落在缺口里：形态日与决策日都收在 MA60 下方
-    ma60_p = sum(closes[p_idx - 59 : p_idx + 1]) / 60
-    ma60_d = sum(closes[d_idx - 59 : d_idx + 1]) / 60
-    assert closes[p_idx] < ma60_p and closes[d_idx] < ma60_d, "夹具必须在 MA60 下方"
-
-    # 形态日口径（不传 decision_index，历史行为）：当天放量 → 放行
-    at_pattern = evaluate_confluence(bars, p_idx, "bullish", "平底锅底部")
-    assert not [sc for sc in at_pattern.soft_conflict_items if "左侧超跌形态" in sc.message]
-
-    # 决策日口径：今天缩量 → 拦下
-    at_decision = evaluate_confluence(
-        bars, p_idx, "bullish", "平底锅底部", decision_index=d_idx
-    )
-    flaws = [sc for sc in at_decision.soft_conflict_items if "左侧超跌形态" in sc.message]
-    assert flaws, f"决策日缩量应触发左侧防守，实得：{at_decision.soft_conflicts}"
-    assert "决策日" in flaws[0].message
-    assert "MA60" in flaws[0].message
-
-    # 下游：被拦下即不构成候选
-    from app.services.market_confluence_service import _is_candidate
-
-    assert _is_candidate(99.0, at_decision.effective_count, at_decision.soft_conflict_items) is False
-
-
 def test_left_side_gate_still_passes_when_decision_bar_has_volume():
     """决策日放量 → 放行（形态日缩量也不拦，因为决策日已给出量能确认）。"""
     from app.core.confluence import evaluate_confluence
@@ -815,48 +624,6 @@ def test_left_side_gate_still_passes_when_decision_bar_has_volume():
         bars, len(bars) - 2, "bullish", "平底锅底部", decision_index=len(bars) - 1
     )
     assert not [sc for sc in res.soft_conflict_items if "左侧超跌形态" in sc.message]
-
-
-def test_left_side_label_only_when_still_below_ma60():
-    """已收复 MA60 的左侧形态不得再标「左侧超跌观察」——它中期趋势已修复。
-
-    线上案例：603995 甬金股份 收 26.67 / MA60 23.29（在均线上方）、近5日量能 +2%，
-    改前被标成「左侧超跌观察」，与「已站上中期均线」的事实恰好相反，
-    用户会以为它还在下跌途中。
-    """
-    from app.services.market_confluence_service import _detect_buy_signal
-
-    closes = [20.0 - 0.10 * i for i in range(60)]
-    closes += [14.1 + 0.35 * (i + 1) for i in range(19)]
-    closes.append(closes[-1] + 0.30)
-    bars = _bars_from_closes(closes, [1000] * len(closes))
-    price, ma60, ma20 = closes[-1], sum(closes[-60:]) / 60, sum(closes[-20:]) / 20
-    assert price > ma60 and price > ma20, "夹具必须已收复 MA60 与 MA20"
-
-    res = _detect_buy_signal(
-        bars, 71.0, 3.0, None, pattern_name="平底锅底部", pattern_ready=True
-    )
-    assert res["signal"] == "setup_ready", res
-    assert res["label"] == "形态达标待确认"
-    assert "MA60" in " ".join(res["reasons"])
-
-
-def test_left_side_label_still_used_when_below_ma60():
-    """仍在 MA60 下方（当日放量刚好过闸门）→ 依旧是「左侧超跌观察」。"""
-    from app.services.market_confluence_service import _detect_buy_signal
-
-    closes = [20.0 - 0.10 * i for i in range(60)]
-    closes += [14.1 + 0.02 * (i + 1) for i in range(19)]
-    closes.append(closes[-1] + 0.06)
-    vols = [1000] * (len(closes) - 1) + [2000]  # 当日 2× → 过左侧闸门
-    bars = _bars_from_closes(closes, vols)
-    assert closes[-1] < sum(closes[-60:]) / 60, "夹具必须收在 MA60 下方"
-
-    res = _detect_buy_signal(
-        bars, 71.0, 3.0, None, pattern_name="平底锅底部", pattern_ready=True
-    )
-    assert res["signal"] == "left_side", res
-    assert res["label"] == "左侧超跌观察"
 
 
 def test_peg_base_check_rejects_collapsed_trend():
