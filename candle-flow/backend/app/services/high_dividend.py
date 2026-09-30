@@ -51,6 +51,16 @@ def _normalize_code(raw: Any) -> str:
     return digits[-6:].zfill(6) if digits else ""
 
 
+def _is_hs_a_code(code: str) -> bool:
+    """沪深 A 股（含创业板/科创板）；排除北交所 4/8/92 开头。"""
+    c = str(code or "").zfill(6)
+    if c.startswith(("4", "8")):
+        return False
+    if c.startswith("92"):
+        return False
+    return c.startswith(("00", "30", "60", "68"))
+
+
 def _spot_from_em() -> pd.DataFrame:
     """用户脚本主路径：东财全 A 快照（含 PE/PB/总市值）。"""
     import akshare as ak
@@ -126,6 +136,7 @@ def _fetch_spot() -> pd.DataFrame:
     df = df[keep].copy()
     df["code"] = df["code"].map(_normalize_code)
     df = df[df["code"].str.len() == 6]
+    df = df[df["code"].map(_is_hs_a_code)].copy()
     # 过滤 ST、退市、B 股；排除停牌/无价
     df = df[~df["name"].astype(str).str.contains("ST|退", regex=True, na=False)].copy()
     df = df[~df["name"].astype(str).str.contains(r"B$|Ｂ", regex=True, na=False)].copy()
@@ -274,11 +285,16 @@ def screen_high_dividend_stocks(
         df = df_spot[df_spot["code"].isin(codes)].copy()
         pool_note = f"中证红利({CSI_DIVIDEND_INDEX}) 成分股"
     else:
+        # 全 A 演示：必须先剔北交所，再按市值取前 N。
+        # 新浪 spot 默认把 bj920xxx 排在最前，直接 head(200) 会几乎全是北交所，
+        # 分红接口无数据 → 「无有效分红记录可合并」、命中恒为 0。
         df = df_spot.copy()
-        pool_note = "全 A（已剔 ST/退/B）"
+        df = df[df["pe_ttm"].notna() & df["pb"].notna() & df["market_cap"].notna()]
+        df = df.sort_values("market_cap", ascending=False)
+        pool_note = "沪深 A 股（已剔北交所/ST/退，按市值）"
         if limit is not None and limit > 0:
             df = df.head(int(limit)).copy()
-            pool_note += f"，limit={int(limit)}"
+            pool_note += f"，前 {int(limit)} 只"
 
     logger.info("高股息筛选：计算股息率与分红连续性，候选 %s 只…", len(df))
     records = _collect_dividend_records(df)

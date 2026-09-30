@@ -97,3 +97,12 @@ def test_apply_filters_user_rules():
 def test_to_symbol():
     assert hd._to_symbol("601088") == "601088.SH"
     assert hd._to_symbol("000001") == "000001.SZ"
+
+
+def test_exclude_beijing_exchange_codes():
+    assert hd._is_hs_a_code("601088") is True
+    assert hd._is_hs_a_code("000001") is True
+    assert hd._is_hs_a_code("300750") is True
+    assert hd._is_hs_a_code("920000") is False
+    assert hd._is_hs_a_code("830001") is False
+    assert hd._is_hs_a_code("430047") is False

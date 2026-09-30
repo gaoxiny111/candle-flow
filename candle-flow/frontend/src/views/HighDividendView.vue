@@ -81,8 +81,8 @@ onMounted(() => {
       <label>
         初始池
         <select v-model="universe">
-          <option value="csi_div">中证红利成分股</option>
-          <option value="all">全 A（前 200 只演示）</option>
+          <option value="csi_div">中证红利成分股（推荐）</option>
+          <option value="all">沪深市值前 200（演示）</option>
         </select>
       </label>
       <label>
