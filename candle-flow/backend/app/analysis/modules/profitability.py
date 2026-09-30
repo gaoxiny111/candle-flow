@@ -302,6 +302,7 @@ class ProfitabilityAnalyzer(BaseAnalyzer):
             dividend_yield_pct=kwargs.get("dividend_yield"),
             pe_ttm=kwargs.get("pe_ttm"),
             payout_ratio_pct=kwargs.get("payout_ratio_pct"),
+            industry=kwargs.get("industry"),
         )
         is_div = bool(div_profile.get("is_dividend_asset"))
 

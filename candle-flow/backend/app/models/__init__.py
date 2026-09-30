@@ -1,3 +1,4 @@
+from app.models.dividend_profile import StockDividendProfile
 from app.models.factor_snapshot import FactorSnapshot
 from app.models.fundamental import FundamentalCandidate
 from app.models.indicator import Indicator
@@ -24,6 +25,7 @@ __all__ = [
     "PaymentClaim",
     "FundamentalCandidate",
     "FactorSnapshot",
+    "StockDividendProfile",
     "StockFundFlowDaily",
     "MarketFundFlowDaily",
 ]

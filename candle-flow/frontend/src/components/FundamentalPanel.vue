@@ -31,6 +31,14 @@ const LEVEL_LABEL: Record<string, string> = {
   E: '危险',
 }
 
+/** 内在价值分类标签：周期 > 红利 > 成长 > 价值（后端 models.intrinsic 的 style） */
+const STYLE_LABEL: Record<string, string> = {
+  cyclical: '周期（正常化利润 + PB-ROE 锚）',
+  dividend: '红利（股息锚定）',
+  growth: '成长（DCF）',
+  value: '价值（DCF）',
+}
+
 function levelTone(level: string | null | undefined) {
   if (!level) return 'mid'
   if (level.startsWith('A') || level.startsWith('B')) return 'good'
@@ -494,11 +502,69 @@ function bullBearTone(view: string | undefined) {
         </table>
       </section>
 
+      <section v-if="report.valuation?.intrinsic_value" class="valuation card-inner">
+        <h4>
+          内在价值
+          <span class="muted" style="font-weight:500;font-size:12px">
+            {{ STYLE_LABEL[report.valuation.intrinsic_value.style || 'value'] }}
+            ·
+            {{
+              report.valuation.intrinsic_value.cross_model
+                ? report.valuation.intrinsic_value.conservative
+                  ? '交叉验证（保守侧）'
+                  : '交叉验证'
+                : '单模型（未交叉）'
+            }}
+          </span>
+        </h4>
+        <p v-if="report.valuation.intrinsic_value.note" class="muted">
+          {{ report.valuation.intrinsic_value.note }}
+        </p>
+        <template v-if="report.valuation.intrinsic_value.intrinsic_value_per_share != null">
+          <p>
+            每股内在价值
+            <strong>{{ report.valuation.intrinsic_value.intrinsic_value_per_share }}</strong>
+            <span v-if="report.valuation.intrinsic_value.margin_of_safety_pct != null">
+              · 安全边际 {{ report.valuation.intrinsic_value.margin_of_safety_pct }}%
+            </span>
+            <span class="muted">
+              （现价 {{ report.valuation.intrinsic_value.current_price ?? '—' }} 元）
+            </span>
+          </p>
+          <ul class="intrinsic-models muted">
+            <li v-for="(m, k) in report.valuation.intrinsic_value.models" :key="k">
+              {{ k }} = {{ m.value }} 元<template v-if="m.reliable === false">
+                （不可信：已入池，但整体改取保守侧 min）</template>
+              <span v-if="m.note"> — {{ m.note }}</span>
+            </li>
+          </ul>
+          <p v-if="report.valuation.intrinsic_value.style_reason" class="muted">
+            分类依据：{{ report.valuation.intrinsic_value.style_reason }}
+          </p>
+        </template>
+        <p
+          v-if="report.valuation.intrinsic_value.auxiliary?.dividend_anchor"
+          class="muted"
+        >
+          股息锚对照（仅参考，不参与交叉/定价）：
+          {{ report.valuation.intrinsic_value.auxiliary.dividend_anchor.value }} 元
+          — {{ report.valuation.intrinsic_value.auxiliary.dividend_anchor.reason }}
+        </p>
+      </section>
+
       <section v-if="report.valuation?.dcf" class="valuation card-inner">
         <h4>
           DCF 内在价值
           <span class="muted" style="font-weight:500;font-size:12px">
-            {{ report.valuation.dcf.suppressed || report.valuation.dcf.role === 'not_applicable_dividend' ? '红利资产不适用' : '保守参考' }}
+            {{
+              report.valuation.dcf.role === 'not_applicable_dividend'
+                ? '红利资产不适用'
+                : report.valuation.dcf.role === 'not_applicable_cyclical'
+                  ? '周期股禁用峰值DCF'
+                  : report.valuation.dcf.suppressed
+                    ? '不参与定价'
+                    : '保守参考'
+            }}
           </span>
         </h4>
         <p v-if="report.valuation.dcf.note" class="muted">{{ report.valuation.dcf.note }}</p>
@@ -537,6 +603,7 @@ function bullBearTone(view: string | undefined) {
 }
 .err { color: #f5222d; font-size: 14px; }
 .muted { color: var(--text-secondary); font-size: 14px; }
+.intrinsic-models { margin: 6px 0 0 18px; padding: 0; font-size: 13px; line-height: 1.6; }
 .hero { display: flex; gap: var(--space-md); margin-bottom: var(--space-md); align-items: center; }
 .hero-score {
   width: 88px; height: 88px; border-radius: 12px;

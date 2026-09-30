@@ -935,6 +935,7 @@ class CashflowAnalyzer(BaseAnalyzer):
                 div_p = classify_dividend_asset(
                     dividend_yield_pct=kwargs.get("dividend_yield"),
                     pe_ttm=kwargs.get("pe_ttm"),
+                    industry=kwargs.get("industry"),
                 )
                 quality_ar = is_quality_receivable_context(
                     name=str(kwargs.get("name") or ""),

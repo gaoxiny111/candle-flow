@@ -1098,6 +1098,9 @@ export interface FundamentalAnalysisReport {
         growth_rate?: number
         growth_label?: string
         thresholds?: string
+        /** 口径说明的自证文案（后端 engine 会对 PEG/红利类指标写入，
+         *  例如「成长股/周期底部：负CAGR使PEG失真」）。组件用它展示口径出处。 */
+        note?: string | null
       }
     >
     dcf?: {
@@ -1105,6 +1108,58 @@ export interface FundamentalAnalysisReport {
       margin_of_safety_pct?: number
       note?: string
       assumptions?: Record<string, number>
+      /** 是否被口径抑制（如红利资产不适用 DCF）→ 前端隐藏内在价值 */
+      suppressed?: boolean
+      /** DCF 的角色标记：不适用 / 高成长参考 / 悲观参考 / 跳过 */
+      role?:
+        | 'high_growth_reference'
+        | 'skipped'
+        | 'not_applicable_dividend'
+        | 'not_applicable_cyclical'
+        | 'pessimistic_reference'
+    }
+    /** 内在价值：先分类 → 再选模型 → 最后交叉验证。
+     *  展示口径（display_only），不进入任何评分。 */
+    intrinsic_value?: {
+      /** 分类结果：周期 / 红利 / 成长 / 价值（周期 > 红利 > 成长 > 价值） */
+      style?: 'cyclical' | 'dividend' | 'growth' | 'value'
+      /** 分类依据的自证文案 */
+      style_reason?: string
+      /** 命中的具体分支（如 cyclical_industry / cyclical_volatile / dividend_authoritative） */
+      style_matched?: string
+      /** 三态留痕：周期股净利同比缺失时为 true（周期位置未判定，但归类仍是周期） */
+      partial?: boolean
+      intrinsic_value_per_share?: number | null
+      /** 是否由 ≥2 个模型交叉得出（否则为单模型参考） */
+      cross_model?: boolean
+      /** 交叉口径：median=全部可信取中位数；conservative=含不可信模型改取保守侧 min */
+      cross_basis?: 'median' | 'conservative' | null
+      /** 是否走了保守侧（含高成长 DCF 等不可信模型时为 true） */
+      conservative?: boolean
+      model_count?: number
+      models?: Record<
+        string,
+        {
+          value?: number
+          note?: string | null
+          reliable?: boolean
+          /** 周期锚专有：正常化PE 与 PB-ROE 双锚明细 */
+          anchors?: Record<string, number | string | null>
+        }
+      >
+      /** 被标记不可信的模型名（仍参与交叉，但整体改取保守侧 min） */
+      unreliable_models?: string[]
+      /** 辅助参考（不入交叉、不影响任何分数）：目前只有周期股的股息锚对照 */
+      auxiliary?: Record<
+        string,
+        { value?: number; note?: string | null; reliable?: boolean; reason?: string }
+      >
+      margin_of_safety_pct?: number | null
+      note?: string | null
+      display_only?: boolean
+      current_price?: number | null
+      bvps_source?: string | null
+      eps_normalized_source?: string | null
     }
     comps?: ComparableValuation
     composite_valuation_score?: number
@@ -1376,7 +1431,7 @@ export const scanHoldings = async (body: { symbols?: string[]; guest_symbols?: s
   return { data: checkApi(res) }
 }
 
-/** 因子库覆盖率：已构建快照 / SH·SZ 股票总数。全市场排序只在已覆盖样本内成立。 */
+/** 因子库覆盖率：已构建快照 / 沪深**主板**股票总数（与 build_all 同一 universe）。 */
 export interface MarketScanCoverage {
   covered: number
   universe: number
@@ -1385,6 +1440,22 @@ export interface MarketScanCoverage {
   latest_built_at: string | null
   stale_days: number | null
   complete: boolean
+  /** 刻意不构建的 SH/SZ 非主板票（创业板/科创板）数：不在默认榜单样本，不是缺口 */
+  excluded_non_main: number
+  /** 是否处于财报披露窗口期（1-4/7-8/10 月）。非披露期快照滞后属设计行为，不按告警渲染 */
+  disclosure_window: boolean
+}
+
+/** 行情覆盖自证：展示层股价/市值/PE/PB/股息率按最新行情缩放的执行结果 */
+export interface QuoteOverlay {
+  applied: boolean
+  reason: string
+  as_of?: string | null
+  quote_source?: string | null
+  applied_count?: number
+  missed_no_quote?: number
+  missed_bad_price?: number
+  errors?: string[]
 }
 
 /**
@@ -1398,7 +1469,11 @@ export interface MarketScanItem {
   composite_score: number | null
   final_rating: string | null
   risk_level_label: string | null
-  /** 快照构建时刻的股价（非实时报价） */
+  /**
+   * 股价。已按最新行情（腾讯快照）缩放覆盖展示 —— 因子快照锚定披露报告期，
+   * 股价/市值/PE/PB/股息率是行情衍生量，须用现价覆盖；`composite_score`
+   * 与估值分位仍锚定报告期口径，不受影响。
+   */
   price: number | null
   pe_ttm: number | null
   pb: number | null
@@ -1410,6 +1485,85 @@ export interface MarketScanItem {
   market_pct: number | null
   /** 行业内分位（0~100）。仅展示，不参与排序 */
   industry_pct: number | null
+  /** 风格首个标签（无标签时为 other），供排序/兼容读取 */
+  style: string | null
+  /**
+   * 风格标签列表（**两维叠加**，可多项）：
+   * value 价值 / growth 成长 / cyclical 周期 / dividend 红利 / blue_chip 蓝筹。
+   * 维度A（价值/成长）二选一，维度B（周期/红利/蓝筹）命中即加；红利命中时不含 value。
+   */
+  style_tags: string[]
+  /** 风格中文组合名（如 周期+红利 / 价值+周期 / 成长+红利），随 style_tags 一并返回 */
+  style_label: string | null
+  /** 风格归类依据（一句话，含触发数值），供悬浮提示 */
+  style_reason: string | null
+  /** 高股息「真高股息防御型」判据是否全部命中（读层过滤，不改分数；缺数据的必判维度不算命中） */
+  high_dividend?: boolean
+  /**
+   * v5 池归属：'main' 主池 / 'watch' 观察池（六条判据成立但 PE<0 的亏损分红票）/ null 出局。
+   *
+   * 观察池由判据⑨ 单列：**不计主池**（主池请传 high_dividend=true，观察池传 hd_watch=true）。
+   */
+  hd_pool?: 'main' | 'watch' | null
+  /** v5 判据⑧：主池内**标黄待复核**（隐含分红率 100~150%） */
+  hd_review?: boolean
+  /** v5 判据⑧：隐含分红率(%) = 快照 TTM 股息率 × 快照 PE（≡ 每股分红÷每股收益）；null = 未判定 */
+  hd_implied_payout_pct?: number | null
+  /** 高股息各维留痕（含「缺」标记；撤除维度以「提示·不参与判定」前缀标出），供悬浮提示 */
+  hd_detail?: string[]
+  /** 真高股息综合评分（0~100，池内分位归一：0.4×股息率 + 0.3×偿债分 + 0.3×支付率接近度）；仅命中集有值 */
+  hd_score?: number | null
+  /** 评分三维原始分量（仅命中集带），供悬浮提示解释分数 */
+  hd_parts?: { yield: number; solvency: number; payout_stab: number } | null
+  /**
+   * 各判据的**实际取值台账**（命中与落选都带），供逐条自证。
+   *
+   * 为什么不复用 hd_detail：那是给眼睛看的中文文案，程序复核拿不到结构化值 ——
+   * 外部曾经只能退而读表格里的「综合分位」列（横截面综合分分位），把判据⑥用的
+   * PE/PB 历史分位误算成综合分分位。口径要可自证，就必须吐结构化台账。
+   */
+  hd_metrics?: {
+    /** 判据②实际取用的股息率(%)：周期股 = 近三年均息，非周期 = 快照 TTM */
+    yield_used_pct: number | null
+    /** 列表展示的股息率(%)：按最新行情缩放，与判据值口径不同，盘中会漂过阈值线 */
+    yield_display_pct: number | null
+    /** 股息率口径：'3y_avg'（周期股三年均息）| 'ttm'（非周期 TTM） */
+    yield_basis: '3y_avg' | 'ttm'
+    /** v5 判据⑦⑧的实际输入：快照锚定的 TTM 股息率(%)（不随盘中价漂移） */
+    yield_ttm_snap_pct: number | null
+    /** v5 判据⑧的实际取值：隐含分红率(%)；null = 未判定（PE 或息缺失） */
+    implied_payout_pct: number | null
+    /** 判据③：分红档案最新完整会计年度 */
+    div_latest_fy: number | null
+    /** 判据④：连续现金分红年限 */
+    div_years: number | null
+    /** 判据④：支付率(%) */
+    payout_pct: number | null
+    /** 判据⑤：偿债能力分（0~100） */
+    solvency: number | null
+    /** 判据⑤：经营现金流覆盖分红倍数 */
+    ocf_div_cover: number | null
+    /** 判据⑥：PE 的 5 年历史分位(%) */
+    pe_percentile: number | null
+    /** 判据⑥：PB 的 5 年历史分位(%) */
+    pb_percentile: number | null
+    /** 判据⑥实际取值 = max(PE 分位, PB 分位)；缺 = 未判定（不熔断） */
+    crowd_pct: number | null
+    /** 判据①：市值(亿元，当前行情口径) */
+    mcap_yi: number | null
+  }
+  /** 连续现金分红年数（来源分红档案表 stock_dividend_profile） */
+  div_years?: number | null
+  /**
+   * 分红档案的「最新完整会计年度」——判据③档案新鲜度闸门的输入。
+   * 档案停更（低于最近应已披露完毕的年度）的标的不计入高股息名单：
+   * 这类标的展示股息率高是股价崩塌放大冻结分红所致（如金科股份 FY2020）。
+   */
+  div_latest_fy?: number | null
+  /** 近三年年均每股分红（元/股，含税；与股价无关，股息率由前端/后端按价现算） */
+  dps_3y_avg?: number | null
+  /** 近三年平均股息率(%)＝dps_3y_avg ÷ 快照价（周期股的门槛口径） */
+  yield_3y_avg?: number | null
 }
 
 export type MarketScanSort =
@@ -1424,6 +1578,13 @@ export type MarketScanSort =
   | 'cashflow'
   | 'solvency'
   | 'valuation'
+  /** 行情字段排序（读层展示口径，支持 asc/desc 双向；缺失值恒排末尾） */
+  | 'dividend_yield'
+  | 'pe_ttm'
+  | 'pb'
+  | 'market_cap_yi'
+  /** 真高股息综合评分（池内分位归一；按它排序会隐含「仅高股息」过滤） */
+  | 'hd_score'
 
 export interface MarketScanQuery {
   top?: number
@@ -1441,10 +1602,26 @@ export interface MarketScanQuery {
   /** 分页起始下标（过滤排序后偏移） */
   offset?: number
   sort_by?: MarketScanSort
+  /** 排序方向；仅行情字段排序（dividend_yield/pe_ttm/pb/market_cap_yi）生效 */
+  sort_order?: 'asc' | 'desc'
+  /** 风格筛选：cyclical/dividend/growth/blue_chip（服务端过滤；主风格或蓝筹副标签命中均算） */
+  style?: string
+  /** 高股息筛选（**真高股息防御型口径 v5**，服务端过滤，读层口径不改分数）：
+   *  ① 剔ST/退市 ∧ 市值≥30亿；② 周期股看近三年均息≥5%、非周期看 TTM≥3.5%；
+   *  ③ 分红档案新鲜度（档案停更的「股价崩塌型」不入选）；④ 连续分红≥3年 ∧ 支付率30~90%；
+   *  ⑤ 财务底线软组合（偿债分≥40 ∨ 现金流覆盖分红≥1.0）；⑥ PE/PB 历史分位取高者≥95 剔除；
+   *  ⑦【v5】当前 TTM 股息率<4.0% 移出主池（含周期股）；⑧【v5】隐含分红率>150% 剔除、
+   *  100~150% 入池标黄待复核（hd_review）；⑨【v5】PE<0 的亏损分红票单列观察池、不计主池。
+   *  选中时配合 sort_by=dividend_yield。 */
+  high_dividend?: boolean
+  /** 只看**高股息观察池**（v5 判据⑨：六条成立但 PE<0 的亏损分红票）；与 high_dividend 互斥 */
+  hd_watch?: boolean
 }
 
 export interface MarketScanData {
   coverage: MarketScanCoverage
+  /** 行情覆盖自证（股价等展示字段是否已按最新行情缩放） */
+  quote_overlay?: QuoteOverlay
   /** 分位基准样本数（=已覆盖且综合分非空的标的数），分位只在基准内成立 */
   percentile_base: number
   count: number
@@ -1454,6 +1631,18 @@ export interface MarketScanData {
   limit: number
   has_more: boolean
   sort_by: string
+  /** 排序方向：仅行情字段排序时 asc 有意义；综合分/五维恒 desc */
+  sort_order: string
+  /** 风格分布（基于风格以外的全部筛选命中集），键见 STYLE_KEYS */
+  style_counts: Record<string, number>
+  /** 高股息命中数（基准同 style_counts：风格以外的全部筛选命中集） */
+  high_dividend_count?: number
+  /** v5 主池内**标黄待复核**数（隐含分红率 100~150%），基准同 high_dividend_count */
+  hd_review_count?: number
+  /** v5 **亏损分红观察池**大小（六条成立但 PE<0），基准同上 */
+  hd_watch_count?: number
+  /** 分红档案覆盖自证（仅高股息/观察池筛选时给出）：真高股息判据的数据底座 */
+  dividend_profile?: { total: number; continuous_ge3: number } | null
   filters: {
     min_composite: number | null
     min_market_cap_yi: number | null
@@ -1461,6 +1650,10 @@ export interface MarketScanData {
     industry: string | null
     keyword: string | null
     include_gem: boolean
+    style: string | null
+    sort_order: string
+    high_dividend?: boolean
+    hd_watch?: boolean
   }
   items: MarketScanItem[]
   notes: string[]
@@ -1478,6 +1671,9 @@ export const fetchMarketScan = async (query: MarketScanQuery = {}) => {
       keyword: query.keyword,
       include_gem: query.include_gem,
       sort_by: query.sort_by,
+      style: query.style,
+      high_dividend: query.high_dividend || undefined,
+      hd_watch: query.hd_watch || undefined,
     },
     timeout: 90000,
   })
@@ -1635,6 +1831,7 @@ export interface QualityValueData {
   items: QualityValueItem[]
   rejected_sample: QualityValueItem[]
   coverage: MarketScanCoverage
+  quote_overlay?: QuoteOverlay
   /** 周期品预警的覆盖率/档位分布自检（未开启时为 null） */
   cycle_price?: {
     enabled: boolean
@@ -1899,6 +2096,7 @@ export interface MarketScanOverlayData {
   filters: MarketScanData['filters']
   sort_by: string
   coverage: MarketScanCoverage
+  quote_overlay?: QuoteOverlay
   cached: boolean
   notes: string[]
 }
@@ -1969,6 +2167,7 @@ export interface MarketScanResonanceData {
     duration_sec: number
   } | null
   coverage: MarketScanCoverage
+  quote_overlay?: QuoteOverlay
   filters: MarketScanData['filters']
   notes: string[]
 }
@@ -2167,7 +2366,7 @@ export interface PvArb {
   env_zh: string
   env_known: boolean
   adx: number | null
-  /** 裁决：SIGNAL 保留信号 / AVOID 规避 / IGNORE 忽略 / STANDBY 空仓观望 */
+  /** 裁决：BLACKLIST 黑名单 / SIGNAL 保留信号 / AVOID 规避 / IGNORE 忽略 / STANDBY 空仓观望 */
   verdict: string
   verdict_zh: string
   final: PvArbItem | null
@@ -2175,6 +2374,64 @@ export interface PvArb {
   kept: PvArbItem[]
   dropped: PvArbItem[]
   explain: string
+  /** 黑名单层（一票否决，先于环境分流与优先级） */
+  blacklist?: PvBlacklistHit[]
+  blacklist_hit?: boolean
+  /** 被黑名单盖住之前、仲裁给出的结论（用于自证「不是没算」） */
+  underlying_verdict?: string | null
+  underlying_verdict_zh?: string | null
+  underlying_explain?: string | null
+}
+
+/** 黑名单条件的逐条明细：passed=null 表示该条件缺数据、未纳入判定 */
+export interface PvBlacklistCondition {
+  key: string
+  passed: boolean | null
+  detail: string
+}
+
+export interface PvBlacklistHit {
+  key: string
+  name: string
+  hit: boolean
+  /** or = 任一命中 / and = 全部命中 */
+  mode?: string
+  /** 命中的条件 key */
+  rules: string[]
+  conditions: PvBlacklistCondition[]
+  /** 有条件缺数据（结论证据不足，需人工复核） */
+  partial: boolean
+  metrics: Record<string, number | string | null>
+  explain: string
+  /** 妖股口径的数据对齐信息 */
+  data?: {
+    turnover_date: string | null
+    price_as_of: string | null
+    same_day: boolean | null
+    turnover_source: string | null
+  }
+  /** 高开砸盘：intraday 盘中 / closed 盘后复盘 */
+  session?: string
+}
+
+/** 黑名单汇总（读层返回，含数据源状态） */
+export interface PvBlacklistSummary {
+  enabled: boolean
+  hits: number
+  counts: Record<string, number>
+  rule_counts: Record<string, number>
+  partial: number
+  turnover_missing: number
+  /** 宇宙内成功取到换手率的只数（覆盖度自证） */
+  turnover_covered: number
+  snapshot: {
+    ok?: boolean
+    skipped?: boolean
+    source?: string | null
+    date?: string | null
+    count?: number
+    errors?: string[]
+  }
 }
 
 export interface PvItem {
@@ -2204,6 +2461,15 @@ export interface PvItem {
   arb_env?: string | null
   arb_signal?: string | null
   arb_signal_name?: string | null
+  /** 是否被黑名单一票否决 */
+  arb_blacklist?: boolean
+  arb_blacklist_keys?: string[]
+  /** 命中条件，如 ['yaogu:price', 'yaogu:turnover'] */
+  arb_blacklist_rules?: string[]
+  /** 基本面综合分（factor_snapshots 只读展示，缺失 = 因子库未覆盖该票） */
+  composite_score?: number | null
+  /** 基本面评级，如 A / B+ / D */
+  final_rating?: string | null
 }
 
 export interface PvStats {
@@ -2212,6 +2478,8 @@ export interface PvStats {
   no_signal: number
   insufficient: number
   lookback_days: number
+  /** 黑名单总开关是否开启（扫描时是否叠加黑名单层） */
+  with_blacklist?: boolean
   signal_counts: Record<string, number>
   latest_signal_counts: Record<string, number>
   category_counts: { trend: number; reversal: number }
@@ -2222,6 +2490,18 @@ export interface PvStats {
   env_counts?: Record<string, number>
   /** 最终裁决命中的信号分布 */
   priority_counts?: Record<string, number>
+  /** 黑名单命中只数（按黑名单类型） */
+  blacklist_counts?: Record<string, number>
+  /** 黑名单命中条件分布（price/turnover/gap/volume/vwap） */
+  blacklist_rule_counts?: Record<string, number>
+  blacklist_hits?: number
+  /** 黑名单判定中「有条件缺数据」的只数 */
+  blacklist_partial?: number
+  /** 未取到换手率的只数（快照失败/停牌） */
+  turnover_missing?: number
+  /** 宇宙内成功取到换手率的只数 */
+  turnover_covered?: number
+  snapshot?: PvBlacklistSummary['snapshot']
   cost: PvCostBreakdown
   built_at: string
 }
@@ -2246,6 +2526,8 @@ export interface PvViewData {
   top?: number
   items?: PvItem[]
   stats?: PvStats
+  /** 黑名单汇总（含数据源状态；enabled=false 表示总开关关闭） */
+  blacklist?: PvBlacklistSummary
   index_age_sec?: number
   cost?: PvCostBreakdown
   notes?: string[]
@@ -2267,10 +2549,58 @@ export interface PvMeta {
   /** 策略环境目录（补丁二：交易分流口径，区别于 regimes 的展示口径） */
   envs?: { key: string; name: string; desc: string }[]
   verdicts?: { key: string; name: string; desc: string }[]
+  /** 黑名单目录（一票否决层）：妖股 / 高开砸盘 */
+  blacklists?: {
+    key: string
+    name: string
+    desc: string
+    source: string
+    timing: string
+    logic: string
+    rules: { key: string; detail: string }[]
+  }[]
   priority_rule?: { risk: number; trend: number; reversal: number; avoid_at: number }
+  /** 完整流水线说明（黑名单 → 环境分流 → 仲裁 → 盘中护栏） */
+  pipeline?: string[]
   cost: PvCostBreakdown
   params: Record<string, number>
   scoring_impact: string
+}
+
+/** 盘中护栏（高开砸盘）单票结果 */
+export interface PvGuardItem {
+  symbol: string
+  name: string | null
+  date?: string
+  /** 分时数据日 ≠ 今日（拿的是上一交易日） */
+  stale?: boolean
+  session?: string
+  /** 判据是否适用（数据不足/非交易时段 → false，且**不代表安全**） */
+  applicable: boolean
+  hit: boolean
+  reason?: string
+  conditions?: PvBlacklistCondition[]
+  metrics?: Record<string, number | null>
+  base_vol_info?: { ok?: boolean; days?: number; dates?: string[]; error?: string }
+}
+
+export interface PvGuardData {
+  empty?: boolean
+  reason?: string
+  session?: string
+  session_zh?: string
+  trading_day?: boolean
+  data_date?: string | null
+  source?: string
+  requested?: number
+  checked?: number
+  applicable?: number
+  hits?: number
+  hit_symbols?: string[]
+  items?: PvGuardItem[]
+  errors?: string[]
+  thresholds?: { gap_pct: number; vol_k: number; open_minutes: number; base_days: number }
+  notes?: string[]
 }
 
 export interface PvValidation {
@@ -2321,12 +2651,14 @@ export interface PvQuery {
   category?: string
   signal?: string
   regime?: string
-  /** 裁决筛选：SIGNAL / AVOID / IGNORE / STANDBY（逗号分隔多值） */
+  /** 裁决筛选：BLACKLIST / SIGNAL / AVOID / IGNORE / STANDBY（逗号分隔多值） */
   verdict?: string
   /** 策略环境筛选：TREND / RANGE / WEAK / UNKNOWN */
   env?: string
   /** 剔除裁决为「规避」的标的（= 只看可买入集合） */
   exclude_avoid?: boolean
+  /** 剔除黑名单命中的标的（一票否决） */
+  exclude_blacklist?: boolean
   latest_only?: boolean
   sort_by?: string
   top?: number
@@ -2351,6 +2683,7 @@ export const fetchPriceVolumeView = async (query: PvQuery = {}) => {
       verdict: query.verdict || undefined,
       env: query.env || undefined,
       exclude_avoid: query.exclude_avoid || undefined,
+      exclude_blacklist: query.exclude_blacklist || undefined,
       latest_only: query.latest_only || undefined,
       sort_by: query.sort_by || undefined,
       top: query.top,
@@ -2365,7 +2698,22 @@ export const fetchPriceVolumeView = async (query: PvQuery = {}) => {
   return { data: checkApi(res) }
 }
 
-export const buildPriceVolume = async (params: { lookback_days?: number; include_gem?: boolean; force?: boolean } = {}) => {
+/** 盘中护栏（补丁 B：高开砸盘）：逐只核对当日分时，命中即提示规避 */
+export const fetchPriceVolumeIntradayGuard = async (
+  params: { symbols?: string; top?: number; refresh?: boolean } = {},
+) => {
+  const res = await api.get<ApiResponse<PvGuardData>>('/strategies/price-volume/intraday-guard', {
+    params: {
+      symbols: params.symbols || undefined,
+      top: params.top,
+      refresh: params.refresh || undefined,
+    },
+    timeout: 60000,
+  })
+  return { data: checkApi(res) }
+}
+
+export const buildPriceVolume = async (params: { lookback_days?: number; include_gem?: boolean; with_blacklist?: boolean; force?: boolean } = {}) => {
   const res = await api.post<ApiResponse<{ status: string; job_id?: string; age_sec?: number }>>(
     '/strategies/price-volume/build',
     null,
@@ -2373,6 +2721,7 @@ export const buildPriceVolume = async (params: { lookback_days?: number; include
       params: {
         lookback_days: params.lookback_days,
         include_gem: params.include_gem || undefined,
+        with_blacklist: params.with_blacklist,
         force: params.force || undefined,
       },
       timeout: 30000,

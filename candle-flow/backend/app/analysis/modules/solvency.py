@@ -299,6 +299,78 @@ class SolvencyAnalyzer(BaseAnalyzer):
                 )
             )
 
+        # ── 存贷双高（资金真实性）：账面「高现金 + 高有息负债」同时成立 ──────
+        # 此前该判定只在风险模块里做，且对周期/资源股按「行业特性」轻扣 2 分，
+        # 等于把「高现金同时高借款」这件事从偿债维度上放行。偿债模块才是
+        # 「有息负债与现金覆盖」的归属地，故把实质扣分落在这里（单一来源），
+        # 风险模块只保留定性提示（见 risk.py 同名分支）。
+        #
+        # 分子取**有息负债合计**而非短期借款：存贷双高在会计上指有息负债与
+        # 货币资金同时高企，短债只是其中一部分。实测天山铝业 2026H1 有息负债
+        # 100.3 亿、短期借款仅 23.3 亿（占 23%）—— 只看短债的话，短债/现金
+        # 约 0.3 恒低于 0.40 门槛，这条判据对用户点名的这只票永远不触发。
+        #
+        # 两条数据边界（都是「不可得」而非「无问题」，缺失一律留痕不判）：
+        #   ① `monetary_funds` 是 `build_financial_dataframe` 写进 balance_sheet
+        #      的账面货币资金；为 0/缺键表示数据源未映射到该科目（银行等金融股
+        #      用「现金及存放央行款项」），不等于「没有现金」。
+        #   ② 有息负债在 `interest_bearing_explicit=False` 时是**残差估计值**
+        #      （总负债 − 经营性负债，可能把应付账款算进来），用它做扣分依据会
+        #      误伤经营性负债高的贸易/分销公司，故一律不判。
+        #   ③ 数据源只给货币资金合计，**不披露受限资金明细**，无法分离「真实
+        #      可动用部分」，故按账面口径判并在措辞 metadata 显式声明，不臆造比例。
+        _cash_raw = bs.get("monetary_funds")
+        cash_mf = float(_cash_raw) if _cash_raw is not None else None
+        _ibd_raw = bs.get("interest_bearing_debt")
+        _ibd_dual = float(_ibd_raw) if _ibd_raw is not None else None
+        if not bool(bs.get("interest_bearing_explicit")):
+            _ibd_dual = None
+
+        dual_ratio: float | None = None
+        dual_high: bool | None = None
+        dual_note: str | None = None
+        if cash_mf is None or cash_mf <= 0:
+            dual_note = "货币资金科目不可得（数据源未映射），存贷双高未判定"
+        elif _ibd_dual is None:
+            dual_note = (
+                "有息负债为残差估计值或不可得（interest_bearing_explicit=False），"
+                "存贷双高未判定"
+            )
+        else:
+            dual_ratio = _ibd_dual / cash_mf
+            dual_high = bool(
+                cash_mf > 1e9 and _ibd_dual > 1e9 and dual_ratio >= 0.40
+            )
+
+        if dual_high and not _is_bank:
+            if dual_ratio <= 0.6:
+                dual_score = 45.0
+            elif dual_ratio <= 0.9:
+                dual_score = 32.0
+            else:
+                dual_score = 22.0
+            indicators.append(
+                IndicatorResult(
+                    name="存贷双高",
+                    value=round(dual_ratio, 2),
+                    score=dual_score,
+                    level=score_to_level(dual_score),
+                    weight=2.5,
+                    comment=(
+                        f"货币资金 {cash_mf / 1e8:.1f}亿、有息负债 {_ibd_dual / 1e8:.1f}亿"
+                        f"（有息负债/现金 {dual_ratio:.2f}）：账面高现金同时高借款，"
+                        "资金真实性与受限比例存疑；数据源不披露受限资金明细，"
+                        "不可动用部分无法分离"
+                    ),
+                    period=bs_period,
+                )
+            )
+            warnings.append(
+                f"存贷双高：货币资金 {cash_mf / 1e8:.1f}亿 与有息负债 "
+                f"{_ibd_dual / 1e8:.1f}亿 同时高企（有息负债/现金 {dual_ratio:.2f}），"
+                "偿债能力已扣分；货币资金受限比例数据源不披露，需人工核查"
+            )
+
         if _is_bank:
             warnings.append(
                 "银行偿债评分仅基于杠杆水平（权益/总资产相对同业中位）；"
@@ -322,6 +394,15 @@ class SolvencyAnalyzer(BaseAnalyzer):
                 "asset_quality_metrics_available": not _is_bank,
                 "balance_sheet": bs or None,
                 "supply_chain_power": supply_chain_power,
+                # 三态：True=双高（已扣分）/ False=判为非双高 / None=数据不可得未判定。
+                # 不用 bool() 压成两态 —— 否则「未判定」会被下游读成「无问题」，
+                # 正是「缺失按 0/False 免检」那类静默失效。
+                "deposit_loan_dual_high": dual_high,
+                "deposit_loan_dual_ratio": round(dual_ratio, 2) if dual_ratio is not None else None,
+                "deposit_loan_dual_note": dual_note,
+                # 受限资金不可观测：数据源只给货币资金合计，显式声明，
+                # 供前端与下游区分「已评估」与「不可评估」（与银行口径同构）。
+                "restricted_cash_observable": False,
                 "adjusted_current_ratio": round(adj_cr, 2) if adj_cr is not None else None,
                 "adjusted_quick_ratio": round(adj_qr, 2) if adj_qr is not None else None,
             },

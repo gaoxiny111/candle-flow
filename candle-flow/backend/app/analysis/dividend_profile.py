@@ -39,15 +39,58 @@ def classify_dividend_asset(
     dividend_yield_pct: float | None,
     pe_ttm: float | None = None,
     payout_ratio_pct: float | None = None,
+    industry: str | None,
+    cyclical_industries: frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """
     高股息/红利资产：股息率高且分红慷慨。
     满足时 ROIC/WACC 用红利口径，估值以股息利差为主而非 PEG/历史分位。
+
+    ★ 强周期行业**前置拦截**（2026-09-29 定案）：
+    行业 ∈ ``STRONG_CYCLICAL_INDUSTRIES``（申万三级**精确**名）时一律判为
+    **非红利资产**（``is_dividend_asset=False``、``cyclical_locked=True``），
+    股息率再高、分红再慷慨也不例外。
+    理由：强周期行业的利润由商品价格 / 运价主导，景气高点的股息率来自**峰值利润**、
+    现金流不可持续；按股息做零增长资本化会「骗」出虚高的估值分与综合分。
+    利润波动幅度只用于判断**周期位置**（高点/低点），不是「是不是周期股」的必要条件。
+
+    ``industry`` 为**必传**关键字参数（无默认值）：它是这条拦截的输入，漏传会
+    ``TypeError`` 显式失败，而不是静默退化成「不拦截」。
+    ``cyclical_industries`` 唯一来源在 ``engine.STRONG_CYCLICAL_INDUSTRIES``，
+    引擎调用时显式传入以零开销，其余调用方走函数内惰性导入（避免循环导入）。
     """
     dy = float(dividend_yield_pct) if dividend_yield_pct is not None else None
     payout = payout_ratio_pct
     if payout is None:
         payout = estimate_payout_pct(dy, pe_ttm)
+
+    spread = round(dy - CN_10Y_BOND_YIELD_PCT, 2) if dy is not None else None
+
+    # ── 强周期行业前置拦截（唯一实现；5 处调用点靠它统一口径）──────────
+    ind = str(industry or "").strip()
+    if ind:
+        cyc = cyclical_industries
+        if cyc is None:
+            # 惰性导入：engine 在模块顶层导入本模块，故只能运行时取名单。
+            from app.analysis.engine import STRONG_CYCLICAL_INDUSTRIES
+
+            cyc = STRONG_CYCLICAL_INDUSTRIES
+        if ind in cyc:
+            return {
+                "is_dividend_asset": False,
+                "tier": "cyclical_locked",
+                "cyclical_locked": True,
+                "industry": ind,
+                "dividend_yield_pct": round(dy, 2) if dy is not None else None,
+                "payout_ratio_pct": payout,
+                "bond_yield_pct": CN_10Y_BOND_YIELD_PCT,
+                "div_bond_spread_pct": spread,
+                "wacc_pct": None,
+                "note": (
+                    "强周期行业 → 强制走周期框架（正常化利润 + PB-ROE 锚），不认红利身份："
+                    "景气高点的高股息来自峰值利润、现金流不可持续"
+                ),
+            }
 
     qualified = False
     tier = ""
@@ -69,13 +112,11 @@ def classify_dividend_asset(
         qualified = True
         tier = "observe"
 
-    spread = None
-    if dy is not None:
-        spread = round(dy - CN_10Y_BOND_YIELD_PCT, 2)
-
     return {
         "is_dividend_asset": qualified,
         "tier": tier,
+        "cyclical_locked": False,
+        "industry": ind or None,
         "dividend_yield_pct": round(dy, 2) if dy is not None else None,
         "payout_ratio_pct": payout,
         "bond_yield_pct": CN_10Y_BOND_YIELD_PCT,

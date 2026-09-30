@@ -33,3 +33,12 @@ cloudflared*.json
 /candle-flow/frontend/_*.png
 /candle-flow/scripts/deploy/deploy_*.log
 *.log
+
+# local diag / deploy junk
+backend/_diag*
+backend/_pytest*
+backend/_kw*
+backend/_draw*
+backend/_get_scores*
+backend/_verify*
+frontend/_scan*

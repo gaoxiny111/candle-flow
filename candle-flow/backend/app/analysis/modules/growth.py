@@ -6,6 +6,7 @@ import pandas as pd
 
 from app.analysis.base import AnalysisLevel, BaseAnalyzer, IndicatorResult, ModuleResult, format_report_period, score_to_level
 from app.analysis.config.company_profiles import get_company_profile, get_merger_consolidation
+from app.analysis.cycle_normalized import check_cycle_peak_growth
 
 
 # ── 补丁二：基数校验（净利3年CAGR > 50% 时触发）──────────────────────────
@@ -970,11 +971,29 @@ class GrowthAnalyzer(BaseAnalyzer):
         )
         turnaround_penalty = float(turnaround_check["deduction"] or 0.0)
 
-        # 两条闸门扣减**取更严者**，不与 profit_illusion 叠加（铁律3）。
+        # ── 补丁三：周期/爆款顶点增速未获跨周期证实（跨周期口径）─────────────
+        # 上两条闸门都只看「基期是否失真」（基期亏损/极低值）。但周期股在景气
+        # 顶点时基期完全正常——天山铝业 2026H1 同比 +100.4%、盐湖 +137.9%、
+        # 巨人网络 +176.0%，基期都是正常盈利，因此两条闸门一条都不触发，
+        # 单期同比被当成可持续增速全额计分。本闸门改用 5~7 年年度归母净利序列
+        # 算跨周期复合增速，只有「单期同比显著超出跨周期可支撑水平」且「利润不
+        # 在跨周期中性利润之下（即不处底部）」时才扣减，把底部修复完整保留。
+        cycle_check = check_cycle_peak_growth(
+            profit_yoy=yoy_profit,
+            series=kwargs.get("cycle_annual_profit"),
+        )
+        cycle_peak_penalty = float(cycle_check["deduction"] or 0.0)
+
+        # 三条闸门扣减**取更严者**，不与 profit_illusion 叠加（铁律3）。
         # 关键：扭亏型票在上年亏损时，当期扣非常常也为负 → 必然同时命中
         # profit_illusion（11/32）。若先扣分再压 38 上限，ST西王会掉到 8 分，
-        # 属同一事实被惩罚两次。正确做法是三条判据统一成「候选分取最小」。
-        _gate_penalty = max(growth_base_penalty, turnaround_penalty)
+        # 属同一事实被惩罚两次。正确做法是各条判据统一成「候选分取最小」。
+        _gates = (
+            ("growth_base", growth_base_penalty),
+            ("turnaround", turnaround_penalty),
+            ("cycle_peak", cycle_peak_penalty),
+        )
+        _gate_penalty = max(p for _, p in _gates)
         _candidates = [module_score]
         if _gate_penalty > 0:
             _candidates.append(module_score - _gate_penalty)
@@ -984,19 +1003,26 @@ class GrowthAnalyzer(BaseAnalyzer):
 
         growth_base_applied = 0.0
         turnaround_applied = 0.0
-        if _final < module_score:
+        cycle_peak_applied = 0.0
+        if _final < module_score and _gate_penalty > 0:
             # 只在「闸门真的比 profit_illusion 更严」时才把差额记到闸门名下，
-            # 否则留痕会虚报扣分（铁律：展示值/得分同口径）。
+            # 否则留痕会虚报扣分（铁律：展示值/得分同口径）。并列时按
+            # 基数校验 > 扭亏 > 跨周期顶点 的登记顺序归因（与旧行为一致）。
             _gap = round(module_score - _final, 1)
-            if _gate_penalty > 0 and growth_base_penalty >= turnaround_penalty:
+            _winner = max(_gates, key=lambda kv: kv[1])[0]
+            if _winner == "growth_base":
                 growth_base_applied = _gap
-            elif _gate_penalty > 0:
+            elif _winner == "turnaround":
                 turnaround_applied = _gap
+            else:
+                cycle_peak_applied = _gap
         module_score = _final
         if growth_base_applied > 0:
             warnings.append(base_check["reason"])
         if turnaround_applied > 0:
             warnings.append(turnaround_check["reason"])
+        if cycle_peak_applied > 0:
+            warnings.append(cycle_check["reason"])
 
         return ModuleResult(
             module_name="成长性",
@@ -1018,5 +1044,13 @@ class GrowthAnalyzer(BaseAnalyzer):
                 "growth_base_penalty": growth_base_applied,
                 "turnaround_check": turnaround_check,
                 "turnaround_penalty": turnaround_applied,
+                "cycle_growth_check": cycle_check,
+                "cycle_peak_penalty": cycle_peak_applied,
+                # 规范 3 年净利 CAGR 必须回写：engine 的估值侧
+                # （classify_growth_stock 的 profit_cagr_3y）与引擎后文都读
+                # `metadata["profit_cagr_3y"]`，此前从未写入 → 恒 None →
+                # 退化为 pct_change(3) 粗算（把 3 年累计变动当 CAGR，基期为负时
+                # 得出无意义负值），正是模块注释里声称已修的分叉。
+                "profit_cagr_3y": round(profit_cagr_3y, 2),
             },
         )

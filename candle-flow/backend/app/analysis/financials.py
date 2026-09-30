@@ -1037,6 +1037,13 @@ def build_financial_dataframe(symbol: str, years: int = 5) -> tuple[pd.DataFrame
             "estimated": not bool(zcfz_row.get("interest_bearing_explicit")),
             "source": zcfz_source or zcfz_row.get("source") or "eastmoney",
             "notes_receivable": zcfz_row.get("notes_receivable"),
+            # 货币资金：本函数一直只把它留在局部变量里算流动/速动比率，**从未
+            # 写进 balance_sheet 字典** → 偿债模块「存贷双高」读
+            # bs["monetary_funds"] 恒为 None → 整条判据静默失效（单测因为自己
+            # 造了这个键而全绿，掩盖了生产链路的缺失）。与 current_ratio 同一
+            # 「可用性」约定：0 表示数据源没映射到该科目（银行等金融股用
+            # 「现金及存放央行款项」），属不可得而非「没有现金」，故回传 None。
+            "monetary_funds": round(cash, 2) if cash > 0 else None,
         }
         meta["interest_bearing_ratio"] = ibd_ratio
         meta["interest_bearing_debt"] = ibd

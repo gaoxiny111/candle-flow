@@ -193,11 +193,59 @@ def run_market_scan(
     industry: str | None = Query(default=None, description="行业名包含匹配"),
     sort_by: str = Query(
         default="composite_score",
-        description="composite_score 或五个维度键：profitability/growth/cashflow/solvency/valuation",
+        description=(
+            "composite_score / 五维键 / 行情字段：dividend_yield、pe_ttm、pb、market_cap_yi / "
+            "hd_score（真高股息综合评分，池内分位归一；按它排序会隐含 high_dividend 过滤）"
+        ),
+    ),
+    sort_order: str = Query(
+        default="desc",
+        description="排序方向 asc/desc；仅行情字段排序生效（综合分与五维恒降序）",
     ),
     keyword: str | None = Query(default=None, description="名称/代码包含匹配，如「茅台」「600519」"),
     include_gem: bool = Query(default=False, description="是否纳入创业板/科创板（默认仅沪深主板）"),
     offset: int = Query(default=0, ge=0, description="分页起始下标（过滤排序后偏移）"),
+    style: str | None = Query(
+        default=None,
+        description=(
+            "风格筛选：value/growth/cyclical/dividend/blue_chip/other（两维叠加，"
+            "条目可带多标签，任一命中即算；读层展示口径，不改分数）"
+        ),
+    ),
+    high_dividend: bool = Query(
+        default=False,
+        description=(
+            "高股息筛选（**真高股息防御型口径 v5**，多维判据全部满足才命中，读层过滤不改分数）："
+            "① 剔ST/退市 ∧ 市值≥30亿；② 动态股息率门槛（周期 12 行业看近三年平均股息率≥5%，"
+            "非周期看 TTM≥3.5%）；③ 分红档案新鲜度（档案最新完整会计年度 ≥ 最近应已披露完毕的"
+            "年度，随日期滚动）——档案停更的「股价崩塌型」标的不入选；"
+            "④ 连续现金分红≥3年 ∧ 支付率30%~90%；"
+            "⑤ 财务底线软组合：偿债分≥40 ∨ 经营现金流覆盖分红≥1.0；"
+            "⑥ 估值拥挤度熔断：PE/PB 分位取较高者≥95 剔除；"
+            "⑦【v5】当前 TTM 股息率<4.0% 一律移出主池（含周期股；判据取**快照锚定值**，"
+            "展示值只用于展示）；"
+            "⑧【v5】隐含分红率（= 快照 TTM 息 × PE ≡ 每股分红÷每股收益）>150% 剔除、"
+            "100~150% 入池但标黄待复核（hd_review=true）；"
+            "⑨【v5】PE<0 的亏损分红票单列**观察池**、不计主池（优先于⑦⑧，用 hd_watch=true 查看）。"
+            "缺数据不入选（⑥⑦⑧ 中 ⑥⑧ 属熔断类：缺失=未判定）。"
+            "命中集按池内分位归一算 hd_score（0.4×股息率 + 0.3×偿债分 + 0.3×支付率接近度），"
+            "未显式指定排序时默认按**股息率降序**展示（按该评分排需 sort_by=hd_score）。"
+            "每条带 hd_pool（main/watch）、hd_review、hd_implied_payout_pct 与 hd_metrics"
+            "（各判据实际取用的数字：yield_used_pct 判据股息率 / yield_display_pct 列表展示股息率 / "
+            "yield_ttm_snap_pct 快照锚定 TTM 息 / implied_payout_pct 隐含分红率 / solvency / "
+            "ocf_div_cover / pe_percentile / pb_percentile / crowd_pct / payout_pct / "
+            "div_latest_fy / mcap_yi）供逐条自证。"
+            "注意：列表的「分位」列是 market_pct 横截面综合分分位，不是判据⑥用的 PE/PB 历史分位。"
+        ),
+    ),
+    hd_watch: bool = Query(
+        default=False,
+        description=(
+            "只看**高股息观察池**（v5 判据⑨：①②③④⑤⑥ 成立但 PE<0 的亏损分红票），"
+            "与 high_dividend 互斥。返回体的 hd_watch_count 为池大小；"
+            "这些票不做⑦4%下限与⑧隐含分红率判定，故不带 hd_score。"
+        ),
+    ),
     db: Session = Depends(get_db),
 ):
     """全市场基本面排序（只读因子库，沿用个股分析综合分，不重算分数）。"""
@@ -212,9 +260,13 @@ def run_market_scan(
             exclude_st=exclude_st,
             industry=industry,
             sort_by=sort_by,
+            sort_order=sort_order,
             keyword=keyword,
             include_gem=include_gem,
             offset=offset,
+            style=style,
+            high_dividend=high_dividend,
+            hd_watch=hd_watch,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -250,6 +302,10 @@ def get_quality_value_view(
     with_cycle_price: bool = Query(
         default=True,
         description="是否附加周期品「产品价格拐点」预警（items[].cycle_price，只读，不改分）",
+    ),
+    exclude_cycle_warnings: bool = Query(
+        default=True,
+        description="是否把命中「周期陷阱/景气高位」预警的票从结果集中剔除（仅展示层，不改分）",
     ),
     db: Session = Depends(get_db),
 ):
@@ -292,6 +348,7 @@ def get_quality_value_view(
             min_market_cap_yi=min_market_cap_yi,
             sort_by=sort_by,
             with_cycle_price=with_cycle_price,
+            exclude_cycle_warnings=exclude_cycle_warnings,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -410,6 +467,20 @@ def get_quality_value_rebalance(
             max_month_drop_pct=max_month_drop_pct,
             holdings=hp,
         )
+        # 展示口径（与质量价值榜单一致，用户要求）：**买入桶**剔除命中
+        # 「周期陷阱(trap)/景气高位(peak)」预警的票 —— 选股结果不推荐周期预警标的。
+        # 卖出/持有/未达线桶**不动**：持仓票的止损信号绝不因预警被屏蔽
+        # （风险类提示不做免检通道，铁律 19 同精神）。
+        from app.services.cycle_price import grade_of as _cp_grade
+
+        _buy_kept = [r for r in rules["buy"] if _cp_grade(r) not in ("trap", "peak")]
+        rules["cycle_warning_excluded_buy"] = len(rules["buy"]) - len(_buy_kept)
+        rules["buy"] = _buy_kept
+        rules["buy_count"] = len(_buy_kept)
+        rules["notes"] = list(rules.get("notes") or []) + [
+            "买入桶已剔除「周期陷阱/景气高位」预警票（计数见 cycle_warning_excluded_buy）；"
+            "持仓票的卖出/持有判定不受预警影响。",
+        ]
         # 展示截断：判定结果不截断，只截断回传的明细（避免响应体膨胀）
         for key in ("buy", "sell", "hold", "skip"):
             rules[key] = rules[key][:top]
@@ -466,7 +537,11 @@ def run_market_scan_technical_overlay(
     industry: str | None = Query(default=None, description="行业名包含匹配"),
     sort_by: str = Query(
         default="composite_score",
-        description="composite_score 或五个维度键：profitability/growth/cashflow/solvency/valuation",
+        description="composite_score / 五维键 / 行情字段：dividend_yield、pe_ttm、pb、market_cap_yi",
+    ),
+    sort_order: str = Query(
+        default="desc",
+        description="排序方向 asc/desc；仅行情字段排序生效（综合分与五维恒降序）",
     ),
     force: bool = Query(default=False, description="跳过 10 分钟缓存"),
     keyword: str | None = Query(default=None, description="名称/代码包含匹配，如「茅台」「600519」"),
@@ -500,6 +575,7 @@ def run_market_scan_technical_overlay(
             exclude_st=exclude_st,
             industry=industry,
             sort_by=sort_by,
+            sort_order=sort_order,
             keyword=keyword,
             include_gem=include_gem,
             offset=offset,

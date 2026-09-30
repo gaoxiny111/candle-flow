@@ -12,12 +12,14 @@ import {
   fetchMarketScanResonance,
   fetchPriceVolumeProgress,
   fetchPriceVolumeView,
+  fetchPriceVolumeIntradayGuard,
   fetchQualityValue,
   fetchRebalance,
   fetchResonanceProgress,
   type FactorsProgress,
   type MarketRegimeData,
   type MarketScanCoverage,
+  type QuoteOverlay,
   type MarketScanData,
   type MarketScanItem,
   type MarketScanOverlayData,
@@ -26,6 +28,8 @@ import {
   type MarketScanSort,
   type MarketScanVerdict,
   type MarketScanVerdictFilter,
+  type PvGuardData,
+  type PvGuardItem,
   type PvItem,
   type PvViewData,
   type QualityValueData,
@@ -51,6 +55,12 @@ const SORT_OPTIONS: { value: MarketScanSort; label: string }[] = [
   { value: 'quality_value', label: '质量×价值（好公司好价格）' },
   { value: 'pv', label: '价量策略（趋势确认×反转捕捉）' },
   { value: 'composite_score', label: '综合分（权威口径）' },
+  // 股息率降序 = 高息在前（红利视角）。勾选「仅高股息」时会**自动切到这一项**：
+  // 名单默认就该按息率从高到低看（2026-09-30 二次裁决）。
+  { value: 'dividend_yield', label: '股息率（高息在前）' },
+  // 真高股息综合评分（池内分位归一）。该分数只对命中集存在，选中它会自动打开
+  // 「高股息 = 仅高股息」，因为池外标的没有这个分。它**不再是**自动切换的默认项。
+  { value: 'hd_score', label: '真高股息评分（池内分位归一）' },
   ...DIMS.map((d) => ({ value: d.key as MarketScanSort, label: `按${d.full}排序` })),
 ]
 
@@ -71,16 +81,17 @@ const QV_SORT_OPTIONS: { value: QualityValueSort; label: string }[] = [
 /** 价量策略模式（sort_by = 'pv'）：排序由本下拉控制，作用于 /strategies/price-volume 读层 */
 const PV_SORT_OPTIONS: { value: string; label: string }[] = [
   { value: 'signal_score', label: '信号强度（默认）' },
-  { value: 'verdict', label: '裁决优先（候选→规避→空仓）' },
+  { value: 'verdict', label: '裁决优先（候选→规避→黑名单→空仓）' },
   { value: 'newest', label: '最新信号优先' },
   { value: 'market_cap', label: '市值（大→小）' },
 ]
 
-/** 裁决四态（补丁一）：SIGNAL 保留信号 = 买入候选 */
+/** 裁决五态：黑名单（一票否决）→ 规避 → 保留信号 → 忽略 / 空仓 */
 const PV_VERDICT_OPTIONS: { value: string; label: string; desc: string }[] = [
   { value: '', label: '全部', desc: '不按裁决过滤' },
-  { value: 'SIGNAL', label: '保留信号（买入候选）', desc: '通过环境分流 + 优先级仲裁，保留唯一信号' },
+  { value: 'SIGNAL', label: '保留信号（买入候选）', desc: '通过黑名单 + 环境分流 + 优先级仲裁，保留唯一信号' },
   { value: 'AVOID', label: '规避', desc: '风险类信号命中（价量过热/天量滞涨/PVT顶背离）→ 已从买入列表剔除' },
+  { value: 'BLACKLIST', label: '黑名单（一票否决）', desc: '妖股黑名单命中：近 3 日涨幅 > 20% 或 换手率 > 25%（先于环境分流与优先级）' },
   { value: 'IGNORE', label: '忽略', desc: '信号被 ADX 环境分流全部屏蔽' },
   { value: 'STANDBY', label: '空仓观望', desc: 'ADX<20 无趋势，本轮不下注' },
 ]
@@ -105,11 +116,76 @@ const form = ref({
   min_market_cap_yi: '' as string,
   exclude_st: true,
   include_gem: false,
+  /** 风格筛选（仅普通榜单模式；后端读层展示口径，服务端过滤） */
+  style: '',
+  /** 高股息筛选（仅普通榜单模式；后端读层多维判据，服务端过滤） */
+  high_dividend: false,
+  /** v5 亏损分红观察池（与 high_dividend 互斥；后端同样拒绝同时传两个） */
+  hd_watch: false,
   top: 50,
   offset: 0,
   /** 技术面门槛（共振模式的「买入候选」线）；大盘偏空时可由用户调到 85 */
   min_tech: 70,
 })
+
+/** 高股息视角的排序联动（两个方向都要处理，否则会出现「UI 显示不限、结果已过滤」）：
+ *  ① 选中「仅高股息」→ 排序自动切到「股息率（高息在前）」：红利视角最直觉，
+ *     谁息高谁在前（2026-09-30 二次裁决；此前默认切到 hd_score，用户看到的是
+ *     息率无序的榜 ——「钱江摩托 10.29% → 力生制药 6.42% → 广日股份 6.54%」，
+ *     误判成排序/过滤失效）；
+ *  ② 手动选「真高股息评分」→ 自动打开「仅高股息」（后端按 hd_score 排序会隐含过滤）。
+ *  记 hdPrevSort 只为「切回不限时还原本来的排序」，且只在**本次是自动切过**的情况下
+ *  才还原 —— 用户自己手动选的排序不会被覆盖。 */
+const hdPrevSort = ref<MarketScanSort | ''>('')
+
+function onHighDividendChange() {
+  if (form.value.high_dividend) {
+    if (form.value.sort_by !== 'dividend_yield') {
+      hdPrevSort.value = form.value.sort_by
+      form.value.sort_by = 'dividend_yield'
+    }
+  } else if (form.value.sort_by === 'dividend_yield' && hdPrevSort.value) {
+    form.value.sort_by = hdPrevSort.value
+    hdPrevSort.value = ''
+  }
+  applyFilters()
+}
+
+/** v5 观察池切换：与「仅高股息」互斥（后端会显式 400，这里先在前端把另一个关掉，
+ *  避免用户看到一次报错）。排序口径与主池一致：股息率降序。 */
+function onHdWatchChange() {
+  if (form.value.hd_watch) {
+    form.value.high_dividend = false
+    if (form.value.sort_by !== 'dividend_yield') {
+      hdPrevSort.value = form.value.sort_by
+      form.value.sort_by = 'dividend_yield'
+    }
+  } else if (form.value.sort_by === 'dividend_yield' && hdPrevSort.value) {
+    form.value.sort_by = hdPrevSort.value
+    hdPrevSort.value = ''
+  }
+  applyFilters()
+}
+
+function onSortChange() {
+  if (form.value.sort_by === 'hd_score' && !form.value.high_dividend) {
+    form.value.high_dividend = true
+  }
+  applyFilters()
+}
+
+/** 风格下拉选项（口径与后端 STYLE_CRITERIA 一致；顺序 = 后端分类优先级）
+ *  2026-09-29 修订：删除「价值股/防御股」（边界重叠、误贴率高，防御并入红利），
+ *  红利不再是「唯股息率」，周期闸前置。 */
+const STYLE_OPTIONS = [
+  { value: 'value', label: '价值股', desc: '低估值（PB <2，且 PE <15 或低于行业中位）+ 盈利质量分 ≥70；周期标的只认 PB（券商走「价值+周期」）。红利命中时不再单列价值' },
+  { value: 'growth', label: '成长股', desc: '成长分 ≥75（用户口径「上半区」）且不满足价值条件；周期/券商行业不判成长（防「周期顶当成长」）' },
+  { value: 'cyclical', label: '周期股', desc: '盈利随商品价格/运价/行情波动（有色/化工/油气/运价/地产等，含券商）；煤炭与港口收租除外' },
+  { value: 'dividend', label: '红利股', desc: '股息率 ≥3.95%（≈4.0%）且分红率已知、≤200%；或弱周期/收租行业（银行/高速/电力/煤炭/白酒/中药/港口收租）有可持续分红证据。>12% 多为股价崩了的伪影，不算' },
+  { value: 'blue_chip', label: '蓝筹股', desc: '市值 ≥1000 亿 且 ROE ≥10%（行业龙头；与任意风格并存，如 红利+蓝筹）' },
+] as const
+const styleLabel = (v: string | null | undefined) =>
+  STYLE_OPTIONS.find((o) => o.value === v)?.label ?? ''
 
 /** 质量×价值模式（sort_by = quality_value）的独立参数。
  *  **不改写任何分数**：qv_score 仅排序展示，准入选股靠这里的硬门槛。 */
@@ -154,22 +230,42 @@ const pvEmpty = ref(false)
 const pvReason = ref('')
 /** 信号类别：'' = 全部 / trend = 趋势确认 / reversal = 反转捕捉 */
 const pvCategory = ref<'' | 'trend' | 'reversal'>('')
-/** 裁决筛选（补丁一流水线产出） */
-const pvVerdict = ref<'' | 'SIGNAL' | 'AVOID' | 'IGNORE' | 'STANDBY'>('')
+/** 裁决筛选（黑名单 → 环境分流 → 优先级仲裁 的流水线产出） */
+const pvVerdict = ref<'' | 'SIGNAL' | 'AVOID' | 'BLACKLIST' | 'IGNORE' | 'STANDBY'>('')
 /** 策略环境筛选（补丁二 ADX 分流） */
 const pvEnv = ref<'' | 'TREND' | 'RANGE' | 'WEAK'>('')
 const pvSort = ref('signal_score')
+/** 黑名单总开关（读层）：勾选 = 把黑名单命中的票从列表剔除（一票否决的落地） */
+const pvExcludeBlacklist = ref(false)
 const pvBuilding = ref(false)
 const pvJobError = ref('')
 const pvJobPct = ref(0)
 let pvPollTimer: ReturnType<typeof setInterval> | null = null
 
-const pvItems = computed<PvItem[]>(() => pv.value?.items ?? [])
+/** 盘中护栏（补丁 B：高开砸盘）：按需对当前页的票逐只核对当日分时 */
+const pvGuard = ref<PvGuardData | null>(null)
+const pvGuardLoading = ref(false)
+const pvGuardError = ref('')
 
-/** 裁决徽标文案/色调：买入候选=暖色，规避=风险色，忽略/空仓=中性 */
+const pvItems = computed<PvItem[]>(() => pv.value?.items ?? [])
+/** 黑名单汇总（后端统计直出，不在前端重算） */
+const pvBlacklist = computed(() => pv.value?.blacklist ?? null)
+const pvBlacklistCounts = computed<Record<string, number>>(
+  () => pv.value?.blacklist?.counts ?? {},
+)
+
+/** 盘中护栏结果按 symbol 建索引（未核对的票不显示结论，不默认成「安全」） */
+const pvGuardMap = computed<Record<string, PvGuardItem>>(() => {
+  const out: Record<string, PvGuardItem> = {}
+  for (const it of pvGuard.value?.items ?? []) out[it.symbol] = it
+  return out
+})
+
+/** 裁决徽标文案/色调：买入候选=暖色，规避=绿（A股跌色），黑名单=最重 */
 const PV_VERDICT_LABEL: Record<string, string> = {
   SIGNAL: '保留信号',
   AVOID: '规避',
+  BLACKLIST: '黑名单',
   IGNORE: '忽略',
   STANDBY: '空仓',
 }
@@ -178,30 +274,86 @@ function pvVerdictTone(v: string | null | undefined): string {
   switch (v) {
     // 规避 = 看空 → 绿（A 股习惯：红涨绿跌），与共振模式的「淘汰」灰刻意区分
     case 'AVOID': return 'down'
+    // 黑名单 = 一票否决，比「规避」更重，用专属色调（bl）
+    case 'BLACKLIST': return 'bl'
     case 'SIGNAL': return 'strong'
     case 'STANDBY': return 'medium'
     default: return 'plain'
   }
 }
 
+/** 黑名单命中条件的中文短标签（后端 rules 是 key，这里只做展示翻译） */
+const PV_BL_RULE_ZH: Record<string, string> = {
+  price: '涨幅', turnover: '换手', gap: '高开', volume: '放量', vwap: '破均价', low_price: '低价',
+}
+
+/** 该信号是否被 ADX 环境分流屏蔽（如震荡市屏蔽「量价突破」）：命中则 chip 降灰并提示原因 */
+function pvDroppedOf(row: PvItem, key: string): { why?: string } | undefined {
+  return row.arb?.dropped?.find((d) => d.key === key)
+}
+
+/** 命中黑名单的类型名 + 命中条件（后端 explain 直出，前端不重算） */
+function pvBlacklistNames(row: PvItem): string {
+  const hit = (row.arb?.blacklist ?? []).find((b) => b.hit)
+  if (!hit) return '黑名单'
+  const rs = (hit.rules ?? []).map((r) => PV_BL_RULE_ZH[r] || r).join('+')
+  return rs ? `${hit.name}（${rs}）` : hit.name
+}
+
 /** 裁决列的主文案：保留信号显示信号名，其余显示裁决档位 */
 function pvVerdictText(row: PvItem): string {
   const v = row.arb_verdict
   if (!v) return '未计算'
+  if (v === 'BLACKLIST') return `黑名单 · ${pvBlacklistNames(row)}`
   if (v === 'AVOID') return `规避 · ${row.arb_signal_name || '风险信号'}`
   if (v === 'SIGNAL') return row.arb_signal_name || '保留信号'
   return PV_VERDICT_LABEL[v] || v
 }
 
-/** 裁决 tooltip：把「环境 → 分流 → 仲裁」链路自证出来（后端 explain 直出） */
+/** 裁决 tooltip：把「黑名单 → 环境 → 分流 → 仲裁」链路自证出来（后端 explain 直出） */
 function pvVerdictHint(row: PvItem): string {
   const a = row.arb
   if (!a) return '旧索引未含裁决字段，点「重建扫描」后可用'
-  const parts = [a.explain]
+  const parts: string[] = []
+  for (const b of a.blacklist ?? []) {
+    if (b.hit) parts.push(`【${b.name}】${b.explain}`)
+  }
+  if (a.underlying_explain) {
+    parts.push(`（若不计黑名单，仲裁结论为「${a.underlying_verdict_zh || a.underlying_verdict}」：${a.underlying_explain}）`)
+  }
+  parts.push(a.explain)
   if ((a.dropped ?? []).length) {
     parts.push('被屏蔽：' + a.dropped.map((d) => `${d.name}（${d.why || ''}）`).join('；'))
   }
   return parts.join('\n')
+}
+
+/** 护栏单元文案：区分「命中 / 未见异常 / 不适用」——不适用绝不等同安全 */
+function pvGuardText(row: PvItem): string {
+  const g = pvGuardMap.value[row.symbol]
+  if (!g) return '—'
+  if (g.hit) return '高开砸盘'
+  if (!g.applicable) return '不适用'
+  return '未见异常'
+}
+
+function pvGuardTone(row: PvItem): string {
+  const g = pvGuardMap.value[row.symbol]
+  if (!g) return 'plain'
+  if (g.hit) return 'bl'
+  if (!g.applicable) return 'plain'
+  return 'strong'
+}
+
+function pvGuardHint(row: PvItem): string {
+  const g = pvGuardMap.value[row.symbol]
+  if (!g) return '未核对。点右上「盘中护栏」对当前页逐只核对当日分时（高开 >3% + 开盘30分钟量能节奏 ≥3 倍 + 跌破均价线）。'
+  const lines = [g.date ? `分时日期：${g.date}` : '', g.reason || '']
+  for (const c of g.conditions ?? []) {
+    lines.push(`${c.passed === null ? '·' : c.passed ? '✓' : '✗'} ${c.detail}`)
+  }
+  if (g.stale) lines.push('⚠ 取到的是上一交易日的分时（今日尚无数据），属于复盘而非实时。')
+  return lines.filter(Boolean).join('\n')
 }
 
 /** 摘要条计数：直接读后端统计（口径一致，不在前端重算） */
@@ -226,9 +378,29 @@ onUnmounted(stopPvPoll)
  *  这里按阶段权重折算并取 max 保证单调（与 PriceVolumeView 同口径）。 */
 const PV_PHASE_RANGE: Record<string, [number, number]> = {
   starting: [0, 0.02],
-  load: [0.02, 0.35],
-  scan: [0.35, 1],
+  load: [0.02, 0.30],
+  // 黑名单层：拉全市场换手率快照（约 2 秒，5 个批量请求）
+  snapshot: [0.30, 0.42],
+  scan: [0.42, 1],
   cache: [1, 1],
+}
+
+/** 盘中护栏：对**当前页**的票逐只核对当日分时（后端逐票串行，最多 50 只）。
+ *  只提示、不改分；非交易时段后端返回 applicable=false（**不等于安全**）。 */
+async function runPvGuard() {
+  const syms = pvItems.value.map((r) => r.symbol)
+  if (!syms.length) return
+  pvGuardLoading.value = true
+  pvGuardError.value = ''
+  try {
+    const { data } = await fetchPriceVolumeIntradayGuard({ symbols: syms.join(',') })
+    pvGuard.value = data.data
+  } catch (e) {
+    pvGuard.value = null
+    pvGuardError.value = apiErrorText(e, '盘中护栏核对失败')
+  } finally {
+    pvGuardLoading.value = false
+  }
 }
 
 async function pollPvJob() {
@@ -308,6 +480,7 @@ async function loadPv() {
       industry: q.industry.trim() || undefined,
       min_market_cap_yi: q.min_market_cap_yi === '' ? undefined : Number(q.min_market_cap_yi),
       exclude_st: q.exclude_st,
+      exclude_blacklist: pvExcludeBlacklist.value || undefined,
     })
     const payload = data.data
     if (payload.empty) {
@@ -319,6 +492,8 @@ async function loadPv() {
       pvEmpty.value = false
       pvReason.value = ''
       pv.value = payload
+      // 换页/换筛选后旧的护栏结论已不对应当前列表 → 清掉，避免张冠李戴
+      pvGuard.value = null
     }
   } catch (e) {
     pv.value = null
@@ -644,6 +819,7 @@ async function goPage(p: number) {
 }
 
 const coverage = computed<MarketScanCoverage | null>(() => reso.value?.coverage ?? report.value?.coverage ?? null)
+const quoteOverlay = computed<QuoteOverlay | null>(() => reso.value?.quote_overlay ?? report.value?.quote_overlay ?? null)
 const items = computed<MarketScanItem[]>(() => report.value?.items ?? [])
 const isDimSort = computed(() => form.value.sort_by !== 'composite_score' && form.value.sort_by !== 'resonance')
 const dimSortLabel = computed(
@@ -659,8 +835,9 @@ const coverageWarning = computed(() => {
   if (!c.complete) {
     msgs.push(`当前只覆盖 ${c.covered} / ${c.universe} 只（${c.coverage_pct}%），未覆盖标的不在榜内`)
   }
-  if (c.stale_days != null && c.stale_days > 3) {
-    msgs.push(`快照最近构建于 ${formatTime(c.latest_built_at)}，已滞后 ${c.stale_days} 天`)
+  // 披露窗口期才要求快照紧随财报重建；非披露期「滞后 N 天」是设计行为，不按告警渲染
+  if (c.disclosure_window && c.stale_days != null && c.stale_days > 3) {
+    msgs.push(`披露窗口期内快照最近构建于 ${formatTime(c.latest_built_at)}，已滞后 ${c.stale_days} 天`)
   }
   return msgs.join('；')
 })
@@ -668,8 +845,34 @@ const coverageWarning = computed(() => {
 const coverageTone = computed(() => {
   const c = coverage.value
   if (!c || !c.covered) return 'bad'
-  if (!c.complete || (c.stale_days ?? 0) > 3) return 'warn'
+  if (!c.complete) return 'warn'
+  if (c.disclosure_window && (c.stale_days ?? 0) > 3) return 'warn'
   return 'ok'
+})
+
+/** 覆盖率正常时的说明：区分披露窗口期 / 非披露期（后者滞后属设计行为）。 */
+const coverageOkText = computed(() => {
+  const c = coverage.value
+  if (!c) return ''
+  const base = `已覆盖全部沪深主板标的（${c.universe} 只），榜单即为样本内全市场排序。`
+  const tail = c.disclosure_window
+    ? '披露窗口期内，快照会在新财报发布后重建。'
+    : `非披露窗口期不重建、因子分冻结属设计：每天 ${'16:35'} 例行检查只补缺失条目，`
+      + '股价/市值/PE/PB/股息率等行情字段已按最新行情覆盖，不受快照冻结影响。'
+  return base + tail
+})
+
+/** 行情覆盖自证文案。 */
+const quoteOverlayText = computed(() => {
+  const q = quoteOverlay.value
+  if (!q) return ''
+  if (q.applied) {
+    const n = q.applied_count ?? 0
+    const miss = (q.missed_no_quote ?? 0) + (q.missed_bad_price ?? 0)
+    return `行情已覆盖 ${n} 只${miss ? `（${miss} 只无行情/停牌，保留快照价）` : ''}`
+      + `${q.as_of ? `，行情时间 ${formatTime(q.as_of)}` : ''}。`
+  }
+  return '行情覆盖未生效（行情源暂不可用），股价等为快照构建时价。'
 })
 
 /** 因子库口径重建进度：跑出来几条就显示几条；重建活跃时 5s 轮询，完成即停。 */
@@ -805,6 +1008,9 @@ async function load() {
       min_market_cap_yi: q.min_market_cap_yi === '' ? undefined : Number(q.min_market_cap_yi),
       exclude_st: q.exclude_st,
       include_gem: q.include_gem,
+      style: q.style || undefined,
+      high_dividend: q.high_dividend || undefined,
+      hd_watch: q.hd_watch || undefined,
     })
     report.value = data.data ?? null
     // 条件变更导致命中数缩水时回退页码，避免停在空页
@@ -901,7 +1107,11 @@ const qvTotalPages = computed(() =>
 )
 
 function resetFilters() {
-  const sortBy = form.value.sort_by
+  // hd_score / dividend_yield 都可能是筛选联动切过来的排序，重置时还原到联动前的
+  // 排序，没记过就回默认（resonance）。判据：只要「记过 hdPrevSort」，当前这个排序
+  // 就是联动切来的（手动选择不会同时留下 hdPrevSort）。
+  const sortBy = hdPrevSort.value || ('resonance' as MarketScanSort)
+  hdPrevSort.value = ''
   form.value = {
     sort_by: sortBy,
     keyword: '',
@@ -910,6 +1120,9 @@ function resetFilters() {
     min_market_cap_yi: '',
     exclude_st: true,
     include_gem: false,
+    style: '',
+    high_dividend: false,
+    hd_watch: false,
     top: 50,
     offset: 0,
     min_tech: 70,
@@ -938,6 +1151,9 @@ function resetFilters() {
   pvVerdict.value = ''
   pvEnv.value = ''
   pvSort.value = 'signal_score'
+  pvExcludeBlacklist.value = false
+  pvGuard.value = null
+  pvGuardError.value = ''
   if (resoMode.value) {
     loadResonance()
     return
@@ -1021,7 +1237,10 @@ const displayItems = computed<DisplayRow[]>(() => {
     const vf = verdictFilter.value
     if (vf) {
       const allow = VERDICT_FILTER_SETS[vf]
-      rows = rows.filter((r) => allow.includes(r.verdict))
+      // 档位筛选只对**有档位**的行生效：质量价值/价量等模式的行没有 `verdict`
+      // （DisplayRow 的 verdict 来自 Partial<OverlayFields>，故类型上是可选的），
+      // 缺失档位不应被任何筛选集合命中。
+      rows = rows.filter((r) => r.verdict != null && allow.includes(r.verdict))
     }
     return rows
   }
@@ -1310,6 +1529,10 @@ onMounted(() => {
             <b>{{ coverage.remaining }}</b>
             <em>待构建</em>
           </span>
+          <span v-if="coverage.excluded_non_main > 0" class="figure">
+            <b>{{ coverage.excluded_non_main }}</b>
+            <em>双创（不在样本）</em>
+          </span>
           <span class="figure">
             <b>{{ formatTime(coverage.latest_built_at) }}</b>
             <em>最近构建</em>
@@ -1334,11 +1557,14 @@ onMounted(() => {
           </div>
         </div>
         <p v-if="coverageWarning" class="coverage-warn">{{ coverageWarning }}</p>
-        <p v-else class="coverage-ok">已覆盖全部沪深标的，榜单即为全市场排序。</p>
+        <p v-else class="coverage-ok">{{ coverageOkText }}</p>
+        <p v-if="quoteOverlayText" class="coverage-hint">{{ quoteOverlayText }}</p>
         <p class="coverage-hint">
-          缺口源自单次构建预算截断（单只约 13s）。补齐：
-          <code>POST /api/v1/fundamentals/factors/rebuild?budget_sec=10800&amp;max_symbols=4300</code>
-          ，或在服务端把 <code>FACTOR_BUILD_DEADLINE_SEC</code> 放宽后等夜间批跑。
+          样本 = 沪深主板
+          <template v-if="coverage.excluded_non_main > 0">（另有 {{ coverage.excluded_non_main }} 只创业板/科创板不在默认榜单样本）</template>
+          。覆盖率为 100% 时无缺口；不足时可在服务端触发补齐
+          <code>POST /api/v1/fundamentals/factors/rebuild</code>
+          （单只约 13s，受单次构建预算截断，补齐是渐进的）。
         </p>
       </div>
       <p v-else class="coverage-warn">覆盖率读取失败。</p>
@@ -1347,7 +1573,7 @@ onMounted(() => {
     <section class="card filters">
       <label class="field">
         <span>排序维度</span>
-        <select v-model="form.sort_by" @change="applyFilters">
+        <select v-model="form.sort_by" @change="onSortChange">
           <option v-for="opt in SORT_OPTIONS" :key="opt.value" :value="opt.value">
             {{ opt.label }}
           </option>
@@ -1370,6 +1596,52 @@ onMounted(() => {
           placeholder="如 银行 / 煤炭"
           @keyup.enter="applyFilters"
         />
+      </label>
+      <label
+        v-if="!resoMode && !qvMode && !pvMode"
+        class="field"
+        title="风格为读层展示口径（两维叠加：维度A 价值/成长 二选一；维度B 周期/红利/蓝筹 命中即加；红利命中时不再单列价值），只筛选不改分数：价值=PB<2 且（PE<15 或低于行业中位）+ 盈利质量分≥70，周期标的只认 PB（券商=价值+周期）；成长=成长分≥75 且不满足价值条件，周期/券商不判成长；周期=强周期行业或券商，煤炭与港口收租除外；红利=股息率≥3.95% 且分红率已知、≤200%，或弱周期/收租行业有可持续分红证据；蓝筹=市值≥1000亿且ROE≥10%（可与任意风格并存）。条目可多标签（如 价值+周期 / 周期+红利 / 成长+红利 / 红利+蓝筹）。标签按披露报告期快照值判定（不受日内价波动影响），列表展示的股息率/估值仍为实时值。"
+      >
+        <span>风格</span>
+        <select v-model="form.style" @change="applyFilters">
+          <option value="">全部</option>
+          <option v-for="opt in STYLE_OPTIONS" :key="opt.value" :value="opt.value" :title="opt.desc">
+            {{ opt.label }}
+          </option>
+        </select>
+      </label>
+      <label
+        v-if="!resoMode && !qvMode && !pvMode"
+        class="field"
+        title="高股息筛选（服务端过滤，不改分数；真高股息防御型口径 v5——用户口径①②③ = 判据⑦⑧⑨）——v4 六条判据：① 剔除 ST/退市 且 市值≥30亿；② 动态股息率门槛：强周期行业（航运港口/煤炭开采/普钢/特钢/工业金属/小金属/能源金属/贵金属/金属新材料/化学原料/农化制品/水泥）要求【近三年平均股息率≥5%】——用三年均值平滑周期股景气高点的单年虚高；其余行业要求【TTM 股息率≥3.5%】；③ 分红档案新鲜度：分红档案的最新完整会计年度须 ≥ 最近应已披露完毕的年度（随日期滚动，5 月起要求上一完整年度、1~4 月放宽一年）——档案停更的「股价崩塌型」标的不入选（它们的高息是股价下跌放大了冻结的历史分红，不是防御属性）；④ 连续现金分红≥3 年 且 支付率 30%~90%（防象征性分红与透支分红）；⑤ 财务底线（软组合，两条都差才否）：偿债能力分≥40 或 经营现金流覆盖分红≥1.0 倍；⑥ 估值拥挤度熔断：PE/PB 历史分位取较高者 ≥95 时剔除（防高位接盘）。任一必判维度缺数据即不入选（缺失不免检；唯独估值拥挤度缺失=未判定，不熔断）。命中集按【池内分位归一】算综合评分 = 0.4×股息率分位 + 0.3×偿债分分位 + 0.3×支付率接近度分位（原式三维量纲不一致会让偿债分独占权重）；不指定排序时名单默认按【股息率降序】展示（想按该评分排，排序选「真高股息评分」）。每条条目另带 hd_metrics 台账 —— 六条判据各自**实际取用的数字**（判据股息率 yield_used_pct / 列表展示股息率 yield_display_pct / 偿债分 solvency / 现金流覆盖 ocf_div_cover / PE·PB 历史分位 / 熔断取值 crowd_pct / 支付率 / 档案年度 / 市值），可逐条自证：注意表格里的「综合分位」列是横截面综合分排名，**不是**判据⑥用的估值历史分位（两者名字像、含义不同）。分红连续年限、近三年均息与档案年度来自分红历史档案表（东财分红历史落地），无档案的标的按缺数据不入选。本口径不含 ROE/扣非/负债率/存贷双高/质押/减持六维；其中存贷双高（读层精判）、大股东质押≥50%、减持窗口会在条目留痕里作「提示·不参与判定」标出。【v5 三条 · 2026-09-30】⑦ 当前 TTM 股息率 <4.0% 一律移出主池（**含周期股**：三年均息是② 的事，⑦ 看的是「当年还有多少息」；判据取**快照锚定值**，不随盘中价漂移）——靶点：冀中能源三年均息 11.47% 但当年 TTM 仅 2.29%；⑧ 隐含分红率自洽校验 = 快照 TTM 息 × PE（≡ 每股分红÷每股收益）：>150% 视为「息与盈利不自洽」直接剔除（靶点：长虹美菱 422.8% / 力生制药 182.9% / 东鹏控股 179.0%），100~150% **入池但标黄待复核**（列表里带「待复核」标记）；⑨ **亏损分红单列观察池**：PE<0 且①~⑥ 成立 → 移入观察池、**不计主池**（靶点：北大荒 / 万和电气），⑨ **优先于** ⑦⑧（万和电气 TTM 息 3.58%<4.0%，仍进观察池而非被剔除）。观察池请用右侧「观察池」下拉单独查看（与「仅高股息」互斥）。"
+      >
+        <span>高股息</span>
+        <select v-model="form.high_dividend" @change="onHighDividendChange">
+          <option :value="false">不限</option>
+          <option :value="true">仅高股息（主池）</option>
+        </select>
+        <span
+          v-if="form.high_dividend && report"
+          class="hd-count-note"
+          title="v5：主池命中数 = 列表条数；「待复核」= 隐含分红率 100~150% 的标黄票（仍计主池）；「观察池」= 六条判据成立但 PE<0 的亏损分红票，**不计主池**，用右侧「观察池」下拉单独查看"
+        >
+          命中 {{ report.matched }} · 待复核 {{ report.hd_review_count ?? 0 }} · 观察池
+          {{ report.hd_watch_count ?? 0 }}
+        </span>
+      </label>
+      <label
+        v-if="!resoMode && !qvMode && !pvMode"
+        class="field"
+        title="高股息·亏损分红**观察池**（v5 判据⑨）：六条判据（剔ST/市值≥30亿、动态股息率门槛、档案新鲜度、连续分红∧支付率、财务底线、估值拥挤度）**都成立**、但 PE<0 的标的 —— 它们的高息来自亏损状态下的分红（亏损 ≠ 骗息，但盈利不可持续），故**单列观察、不计主池**（靶点：北大荒、万和电气）。观察池不做⑦「当前 TTM 息≥4.0%」与⑧「隐含分红率」判定（亏损状态下两者都失去意义），也不参与池内分位归一评分（hd_score 恒空）。与「仅高股息」互斥：同时传后端会显式报错，此处切换时自动关掉另一个。"
+      >
+        <span>观察池</span>
+        <select v-model="form.hd_watch" @change="onHdWatchChange">
+          <option :value="false">不看</option>
+          <option :value="true">只看亏损分红</option>
+        </select>
+        <span v-if="form.hd_watch && report" class="hd-count-note">
+          {{ report.matched }} 只亏损分红票
+        </span>
       </label>
       <label v-if="!pvMode" class="field">
         <span>综合分 ≥</span>
@@ -1434,6 +1706,13 @@ onMounted(() => {
             </option>
           </select>
         </label>
+        <label
+          class="field checkbox"
+          title="黑名单一票否决的落地开关：命中者直接从列表剔除（买入候选里本来就永远不会出现黑名单票）。"
+        >
+          <input v-model="pvExcludeBlacklist" type="checkbox" @change="applyFilters" />
+          <span>剔除黑名单</span>
+        </label>
       </template>
       <label class="field">
         <span>每页条数</span>
@@ -1455,6 +1734,16 @@ onMounted(() => {
         </button>
         <button class="btn-secondary" type="button" :disabled="loading || qvLoading || pvLoading" @click="resetFilters">
           重置
+        </button>
+        <button
+          v-if="pvMode"
+          class="btn-secondary"
+          type="button"
+          :disabled="pvGuardLoading || !pvItems.length"
+          title="高开砸盘护栏（补丁 B）：对当前页逐只核对当日分时——高开 >3% + 开盘30分钟量能节奏 ≥3 倍 + 现价跌破均价线，三条同时满足才提示规避。非交易时段返回「不适用」，**不等于安全**。"
+          @click="runPvGuard"
+        >
+          {{ pvGuardLoading ? '核对中…' : '盘中护栏' }}
         </button>
       </div>
     </section>
@@ -1654,6 +1943,13 @@ onMounted(() => {
           >买入候选 {{ pvVerdictCounts.SIGNAL || 0 }}</span>
           <span
             class="verdict-chip"
+            :class="pvVerdictTone('BLACKLIST')"
+            :style="{ cursor: 'pointer', outline: pvVerdict === 'BLACKLIST' ? '2px solid currentColor' : 'none' }"
+            :title="`黑名单一票否决（先于 ADX 环境分流与优先级仲裁）：${pvBlacklist?.enabled === false ? '本轮扫描已关闭黑名单层（总开关）' : '妖股黑名单 = 近 3 日涨幅 > 20% 或 换手率 > 25%'}`"
+            @click="pickPvVerdict('BLACKLIST')"
+          >黑名单 {{ pvBlacklistCounts.yaogu || pvBlacklist?.hits || 0 }}</span>
+          <span
+            class="verdict-chip"
             :class="pvVerdictTone('AVOID')"
             :style="{ cursor: 'pointer', outline: pvVerdict === 'AVOID' ? '2px solid currentColor' : 'none' }"
             title="风险类信号命中（价量过热 / 天量滞涨 / PVT顶背离，优先级 ≥5）→ 已从买入列表剔除"
@@ -1680,9 +1976,43 @@ onMounted(() => {
           </span>
         </div>
         <p class="overlay-note dim">
-          流水线：ADX 判环境（&gt;25 趋势市只跑趋势类；20~25 震荡市只跑反转类；&lt;20 无趋势空仓）
-          → 按优先级仲裁取唯一结论（风险类 ≥5 直接判规避）。<b>风险类信号不受环境过滤</b>，
+          流水线：<b>① 黑名单一票否决</b>（妖股：近 3 日涨幅 &gt;20% <i>或</i> 换手率 &gt;25%）
+          → ② ADX 判环境（&gt;25 趋势市只跑趋势类；20~25 震荡市只跑反转类；&lt;20 无趋势空仓）
+          → ③ 按优先级仲裁取唯一结论（风险类 ≥5 直接判规避）。<b>风险类信号不受环境过滤</b>，
           否则趋势市会把「价量过热」这类风险提示一起屏蔽。
+        </p>
+        <!-- 黑名单数据源状态：换手率取不到时**逐票降级为「仅价格条件」并留痕**，不静默 -->
+        <p v-if="pvBlacklist && !pvBlacklist.enabled" class="overlay-note dim">
+          黑名单层：<b>总开关已关闭</b>（本轮扫描未叠加黑名单，重建扫描时可开启）。
+        </p>
+        <p
+          v-else-if="pvBlacklist && (!pvBlacklist.snapshot?.ok || pvBlacklist.turnover_missing)"
+          class="overlay-note warn-note"
+        >
+          黑名单层：换手率快照{{ pvBlacklist.snapshot?.ok ? '' : '获取失败' }}，
+          有 {{ pvBlacklist.turnover_missing }} 只未取到换手率 → 这些票的妖股判定
+          <b>降级为「仅价格条件」</b>（并未当作安全），其中 {{ pvBlacklist.partial }} 只已标 partial。
+          <template v-if="pvBlacklist.snapshot?.errors?.length">
+            错误：{{ pvBlacklist.snapshot.errors.slice(0, 2).join('；') }}
+          </template>
+        </p>
+        <p v-else-if="pvBlacklist" class="overlay-note dim">
+          黑名单层：换手率覆盖 {{ pvBlacklist.turnover_covered }}/{{ pv?.stats?.universe ?? 0 }} 只
+          （快照 {{ pvBlacklist.snapshot?.date || '—' }}
+          {{ pvBlacklist.snapshot?.count ? `· 全市场 ${pvBlacklist.snapshot.count} 只` : '' }}）
+          · 命中 {{ pvBlacklist.hits }} 只
+          <template v-if="pvBlacklist.rule_counts?.price"> · 涨幅条件 {{ pvBlacklist.rule_counts.price }}</template>
+          <template v-if="pvBlacklist.rule_counts?.turnover"> · 换手条件 {{ pvBlacklist.rule_counts.turnover }}</template>
+          <template v-if="pvBlacklist.partial"> · 证据不足 {{ pvBlacklist.partial }}</template>
+        </p>
+        <!-- 盘中护栏结论（补丁 B）：绿色 = 已核对且未见异常；「不适用」绝不等于安全 -->
+        <p v-if="pvGuardError" class="overlay-note warn-note">盘中护栏：{{ pvGuardError }}</p>
+        <p v-else-if="pvGuard" class="overlay-note dim">
+          盘中护栏（{{ pvGuard.session_zh }}，分时 {{ pvGuard.data_date || '—' }}）：
+          已核对 {{ pvGuard.checked }} 只（判据适用 {{ pvGuard.applicable }} 只）·
+          <b :class="pvGuard.hits ? 'warn-note' : ''">命中「高开砸盘」{{ pvGuard.hits }} 只</b>
+          <template v-if="pvGuard.hit_symbols?.length">：{{ pvGuard.hit_symbols.join('、') }}</template>
+          · 不适用 = 数据不足，<b>不等于安全</b>
         </p>
       </div>
 
@@ -1836,8 +2166,12 @@ onMounted(() => {
               <th class="col-num" title="信号强度分：窗口内信号的类别/方向/强度加权（仅用于本视图排序展示）">强度</th>
               <th
                 class="col-verdict"
-                title="信号处理流水线唯一结论：先按 ADX 判策略环境（>25 趋势市 / 20~25 震荡市 / <20 空仓），再按优先级仲裁取唯一信号（风险类 ≥5 直接判规避）。只影响本视图筛选，不进任何评分与门槛。"
+                title="信号处理流水线唯一结论：先过黑名单一票否决（妖股），再按 ADX 判策略环境（>25 趋势市 / 20~25 震荡市 / <20 空仓），最后按优先级仲裁取唯一信号（风险类 ≥5 直接判规避）。只影响本视图筛选，不进任何评分与门槛。"
               >裁决</th>
+              <th
+                class="col-guard"
+                title="盘中护栏（补丁 B 高开砸盘）：高开 >3% + 开盘 30 分钟量能节奏 ≥3 倍 + 现价跌破当日均价线，三条同时满足才提示规避。点右上「盘中护栏」核对当前页；「不适用」= 数据不足/非交易时段，**不等于安全**。"
+              >盘中护栏</th>
               <th class="col-signal" title="回看窗口内触发的价量信号（原始判据，未过滤）；带 · 标记 = 当日仍在生效">信号</th>
               <th class="col-num" title="最新信号距最新一根K线的交易日数；「当日」= 仍在生效">最近</th>
               <th
@@ -1846,6 +2180,10 @@ onMounted(() => {
               >环境 / ADX</th>
               <th class="col-num" title="取自扫描时刻的行情，非实时报价">收盘价</th>
               <th class="col-num hide-mobile">市值(亿)</th>
+              <th
+                class="col-num hide-mobile"
+                title="基本面综合分 / 评级（factor_snapshots，盘后构建）。只读展示：不参与本视图排序与任何门槛；「—」= 因子库未覆盖该票。"
+              >综合分/评级</th>
               <th></th>
             </tr>
           </thead>
@@ -1869,13 +2207,20 @@ onMounted(() => {
                   :title="pvVerdictHint(row)"
                 >{{ pvVerdictText(row) }}</span>
               </td>
+              <td class="col-guard">
+                <span
+                  class="sig-chip"
+                  :class="pvGuardTone(row)"
+                  :title="pvGuardHint(row)"
+                >{{ pvGuardText(row) }}</span>
+              </td>
               <td class="col-signal">
                 <span
                   v-for="s in row.signals.slice(0, 4)"
                   :key="s.key + s.date"
                   class="sig-chip"
-                  :class="s.direction === 'bearish' ? 'plain' : s.category === 'trend' ? 'strong' : 'medium'"
-                  :title="`${s.date} · ${s.category_zh}/${s.direction_zh} · ${s.reason}`"
+                  :class="pvDroppedOf(row, s.key) ? 'plain' : s.direction === 'bearish' ? 'plain' : s.category === 'trend' ? 'strong' : 'medium'"
+                  :title="`${s.date} · ${s.category_zh}/${s.direction_zh} · ${s.reason}${pvDroppedOf(row, s.key) ? `（已被环境屏蔽：${pvDroppedOf(row, s.key)?.why || '见裁决'}）` : ''}`"
                 >
                   {{ s.name }}<template v-if="s.bars_ago === 0"> ·</template>
                 </span>
@@ -1900,6 +2245,13 @@ onMounted(() => {
               </td>
               <td class="col-num">{{ priceText(row.close) }}</td>
               <td class="col-num hide-mobile">{{ num(row.market_cap_yi) }}</td>
+              <td class="col-num hide-mobile">
+                <template v-if="row.composite_score != null || row.final_rating">
+                  <span class="score" :class="scoreTone(row.composite_score ?? 0)">{{ num(row.composite_score) }}</span>
+                  <span class="rating" :class="ratingTone(row.final_rating)">{{ row.final_rating || '—' }}</span>
+                </template>
+                <span v-else class="dim" title="因子库未覆盖该票">—</span>
+              </td>
               <td class="col-action">
                 <RouterLink class="detail-link" :to="`/chart/${row.symbol}`">详情</RouterLink>
               </td>
@@ -1955,7 +2307,10 @@ onMounted(() => {
                 class="col-num"
                 title="周期品「产品价格拐点」预警（只读：不改写任何分数、不参与硬门槛）。只看**产品价** —— 原油/煤等成本项回落是成本改善，不计入预警。"
               >周期价</th>
-              <th class="col-pct">分位</th>
+              <th
+                class="col-pct"
+                title="横截面分位（0~100，越高越好）= 该股**综合分**在当前筛选命中集内的排名位置。**这不是估值分位**：判据⑥「估值拥挤度熔断」用的是 PE/PB 的**5 年历史分位**（相对自身历史贵不贵），取值见条目的 hd_metrics.crowd_pct，或切到「质量×价值」模式看 PE分位% 列。两者名字像、含义完全不同，2026-09-30 曾据此误算过一次名单（把 44 只「综合分位≥95」当成了「估值分位≥95」）。"
+              >综合分位</th>
               <th class="col-num hide-mobile">PE</th>
               <th class="col-num hide-mobile">PB</th>
               <th class="col-num hide-mobile">市值(亿)</th>
@@ -1970,9 +2325,32 @@ onMounted(() => {
                 <div class="sym-cell">
                   <span class="code">{{ row.symbol.split('.')[0] }}</span>
                   <span class="name">{{ row.name || '—' }}</span>
+                  <span
+                    v-if="row.hd_review"
+                    class="hd-badge review"
+                    :title="`高股息·待复核：隐含分红率 ${
+                      row.hd_implied_payout_pct == null
+                        ? '—'
+                        : row.hd_implied_payout_pct.toFixed(1)
+                    }%（100~150%）。口径 = 快照 TTM 股息率 × PE（≡ 每股分红 ÷ 每股收益）；已 >150% 的会被直接剔除，此档保留在主池但需人工确认分红是否为一次性/特别分红（或 PE 分母失真）。`"
+                  >待复核</span>
+                  <span
+                    v-else-if="row.hd_pool === 'watch'"
+                    class="hd-badge watch"
+                    title="高股息·亏损分红观察池：剔除ST/市值≥30亿、动态股息率门槛、档案新鲜度、连续分红∧支付率、财务底线、估值拥挤度六条判据均成立，但当前 PE<0（亏损）。按 v5 判据⑨ 单列观察、不计主池（亏损 ≠ 骗息，只是盈利不可持续）。"
+                  >观察池</span>
                 </div>
               </td>
-              <td class="col-industry industry">{{ row.industry || '—' }}</td>
+              <td class="col-industry industry">
+                {{ row.industry || '—' }}
+                <span
+                  v-for="tag in row.style_tags || []"
+                  :key="tag"
+                  class="style-tag"
+                  :class="`style-${tag}`"
+                  :title="row.style_reason || ''"
+                >{{ styleLabel(tag) }}</span>
+              </td>
               <td class="col-score">
                 <span class="score" :class="scoreTone(row.composite_score)">
                   {{ num(row.composite_score) }}
@@ -2197,6 +2575,17 @@ onMounted(() => {
 .sig-chip.medium { background: rgba(250, 140, 22, 0.14); color: #d46b08; }
 .sig-chip.weak { background: rgba(24, 144, 255, 0.12); color: var(--color-primary); }
 .sig-chip.plain { background: var(--border-color); color: var(--text-secondary); }
+/* 规避 = 看空信号 → 绿（A 股习惯红涨绿跌）；下表与摘要条共用同一套语义色 */
+.sig-chip.down { background: rgba(82, 196, 26, 0.16); color: var(--color-down); }
+/* 黑名单（一票否决）/ 盘中护栏命中 → 最重的警示色，明显区别于「规避」 */
+.sig-chip.bl,
+.verdict-chip.bl {
+  background: rgba(207, 19, 34, 0.10);
+  color: #a8071a;
+  border: 1px solid rgba(207, 19, 34, 0.35);
+}
+.warn-note { color: #d46b08; }
+.col-guard { white-space: nowrap; }
 .verdict-chip {
   display: inline-block;
   padding: 2px 10px;
@@ -2368,8 +2757,43 @@ button.verdict-chip { border: 1px solid transparent; cursor: pointer; }
 .sym-cell { display: flex; flex-direction: column; gap: 2px; }
 .code { font-weight: 600; font-variant-numeric: tabular-nums; }
 .name { font-size: 12px; color: var(--text-secondary); }
+/* 高股息 v5 标记：待复核（隐含分红率 100~150%）/ 观察池（亏损分红 PE<0）。
+   与 .style-tag 同款「浅底 + 深字」，不引入与主题冲突的实底色。 */
+.hd-badge {
+  align-self: flex-start;
+  display: inline-block;
+  margin-top: 1px;
+  padding: 0 5px;
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 15px;
+  cursor: help;
+}
+/* 标黄待复核：琥珀色（刻意与 danger 红分开 —— 它是「请复核」不是「已出问题」） */
+.hd-badge.review { color: #b45309; background: rgba(245, 158, 11, 0.18); }
+/* 观察池：中性蓝（单列 ≠ 风险，只是不计主池） */
+.hd-badge.watch { color: #0369a1; background: rgba(14, 165, 233, 0.16); }
+.hd-count-note { margin-left: 6px; font-size: 11px; color: var(--text-secondary); }
 .rank { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
 .industry { color: var(--text-secondary); font-size: 12px; }
+/* 风格标注：行业名旁的小 tag（读层展示口径，非评分）。浅色底 + 深色字，六风格一色相 */
+.style-tag {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 5px;
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 16px;
+  vertical-align: middle;
+  background: color-mix(in srgb, var(--text-secondary) 12%, transparent);
+  color: var(--text-secondary);
+}
+/* 五类风格标签一色相（两维叠加后一条目可并列多枚）。 */
+.style-value { color: #1d4ed8; background: rgba(59, 130, 246, 0.13); }
+.style-cyclical { color: #b91c1c; background: rgba(239, 68, 68, 0.12); }
+.style-dividend { color: #b45309; background: rgba(245, 158, 11, 0.14); }
+.style-growth { color: #15803d; background: rgba(34, 197, 94, 0.13); }
+.style-blue_chip { color: #6d28d9; background: rgba(139, 92, 246, 0.13); }
 .col-dim { width: 3.2rem; font-variant-numeric: tabular-nums; color: var(--text-secondary); }
 .col-dim.active { background: rgba(24, 144, 255, 0.08); color: var(--text-primary); }
 .col-pct { width: 5.5rem; }

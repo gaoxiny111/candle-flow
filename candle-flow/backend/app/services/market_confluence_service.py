@@ -64,7 +64,11 @@ CACHE_TTL_SEC = 600
 # 000612 实测证伪）；enrichment 新增 nshape_stage/nshape_detail/breakout_gap_days/
 # pullback_days/pullback_shrink/boom_gap_days/ma_bullish/main_flow_net。
 # 旧缓存缺这些字段，必须失效重算。
-CACHE_VERSION = 10
+# 11：高股息 v5（判据⑦当前息4%下限 / ⑧隐含分红率 / ⑨亏损分红观察池）——条目新增
+# hd_pool / hd_review / hd_implied_payout_pct，hd_metrics 新增 yield_ttm_snap_pct /
+# implied_payout_pct。缓存 payload 里的 items 由内部 scan_market 产出，旧缓存缺这些
+# 字段 → 前端标黄与观察池标注会静默失效，故必须 bump 重算。
+CACHE_VERSION = 11
 
 Outcome = Literal["hit", "ok", "skipped", "error", "left_side_blocked", "weak_resonance"]
 Tier = Literal["A", "B", "C", "D", "E"]

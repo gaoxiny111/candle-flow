@@ -651,7 +651,10 @@ def test_high_dividend_valuation_skips_peg_and_value_trap(monkeypatch):
         fd["short_term_borrowings"] = [10e8, 12e8, 13e8]
         return fd, {
             "name": "中国神华",
-            "industry": "煤炭开采",
+            # 2026-09-29：「煤炭开采」已改判强周期（强制走周期框架、不认红利身份），
+            # 故本测试换用非周期行业，以继续覆盖「红利资产估值不用 PEG 锁分、
+            # 不因 ROIC<WACC 触发价值陷阱」这条红利框架路径。
+            "industry": "白酒Ⅱ",
             "symbol": "601088.SH",
             "report_dates": list(fd.index),
             "annual_dates": list(fd.index),
@@ -719,10 +722,122 @@ def test_classify_dividend_asset_soft_tier():
     from app.analysis.dividend_profile import classify_dividend_asset
 
     # 股息率 4.3% + 估分红率≈80% → soft 红利
-    p = classify_dividend_asset(dividend_yield_pct=4.3, pe_ttm=18.8)
+    # industry 为必传参数（强周期前置拦截的输入）；此处显式传非周期行业以走原逻辑。
+    p = classify_dividend_asset(
+        dividend_yield_pct=4.3, pe_ttm=18.8, industry="白酒Ⅱ"
+    )
     assert p["is_dividend_asset"] is True
     assert p["tier"] == "soft"
     assert p["wacc_pct"] == 4.5
+
+
+def test_classify_dividend_asset_cyclical_industry_is_locked_out():
+    """★ 强周期行业**前置拦截**（2026-09-29 定案）：股息率再高、分红再慷慨也不判红利。
+
+    这是评分侧与展示侧对齐的**唯一实现**：``industry`` 必传，命中
+    ``STRONG_CYCLICAL_INDUSTRIES``（申万三级**精确**名）即返回非红利。
+
+    背景：神华（煤炭开采，息 4.25%/分红率 79.1%）、中石油（炼化及贸易，息 4.23%）
+    这类票原先被判红利 → 估值走股息零增长资本化 → 估值分虚高；现在统一走周期框架
+    （正常化利润 + PB-ROE 锚）。10Y 国债锚为 1.7%。
+    """
+    from app.analysis.dividend_profile import classify_dividend_asset
+
+    # 煤炭开采：原判 soft 红利 → 现在必须非红利
+    p = classify_dividend_asset(
+        dividend_yield_pct=4.25, pe_ttm=19.0, payout_ratio_pct=79.1, industry="煤炭开采"
+    )
+    assert p["is_dividend_asset"] is False
+    assert p["tier"] == "cyclical_locked"
+    assert p["cyclical_locked"] is True
+    assert p["wacc_pct"] is None
+    # 展示字段仍完整回传（股息率/利差照常给出，便于页面做「股息锚对照」）
+    assert p["dividend_yield_pct"] == pytest.approx(4.25)
+    assert p["div_bond_spread_pct"] == pytest.approx(4.25 - 1.7, abs=0.01)
+
+    # 炼化及贸易（中石油 / 中石化）
+    assert (
+        classify_dividend_asset(
+            dividend_yield_pct=4.23, pe_ttm=11.56, payout_ratio_pct=54.7,
+            industry="炼化及贸易",
+        )["is_dividend_asset"]
+        is False
+    )
+
+    # 非周期行业不受影响，仍走原逻辑
+    p2 = classify_dividend_asset(
+        dividend_yield_pct=6.0, pe_ttm=18.0, payout_ratio_pct=70.0, industry="白酒Ⅱ"
+    )
+    assert p2["is_dividend_asset"] is True
+    assert p2["tier"] == "high"
+    assert p2["cyclical_locked"] is False
+
+    # 注入自定义名单（唯一实现的另一条入口）
+    p3 = classify_dividend_asset(
+        dividend_yield_pct=6.0, pe_ttm=18.0, payout_ratio_pct=70.0,
+        industry="自定义行业", cyclical_industries=frozenset({"自定义行业"}),
+    )
+    assert p3["is_dividend_asset"] is False
+
+    # industry 必传：漏传 = TypeError（显式失败），而不是静默退化成「不拦截」
+    with pytest.raises(TypeError):
+        classify_dividend_asset(dividend_yield_pct=6.0, pe_ttm=18.0)  # type: ignore[call-arg]
+
+
+def test_cyclical_dividend_lock_consistent_across_modules(monkeypatch):
+    """★ 强周期行业在**全模块**同判非红利（防「一处判一套」，铁律 9/10）。
+
+    用煤炭开采 + 高股息构造，断言估值与盈利两个出口都判「非红利」且
+    ``cyclical_locked=True``；盈利模块的 WACC 不得走红利口径 4.5%。
+    """
+    engine = FundamentalEngine()
+
+    def fake_build(symbol: str, years: int = 5):
+        fd = _sample_financials().copy()
+        return fd, {
+            "name": "测试煤企",
+            "industry": "煤炭开采",
+            "symbol": "601088.SH",
+            "report_dates": list(fd.index),
+            "annual_dates": list(fd.index),
+            "revenue_yoy": 3.0,
+            "profit_yoy": 4.1,
+            "debt_ratio": 33.0,
+            "latest_report": "20250630",
+            "payout_ratio_pct": 79.1,
+            "dividend": {"d0": 2.01, "payout_ratio_pct": 79.1, "consecutive_years": 19},
+        }
+
+    def fake_valuations(*a, **k):
+        return [
+            {
+                "symbol": "601088.SH", "name": "测试煤企", "price": 47.0,
+                "pe_ttm": 19.0, "pb": 2.2, "market_cap": 1e12, "total_shares": 2e10,
+                "dividend_yield": 4.25,
+            }
+        ]
+
+    monkeypatch.setattr("app.analysis.engine.build_financial_dataframe", fake_build)
+    monkeypatch.setattr("app.analysis.engine.industry_averages", lambda *a, **k: {})
+    monkeypatch.setattr("app.analysis.engine.get_valuations", fake_valuations)
+    monkeypatch.setattr(
+        "app.analysis.engine.calculate_comparable_valuation",
+        lambda *a, **k: {
+            "stock_code": "601088.SH", "comparables": [], "avg_pe": None,
+            "avg_pb": None, "valuation_range": {}, "peer_count": 0,
+            "insufficient_sample": True,
+        },
+    )
+
+    report = engine.run_full_analysis("601088.SH", db=None)
+    val = report["valuation"]
+    prof = report["modules"]["profitability"]["metadata"]
+
+    assert val.get("is_dividend_asset") is False
+    assert (val.get("dividend_profile") or {}).get("cyclical_locked") is True
+    assert prof.get("is_dividend_asset") is False
+    # 红利口径 WACC 是 4.5%；被拦截后不得使用它
+    assert prof.get("wacc_pct") != pytest.approx(4.5)
 
 
 def test_high_growth_quality_wacc_and_roic_exemption():
@@ -954,7 +1069,9 @@ def test_dividend_valuation_skips_pe_pb_percentile_drag():
             "profit_yoy": 4.0,
             "debt_ratio": 33.0,
             "name": "中国神华",
-            "industry": "煤炭开采",
+            # 2026-09-29：煤炭开采 → 强周期（强制周期框架）。本测试要覆盖的是
+            # 「红利资产不以 PE/PB 高分位拉低均分」，故换非周期行业。
+            "industry": "白酒Ⅱ",
         },
         cashflow_score=85.0,
     )
@@ -1879,7 +1996,10 @@ def test_dividend_yield_fallback_shared_across_modules(monkeypatch):
         fd = _sample_financials().copy()
         return fd, {
             "name": "测试水泥",
-            "industry": "水泥",
+            # 2026-09-29：「水泥」已改判强周期（强制周期框架）。本测试要覆盖的是
+            # 「股息率回退必须在 ctx 构建前完成、全模块口径一致」，与行业无关，
+            # 故换用非周期行业以继续走红利路径。
+            "industry": "白酒Ⅱ",
             "symbol": "600585.SH",
             "report_dates": list(fd.index),
             "annual_dates": list(fd.index),

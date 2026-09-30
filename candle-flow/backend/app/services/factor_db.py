@@ -122,6 +122,7 @@ def get_many(symbols: list[str]) -> dict[str, dict[str, Any]]:
 def upsert(symbol: str, report: dict[str, Any]) -> None:
     """写入或更新单条因子快照。"""
     db = SessionLocal()
+    written = False
     try:
         # 打上口径版本戳：build_all(force=False) 与盘后任务据此识别"口径已变、
         # 分数需重算"的存量快照（见 SCORING_VERSION 注释）。
@@ -139,11 +140,18 @@ def upsert(symbol: str, report: dict[str, Any]) -> None:
         row.pe_ttm = float(pe_ttm) if pe_ttm is not None else None
         row.built_at = datetime.now(timezone.utc)
         db.commit()
+        written = True
     except Exception:
         logger.debug("factor_db.upsert failed for %s", symbol, exc_info=True)
         db.rollback()
     finally:
         db.close()
+    if written:
+        # 顺带刷新分红档案（真高股息判据的数据底座）：分析期刚调用过东财分红
+        # 接口，同进程 6h 缓存命中 → 基本零额外网络；失败绝不影响快照结果。
+        from app.services.dividend_store import refresh_profile
+
+        refresh_profile(symbol)
 
 
 def _get_all_symbols() -> list[str]:
@@ -287,7 +295,52 @@ _REQUIRED_SNAPSHOT_KEYS: tuple[str, ...] = ("profit_yoy", "scoring_version")
 #      上年同期扣非 <=0 另 +15。**必须 bump**：`_calc_cagr` 在 start<=0 时返回 0，
 #      故 CAGR 闸门对扭亏票天然免疫（全市场实测 0 触发），本条才是拦扭亏的链路。
 #      与 profit_illusion（当期扣非为负）重叠时只取更严者，不累加。
-SCORING_VERSION = "2026.09.22.12"
+# .1 (2026-09-29) 减持释放通道补「终止减持/未减持」（major_risk_events）——
+#      「未减持公司股份暨提前终止减持计划」类公告此前被 all_of 共现判成
+#      新增减持风险扣 8 分（实测天山铝业 002532，2026-06-17 公告，零减持
+#      却扣分）。改判据后观察级扣分与风险乘数变化 → 需全量重建。
+# .2 (2026-09-29) 基本面三改：①成长模块新增「周期/爆款顶点增速未获跨周期
+#      证实」闸门（cycle_normalized，5~7 年年度归母净利序列；利润不在跨周期
+#      中性利润之下时不触发，保住底部修复叙事）；②强周期股估值换锚——不再用
+#      PE 历史分位，改 PB 分位 + 跨周期中性利润 PE + 股息率−国债利差，并新增
+#      「低 PE 且利润处周期中高层」的顶点假便宜判据；③偿债模块新增「存贷双高」
+#      实质扣分（周期股不再近乎免检）；另修 growth.metadata 漏写 profit_cagr_3y
+#      （engine 读它做 classify_growth_stock，此前恒 None → 退化为 pct_change(3)）。
+#      同日晚线上验收三靶点（002532/000792/002558）时又抓到两处「单测全绿但
+#      生产静默失效」，一并修掉（均在本版本内，未再 bump —— 当时全库 3218 条
+#      快照的 scoring_version 仍非本值，尚未有任何快照按本口径落地）：
+#        a) 存贷双高的 `monetary_funds` 键在 `build_financial_dataframe` 产出的
+#           balance_sheet 字典里根本不存在（只留在局部变量算流动比）→ 判据对
+#           全市场恒不触发。已补键；并把分子由「短期借款」改为「有息负债合计」——
+#           实测天山铝业 2026H1 有息负债 100.3 亿、短债仅 23.3 亿，只看短债
+#           永远判不出用户点名的这只票。有息负债为残差估计值时一律不判（留痕）。
+#        b) 顶点闸门的位置分母由算术平均改为中性利润（窗口中位数）：单一结构
+#           断裂年会把均值摧毁 —— 盐湖股份 2019 年破产重整计提 -458.6 亿
+#           （真实披露值）→ 2019–2025 七年均值 -3.9 亿 <0 → 位置无法判定 →
+#           闸门静默失效，恰好漏掉用户点名的「盐湖 +138%」。改中位后
+#           盐湖位置 1.82× → 触发扣减 24.8。
+# 2026.09.29.3：**强周期行业前置拦截红利身份**（用户裁决；评分侧与展示侧统一）。
+#      `dividend_profile.classify_dividend_asset` 新增 `industry` 必传参数，
+#      行业 ∈ STRONG_CYCLICAL_INDUSTRIES（申万三级精确名）即判非红利
+#      （is_dividend_asset=False / tier="cyclical_locked"），无论股息率多高、分红多慷慨。
+#      理由：强周期利润由商品价格/运价主导，景气高点的股息来自**峰值利润**、
+#      现金流不可持续，按股息做零增长资本化会「骗」出虚高的估值分与综合分。
+#      配套三处：①展示层取消「|净利同比| > 30%」的周期**身份**闸（只留作周期位置标记）；
+#      ②废除 market_scan 的煤炭红利豁免（COAL_DIVIDEND_INDUSTRIES 已删）；
+#      ③5 处调用点（engine×2 / cashflow / profitability / risk）均显式传 industry。
+#      影响面：全库 3218 条中强周期行业 723 只，其中当前判红利 90 只改走周期框架
+#      （另约 30 只估值分本就被 value_trap 锁在 28，不受影响）。
+# 2026.09.30.1：**纯数据卫生 bump，评分口径零变化**（不要误读为改分）。
+#      起因：2026.09.29.3 的重建在 09-30 盘中 11:00–14:17 跑了 2075 只，
+#      日内价被烤进估值/估值分位/股息率等字段；而 daily 定时任务的
+#      `build_all(force=False)` 在非披露期（9 月）只补「版本落后/缺失」项，
+#      这 2075 只版本已匹配 → 当日 16:35 会被**跳过**，日内价将长期留存
+#      （即「禁止盘中重建」铁律描述的那个坑）。
+#      处置：bump 版本使全库 3218 只统一变为「版本落后」，于 09-30 收盘价定稿后
+#      一次性全量重建，把价格基准统一到当日收盘价。
+#      副作用：bump 后重建期间读层缓存指纹（max(built_at)）持续变化 → 扫描会
+#      反复重建读缓存，属预期内的一次性开销。
+SCORING_VERSION = "2026.09.30.1"
 
 
 def _outdated_snapshot_symbols() -> set[str]:

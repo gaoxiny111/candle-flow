@@ -50,6 +50,7 @@ class RiskAnalyzer(BaseAnalyzer):
             dividend_yield_pct=kwargs.get("dividend_yield"),
             pe_ttm=kwargs.get("pe_ttm"),
             payout_ratio_pct=kwargs.get("payout_ratio_pct"),
+            industry=industry,
         )
         quality_ar = is_quality_receivable_context(
             name=name,

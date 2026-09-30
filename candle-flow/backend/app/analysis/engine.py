@@ -29,9 +29,11 @@ from app.analysis.dividend_profile import (
 )
 from app.analysis.growth_quality import HIGH_GROWTH_WACC_PCT, classify_high_growth_quality
 from app.analysis.growth_profile import classify_growth_stock
+from app.analysis.cycle_normalized import cross_cycle_stats
 from app.analysis.financials import build_financial_dataframe, industry_averages
 from app.analysis.models.dcf import DCFModel
 from app.analysis.models.ddm import DDMModel
+from app.analysis.models.intrinsic import compute_intrinsic_value
 from app.analysis.models.relative import RelativeValuation
 from app.analysis.models.comps import calculate_comparable_valuation
 from app.analysis.modules.profitability import _estimate_wacc_pct
@@ -142,6 +144,13 @@ CYCLE_TRAP_PE_PCT_MAX = 30.0
 CYCLE_TRAP_PB_PCT_MIN = 70.0
 CYCLE_TRAP_ROE_MIN = 15.0
 CYCLE_TRAP_HAIRCUT = 12.0
+# 跨周期口径的周期顶点判据：利润处跨周期中性利润的 1.15 倍以上 = 中高位。
+# 为什么需要这条独立判据：cycle_trap_hit 要求 PB 分位 ≥70 且 ROE ≥15，
+# 在 PB 分位缺失或资产端尚未被抬高时（利润顶但 PB 还没跟上）会漏判；
+# 而「低 PE + 利润处周期中高位」本身就是顶点假便宜的充分证据，不依赖 PB。
+CYCLE_PEAK_POSITION_MIN = 1.15
+# 绝对 PE 视为「便宜」的上限（周期股口径，与 CYCLE_TRAP_PE_PCT_MAX 平行）
+CYCLE_TRAP_PE_ABS_MAX = 15.0
 # 估值合理性折减的全局上限（现金流折减与周期陷阱折减共用，禁止叠加）
 VALUATION_HAIRCUT_MAX = 22.0
 
@@ -293,6 +302,32 @@ def cycle_trap_hit(
         and float(pb_pct) >= CYCLE_TRAP_PB_PCT_MIN
         and float(roe) >= CYCLE_TRAP_ROE_MIN
     )
+
+
+def cycle_peak_trap_hit(
+    pe_pct: float | None,
+    pe_abs: float | None,
+    position_ratio: float | None,
+) -> bool:
+    """「低 PE + 利润处周期中高位」= 顶点假便宜（跨周期口径）。
+
+    与 ``cycle_trap_hit`` 的分工：后者是「PE 低分位 + PB 高分位 + 高 ROE」的
+    资产端三角验证；本函数只看盈利端 —— 只要 PE 看着便宜（历史分位 ≤30% 或
+    绝对 PE ≤15）**且**当前利润已高于跨周期中性利润（position ≥1.15×），
+    就判定「便宜来自周期顶点」而非「资产便宜」。两条判据互补，调用方取 OR。
+    任一输入缺失即返回 False（不猜、不给缺失数据加权）。
+    """
+    if position_ratio is None:
+        return False
+    try:
+        if float(position_ratio) < CYCLE_PEAK_POSITION_MIN:
+            return False
+    except (TypeError, ValueError):
+        return False
+    cheap = (pe_pct is not None and float(pe_pct) <= CYCLE_TRAP_PE_PCT_MAX) or (
+        pe_abs is not None and 0 < float(pe_abs) <= CYCLE_TRAP_PE_ABS_MAX
+    )
+    return bool(cheap)
 
 
 class FundamentalEngine:
@@ -461,6 +496,9 @@ class FundamentalEngine:
             # （同一判定不在两处各算、不产生两个 is_growth）。
             "pb": market.get("pb"),
             "latest_gross_margin": meta.get("latest_gross_margin"),
+            # 跨周期年度归母净利序列（1231 口径，financials 单一来源）：
+            # 供成长模块判定「单期顶点增速是否获跨周期记录证实」。
+            "cycle_annual_profit": meta.get("cycle_annual_profit"),
             "industry_avg": industry_averages(meta.get("industry", ""), meta.get("latest_report")),
             **kwargs,
         }
@@ -917,6 +955,8 @@ class FundamentalEngine:
             dividend_yield_pct=div,
             pe_ttm=pe,
             payout_ratio_pct=float(real_payout) if real_payout is not None else None,
+            industry=meta.get("industry"),
+            cyclical_industries=STRONG_CYCLICAL_INDUSTRIES,
         )
         is_div = bool(div_profile.get("is_dividend_asset"))
         result["dividend_profile"] = div_profile
@@ -1060,6 +1100,12 @@ class FundamentalEngine:
                 )
         result["relative"] = rel
 
+        # ── 跨周期中性利润口径：估值打分「周期换锚」与内在价值「周期正常化锚」
+        # 共用同一次产出（铁律 10：同一判定不两处各算）。提前到分支之前，
+        # 使内在价值组装层也能拿到 position_ratio / neutral。
+        _ind_anchor = str(meta.get("industry") or "").strip()
+        _cycle_stats = cross_cycle_stats(meta.get("cycle_annual_profit"))
+
         scores: list[float] = []
         weights_list: list[float] = []
         breakdown: list[dict[str, Any]] = []
@@ -1102,30 +1148,103 @@ class FundamentalEngine:
             # 「周期股分红承诺≥45% +5」），无需外部再溢价。
         else:
             # ── 估值评分：历史分位50% + 相对估值30% + 股息率20% ──
-            # 1. PE历史分位（权重50%）
+            # 强周期股换锚：PE 历史分位在周期股上方向是反的 —— 利润处顶点时
+            # PE 天然显得低（分位低 → 被读成「历史底部」），利润塌陷时 PE 天然
+            # 显得高。故周期股不看 PE 分位，改看资产端（PB 分位）+ 跨周期中性
+            # 利润（PE）+ 现金回报（股息率−国债利差）。相对 PE 保留（同业口径，
+            # 非自身历史分位）。_ind_anchor / _cycle_stats 已在上方分支外统一产出。
+            cycle_neutral_pe: float | None = None
+            # 中性利润用 cross_cycle_stats 的 `neutral`（窗口中位数）：与成长侧
+            # 闸门同一口径、同一函数产出，避免「同一判定两处各算」（铁律10）。
+            _neutral_profit = _cycle_stats.get("neutral") if _cycle_stats else None
+            if (
+                _neutral_profit
+                and market.get("market_cap")
+                and float(_neutral_profit) > 0
+                and float(market["market_cap"]) > 0
+            ):
+                cycle_neutral_pe = round(
+                    float(market["market_cap"]) / float(_neutral_profit), 1
+                )
+            position_ratio = (
+                _cycle_stats.get("position_ratio") if _cycle_stats else None
+            )
+            _is_cycle_anchor = _ind_anchor in STRONG_CYCLICAL_INDUSTRIES and not is_div
+            anchor_added = False
+            _spread_added = False
+            if _is_cycle_anchor:
+                if pb_pct is not None:
+                    ppb = float(pb_pct)
+                    if ppb < 10:
+                        pb_pct_score = 90.0
+                    elif ppb < 30:
+                        pb_pct_score = 70.0
+                    elif ppb < 70:
+                        pb_pct_score = 50.0
+                    elif ppb < 90:
+                        pb_pct_score = 30.0
+                    else:
+                        pb_pct_score = 10.0
+                    _add_points("PB历史分位", pb_pct_score, f"分位{ppb:.0f}%", weight=0.35)
+                    anchor_added = True
+                if cycle_neutral_pe is not None:
+                    npe = cycle_neutral_pe
+                    if npe < 8:
+                        npe_score = 88.0
+                    elif npe < 12:
+                        npe_score = 74.0
+                    elif npe < 18:
+                        npe_score = 55.0
+                    elif npe < 25:
+                        npe_score = 38.0
+                    else:
+                        npe_score = 25.0
+                    _add_points(
+                        "中性利润PE",
+                        npe_score,
+                        f"市值/跨周期中性利润={npe:.1f}x"
+                        f"（中性利润（{_cycle_stats['n']}年中位）"
+                        f"{float(_neutral_profit) / 1e8:.1f}亿，"
+                        f"当前利润位置 {float(position_ratio):.2f}x）",
+                        weight=0.35,
+                    )
+                    anchor_added = True
+                if div is not None:
+                    _sp = round(float(div) - CN_10Y_BOND_YIELD_PCT, 2)
+                    _, _sp_pts = dividend_spread_signal(_sp)
+                    _add_points(
+                        "股息国债利差",
+                        _sp_pts,
+                        f"股息率{float(div):.1f}%−国债{CN_10Y_BOND_YIELD_PCT:.1f}%={_sp:.1f}pct",
+                        weight=0.30,
+                    )
+                    anchor_added = True
+                    _spread_added = True
             pe_pct_val = rel.get("PE_TTM", {}).get("percentile_5y")
-            if pe_pct_val is not None:
-                pp = float(pe_pct_val)
-                if pp < 10:
-                    pe_pct_score = 90.0
-                elif pp < 30:
-                    pe_pct_score = 70.0
-                elif pp < 70:
-                    pe_pct_score = 50.0
-                elif pp < 90:
-                    pe_pct_score = 30.0
-                else:
-                    pe_pct_score = 10.0
-                _add_points("PE历史分位", pe_pct_score, f"分位{pp:.0f}%", weight=0.50)
-            elif pe is not None and 0 < float(pe):
-                # 无历史分位时用绝对PE回退
-                pv = float(pe)
-                if pv < 12:
-                    _add_points("绝对PE", 88, f"PE={pv:.1f}<12（无分位数据）")
-                elif pv < 20:
-                    _add_points("绝对PE", 65, f"PE={pv:.1f}（无分位数据）")
-                else:
-                    _add_points("绝对PE", 40, f"PE={pv:.1f}（无分位数据）")
+            if not anchor_added:
+                # 1. PE历史分位（权重50%）；周期锚数据全缺时回退此口径
+                if pe_pct_val is not None:
+                    pp = float(pe_pct_val)
+                    if pp < 10:
+                        pe_pct_score = 90.0
+                    elif pp < 30:
+                        pe_pct_score = 70.0
+                    elif pp < 70:
+                        pe_pct_score = 50.0
+                    elif pp < 90:
+                        pe_pct_score = 30.0
+                    else:
+                        pe_pct_score = 10.0
+                    _add_points("PE历史分位", pe_pct_score, f"分位{pp:.0f}%", weight=0.50)
+                elif pe is not None and 0 < float(pe):
+                    # 无历史分位时用绝对PE回退
+                    pv = float(pe)
+                    if pv < 12:
+                        _add_points("绝对PE", 88, f"PE={pv:.1f}<12（无分位数据）")
+                    elif pv < 20:
+                        _add_points("绝对PE", 65, f"PE={pv:.1f}（无分位数据）")
+                    else:
+                        _add_points("绝对PE", 40, f"PE={pv:.1f}（无分位数据）")
             # 2. 相对估值（权重30%）：PE / 同行中位数
             peer_pe = comps.get("avg_pe") if sample_ok else None
             if pe is not None and peer_pe is not None and float(peer_pe) > 0:
@@ -1143,8 +1262,8 @@ class FundamentalEngine:
                     _add_points("可比公司", 82, "相对可比低估")
                 elif comps_signal == "高估":
                     _add_points("可比公司", 30, "相对可比高估")
-            # 3. 股息率（权重20%）
-            if div is not None:
+            # 3. 股息率（权重20%）；已用「股息国债利差」入锚的周期股不重复计
+            if div is not None and not _spread_added:
                 dy = float(div)
                 if dy > 4:
                     div_score = 90.0
@@ -1249,6 +1368,17 @@ class FundamentalEngine:
                 "成长/周期反转口径：PE/PB 极端值不直接判高估，"
                 "参考毛利率（技术壁垒）、营收增速（赛道景气）与周期位置"
             )
+        elif _is_cycle_anchor:
+            rationale_parts.append(
+                "强周期口径：不使用 PE 历史分位（利润在顶/在底时 PE 方向相反），"
+                "改以 PB 历史分位 + 跨周期中性利润 PE + 股息率−国债利差为锚；"
+                "仅当低 PE 与利润处周期中低位同时成立才确认低估"
+                + (
+                    f"（当前利润位置 {float(position_ratio):.2f}× 跨周期中性利润）"
+                    if position_ratio is not None
+                    else "（跨周期窗口不足，位置未判定）"
+                )
+            )
         if breakdown:
             parts = [f"{b['factor']}{b['points']:.0f}" for b in breakdown]
             verb = "加权" if is_div and not is_cycle_val else "均值"
@@ -1283,16 +1413,58 @@ class FundamentalEngine:
             pb_pct_c = (rel.get("PB") or {}).get("percentile_5y")
             roe_c_raw = meta.get("latest_roe")
             roe_c = float(roe_c_raw) if roe_c_raw is not None else None
-            if cycle_trap_hit(pe_pct_c, pb_pct_c, roe_c):
+            _trap_asset = cycle_trap_hit(pe_pct_c, pb_pct_c, roe_c)
+            _trap_peak = cycle_peak_trap_hit(pe_pct_c, pe, position_ratio)
+            # 真低估双条件：低 PE **且** 利润未处周期中高位。只有低 PE 而利润
+            # 已在跨周期中性利润之上（position ≥1.15×）= 顶点假便宜，绝不确认低估。
+            _pe_cheap = (
+                pe_pct_c is not None and float(pe_pct_c) <= CYCLE_TRAP_PE_PCT_MAX
+            ) or (pe is not None and 0 < float(pe) <= CYCLE_TRAP_PE_ABS_MAX)
+            _profit_low = position_ratio is not None and float(position_ratio) <= 1.0
+            _cyc = _cycle_stats or {}
+            result["cycle_position"] = {
+                "position_ratio": position_ratio,
+                "cycle_avg_profit": _cyc.get("avg"),
+                "cycle_median_profit": _cyc.get("median"),
+                # 判据实际使用的中性利润（窗口中位数）—— 与成长侧闸门同源同口径。
+                "cycle_neutral_profit": _cyc.get("neutral"),
+                "cycle_cagr_pct": _cyc.get("cagr_pct"),
+                "neutral_pe": cycle_neutral_pe,
+                "period": (
+                    f"{str(_cyc.get('base_period'))[:4]}–{str(_cyc.get('latest_period'))[:4]}"
+                    if _cyc.get("base_period")
+                    else None
+                ),
+                "series": _cyc.get("series"),
+                "pe_cheap": bool(_pe_cheap),
+                "profit_cycle_low": bool(_profit_low),
+                "true_undervalued": bool(_pe_cheap and _profit_low),
+            }
+            if _trap_asset or _trap_peak:
                 cycle_haircut = CYCLE_TRAP_HAIRCUT
                 result["cycle_trap_warning"] = True
+                _bits: list[str] = []
+                if pe_pct_c is not None:
+                    _bits.append(f"PE 历史分位 {float(pe_pct_c):.0f}%")
+                if pe is not None and float(pe) > 0:
+                    _bits.append(f"PE {float(pe):.1f}x")
+                if position_ratio is not None:
+                    _bits.append(f"利润位置 {float(position_ratio):.2f}× 跨周期中性利润")
+                if pb_pct_c is not None:
+                    _bits.append(f"PB 历史分位 {float(pb_pct_c):.0f}%")
+                if roe_c is not None:
+                    _bits.append(f"ROE {roe_c:.1f}%")
                 result["cycle_trap_note"] = (
-                    f"{_ind_c}：PE 历史分位 {float(pe_pct_c):.0f}%（低）但 PB 历史分位 "
-                    f"{float(pb_pct_c):.0f}%（高）、ROE {roe_c:.1f}%，"
-                    "典型景气高点特征，低 PE 不等于低估"
+                    f"{_ind_c}：" + "、".join(_bits)
+                    + "，典型景气高点特征，低 PE 不等于低估"
                 )
                 rationale_parts.append(
                     result["cycle_trap_note"] + f"，估值合理性折减 {cycle_haircut:.0f} 分"
+                )
+            elif _pe_cheap and not _profit_low:
+                rationale_parts.append(
+                    "PE 显低但利润仍在跨周期中性利润之下（周期中低位），"
+                    "未确认低估亦不按顶点折减"
                 )
         if cycle_haircut > haircut:
             haircut = cycle_haircut
@@ -1341,6 +1513,22 @@ class FundamentalEngine:
                     result["valuation_rationale"] = (
                         (result.get("valuation_rationale") or "") + _note
                     )
+            # ── 强周期股：禁用峰值 DCF 作定价锚（**仅展示口径**）──────────
+            # 周期股景气高点的 FCF 被永续外推 → DCF 系统性高估，故内在价值改由
+            # 「正常化利润 + PB-ROE 锚」承担（见 result["intrinsic_value"]）。
+            # 注意：此处**不清空** intrinsic_value_per_share —— 它仍是估值分
+            # 「无相对估值信号」兜底路径（本函数末尾）的输入，清空会改变
+            # composite_valuation_score，那是另一套口径流程。
+            elif _ind_anchor in STRONG_CYCLICAL_INDUSTRIES and not is_div:
+                dcf_r = result["dcf"]
+                dcf_r["role"] = "not_applicable_cyclical"
+                dcf_r["suppressed"] = True
+                dcf_r["display_label"] = "周期股禁用峰值DCF"
+                dcf_r["note"] = (
+                    (dcf_r.get("note") or "")
+                    + "；强周期股不以峰值 FCF 的 DCF 作定价锚（利润在周期顶点时 "
+                    "DCF 会被系统性高估），内在价值请见「周期正常化锚」"
+                )
 
         # 红利资产：DDM（股利贴现）作为核心参考估值，替代 DCF
         # 扩展：分红率>60% 的非红利股也构建 DDM 用于多模型交叉
@@ -1351,44 +1539,38 @@ class FundamentalEngine:
         if (is_div or is_high_payout) and not fin_df.empty:
             result["ddm"] = self._build_ddm(market, meta)
 
-        # ── 多模型交叉内在价值：DCF 40% + DDM 40% + 机构目标价 20% ──
-        dcf_for_combo = result.get("dcf") or {}
-        ddm_for_combo = result.get("ddm") or {}
-        dcf_iv = dcf_for_combo.get("intrinsic_value_per_share")
-        # 取 DDM 中性情景
-        ddm_iv = None
-        for sc in ddm_for_combo.get("scenarios", []):
-            if sc.get("name") == "中性":
-                ddm_iv = sc.get("intrinsic_value_per_share")
-                break
-        # 机构目标价（当前无数据源，预留接口），无则用 DCF 替代
-        target_iv = meta.get("consensus_target_price") or market.get("target_price")
-        if target_iv is not None:
-            target_iv = float(target_iv)
-
-        components: list[tuple[str, float, float]] = []  # (name, value, weight)
-        if dcf_iv is not None and float(dcf_iv) > 0:
-            components.append(("DCF", float(dcf_iv), 0.4))
-        if ddm_iv is not None and float(ddm_iv) > 0:
-            components.append(("DDM", float(ddm_iv), 0.4))
-        if target_iv is not None and target_iv > 0:
-            components.append(("机构目标价", target_iv, 0.2))
-
-        # 若某模型缺失，用 DCF 替代其权重（保持总权重=1）
-        if components:
-            total_w = sum(w for _, _, w in components)
-            combo_iv = sum(v * w for _, v, w in components) / total_w
-            combo_note = " + ".join(
-                f"{n}={v:.2f}×{w/total_w:.0%}" for n, v, w in components
-            )
-            result["combined_intrinsic_value"] = {
-                "intrinsic_value_per_share": round(combo_iv, 2),
-                "components": [
-                    {"model": n, "value": round(v, 2), "weight": round(w / total_w, 3)}
-                    for n, v, w in components
-                ],
-                "note": f"多模型交叉内在价值：{combo_note} = {combo_iv:.2f}元",
-            }
+        # ── 内在价值：先分类 → 再选模型 → 最后交叉验证 ──────────────────
+        # 与 composite_valuation_score（估值分）严格分离：本块是展示参考锚，
+        # 不参与任何评分。取代原先「DCF 40% + DDM 40% + 机构目标价 20%」的
+        # 固定拼盘 —— 那种拼法对周期股等于用峰值 DCF 定价，对红利股又让 DCF
+        # 的抑制形同虚设（被抑制后权重被静默归一化给 DDM）；
+        # 且「机构目标价」至今无数据源，恒 None，20% 权重从来只体现在文案里。
+        intrinsic = self._build_intrinsic_value(
+            fin_df=fin_df,
+            market=market,
+            meta=meta,
+            result=result,
+            div_profile=div_profile,
+            is_div=is_div,
+            is_growth=is_growth,
+            cycle_stats=_cycle_stats,
+        )
+        result["intrinsic_value"] = intrinsic
+        # 旧键位保留（shape 已由「固定拼盘」改为「按 style 选模」）：
+        # 全仓检索确认无其他消费方，仅作向后兼容的键位占位。
+        result["combined_intrinsic_value"] = {
+            "intrinsic_value_per_share": intrinsic.get("intrinsic_value_per_share"),
+            "components": [
+                {"model": k, "value": v.get("value"), "weight": None}
+                for k, v in (intrinsic.get("models") or {}).items()
+            ],
+            "note": intrinsic.get("note"),
+            "cross_model": intrinsic.get("cross_model"),
+            "cross_basis": intrinsic.get("cross_basis"),
+            "conservative": intrinsic.get("conservative"),
+            "style": intrinsic.get("style"),
+            "auxiliary": intrinsic.get("auxiliary") or {},
+        }
 
         # 无相对估值信号时：仅用「可信」DCF 的安全边际粗估，避免默认 55 / 爆表估值污染分数
         dcf = result.get("dcf") or {}
@@ -1417,6 +1599,153 @@ class FundamentalEngine:
                     )
 
         return result
+
+    @staticmethod
+    def _bvps(fin_df: pd.DataFrame, market: dict, meta: dict) -> tuple[float | None, str]:
+        """每股净资产（BVPS）。行情口径优先，其次由 EPS/ROE 还原。
+
+        只做「取数」，不参与任何判定；两条路径都不可得时返回 None + 来源留痕，
+        由 `models.intrinsic` 决定退化为「只有正常化 PE 单锚」而不是拿 0 凑。
+        """
+        def _num(v: Any) -> float | None:
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        price, pb = _num(market.get("price")), _num(market.get("pb"))
+        if price and pb and pb > 0:
+            return price / pb, "price/PB（行情口径）"
+        eps, roe = _num(meta.get("eps")), _num(meta.get("latest_roe"))
+        if eps is not None and roe is not None and roe > 0:
+            # 净资产 ≈ 净利/ROE，股本 ≈ 净利/EPS → BVPS ≈ EPS/(ROE/100)
+            return eps / (roe / 100.0), "EPS÷ROE 还原（无 PB 数据）"
+        return None, "缺失"
+
+    def _build_intrinsic_value(
+        self,
+        *,
+        fin_df: pd.DataFrame,
+        market: dict,
+        meta: dict,
+        result: dict,
+        div_profile: dict,
+        is_div: bool,
+        is_growth: bool,
+        cycle_stats: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """把引擎已有数据组装成 row，交给 `models.intrinsic`（分类/选模/交叉）。
+
+        本方法只做「取数与口径注入」，不做任何模型运算与判定 —— 分类、模型公式、
+        交叉规则全部在 `app.analysis.models.intrinsic` 内，单一实现、可独立单测。
+        """
+        try:
+            price = float(market["price"]) if market.get("price") else None
+        except (TypeError, ValueError):
+            price = None
+
+        # 每股分红（DPS）：真实分红历史优先，回退「股息率×股价」——与 _build_ddm 同源
+        div_info = meta.get("dividend") or {}
+        dps = None
+        try:
+            d0 = div_info.get("d0")
+            if d0 is not None and float(d0) > 0:
+                dps = float(d0)
+        except (TypeError, ValueError):
+            dps = None
+        if dps is None and market.get("dividend_yield") is not None and price:
+            dps = float(market["dividend_yield"]) / 100.0 * price
+
+        # 正常化 EPS：跨周期中性利润（窗口中位数）/ 股本
+        # —— 与估值打分「中性利润 PE」用的是同一次 cross_cycle_stats 产出（铁律10），
+        # 不是另算一套「5 年中位 EPS」。
+        eps_normalized = None
+        neutral = (cycle_stats or {}).get("neutral")
+        if neutral is not None:
+            try:
+                neutral_f = float(neutral)
+            except (TypeError, ValueError):
+                neutral_f = 0.0
+            if neutral_f > 0:
+                shares, shares_src = self._resolve_shares(fin_df, market, meta, warn=False)
+                if shares and shares > 0:
+                    eps_normalized = neutral_f / shares
+                    _ = shares_src  # 仅取数；来源随 DCF 一并展示
+
+        bvps, bvps_src = self._bvps(fin_df, market, meta)
+
+        # 分红率：优先真实披露值；缺失时用红利分类里的估算值（该估算同时供
+        # 红利框架的「分红比例」因子使用，保持同一份口径）。
+        payout_pct = meta.get("payout_ratio_pct")
+        if payout_pct is None:
+            payout_pct = div_profile.get("payout_ratio_pct")
+
+        row: dict[str, Any] = {
+            "industry": str(meta.get("industry") or "").strip(),
+            "price": price,
+            "pe_ttm": market.get("pe_ttm"),
+            "pb": market.get("pb"),
+            "pb_percentile": market.get("pb_percentile"),
+            "dividend_yield": market.get("dividend_yield"),
+            "payout_ratio_pct": payout_pct,
+            "dividend_per_share": dps,
+            "eps_ttm": meta.get("eps"),
+            "eps_normalized": eps_normalized,
+            "bvps": bvps,
+            "roe_ttm": meta.get("latest_roe"),
+            "profit_yoy": meta.get("profit_yoy"),
+            # growth_score 此处不注入：引擎传的是权威 is_growth_stock，
+            # 模块自带的 growth_score 阈值只服务于独立运行/单测。
+            "growth_score": None,
+        }
+
+        # ── 注入引擎已有的 DCF / DDM，避免同一份模型在本仓算两遍（铁律10）──
+        dcf_obj = result.get("dcf") or {}
+        dcf_value = dcf_obj.get("intrinsic_value_per_share")
+        dcf_reliable = bool(dcf_obj.get("is_reliable"))
+        dcf_payload = None
+        if dcf_value is not None:
+            _note = (
+                f"三阶段 DCF（真实 FCF 口径：{dcf_obj.get('fcf_source') or '未知'}；"
+                f"股本来源：{dcf_obj.get('shares_source') or '未知'}）"
+            )
+            if not dcf_reliable:
+                _note += (
+                    "；该 DCF 已被标记不可信（估值偏离或股本缺失），"
+                    "仍参与交叉但按保守侧取 min（不会被其高值拉高）"
+                )
+            dcf_payload = {"value": dcf_value, "note": _note, "reliable": dcf_reliable}
+
+        ddm_obj = result.get("ddm") or {}
+        ddm_value = None
+        for _sc in ddm_obj.get("scenarios") or []:
+            if _sc.get("name") == "中性":
+                ddm_value = _sc.get("intrinsic_value_per_share")
+                break
+        ddm_payload = None
+        if ddm_value is not None:
+            ddm_payload = {
+                "value": ddm_value,
+                "note": (
+                    f"DDM 戈登中性情景（D0={ddm_obj.get('d0')} 元，"
+                    f"{ddm_obj.get('d0_source') or '来源未知'}）"
+                ),
+                "reliable": True,
+            }
+
+        out = compute_intrinsic_value(
+            row,
+            dcf=dcf_payload,
+            ddm=ddm_payload,
+            is_dividend_asset=is_div,
+            is_growth_stock=is_growth,
+            cyclical_industries=STRONG_CYCLICAL_INDUSTRIES,
+        )
+        out["bvps_source"] = bvps_src
+        out["eps_normalized_source"] = (
+            "跨周期中性利润（窗口中位数）÷股本" if eps_normalized is not None else None
+        )
+        return out
 
     @staticmethod
     def _apply_value_trap_veto(
@@ -1657,8 +1986,14 @@ class FundamentalEngine:
         ) / 100.0
 
     @staticmethod
-    def _resolve_shares(fin_df: pd.DataFrame, market: dict, meta: dict) -> tuple[float, str]:
-        """优先行情股本 → 市值/股价 → 净利润/EPS → 默认 10 亿（告警）。"""
+    def _resolve_shares(
+        fin_df: pd.DataFrame, market: dict, meta: dict, *, warn: bool = True
+    ) -> tuple[float, str]:
+        """优先行情股本 → 市值/股价 → 净利润/EPS → 默认 10 亿（告警）。
+
+        ``warn=False`` 供同一只票的第二次取数使用（DCF 与内在价值锚都要股本，
+        但「股本缺失」这条告警只需出现一次，否则日志翻倍且无法据此计数）。
+        """
         raw = market.get("total_shares")
         if raw is not None and float(raw) > 0:
             return float(raw), "market.total_shares"
@@ -1687,10 +2022,11 @@ class FundamentalEngine:
                 if shares > 1e6:
                     return shares, "meta.eps"
 
-        logger.warning(
-            "[%s] 无法获取有效股本，使用默认值 10亿股，估值结果可能失真",
-            meta.get("symbol") or market.get("symbol") or "?",
-        )
+        if warn:
+            logger.warning(
+                "[%s] 无法获取有效股本，使用默认值 10亿股，估值结果可能失真",
+                meta.get("symbol") or market.get("symbol") or "?",
+            )
         return 1e9, "default_1e9"
 
     @staticmethod
@@ -1921,6 +2257,12 @@ class FundamentalEngine:
                 "margin_of_safety_pct": mos,
             })
 
+        # 说明：本返回体刻意**不含**「前瞻股息率 / 前瞻分红」类文字结论。
+        # 前瞻口径需要机构 EPS 预测（本仓无数据源，`consensus_target_price` 恒 None）
+        # 与中期分红进度，两者都不可得。此前这里有一段硬编码文案 ——
+        # 写死「2026 中期已派 0.98 元（分红比例 74%）、EPS 中枢 2.86-3.15 元、
+        # 前瞻股息率约 5.5%-6%」，对**任何**走 DDM 的红利股都输出同一串数字
+        # （不参与打分、只做展示，但会误导）。已删除。宁可少一句，不臆造。
         return {
             "model": "DDM",
             "d0": round(d0, 2),
@@ -1931,12 +2273,6 @@ class FundamentalEngine:
                 f"D0={d0:.2f}元（{d0_src}）；"
                 "戈登模型 V=D0(1+g)/(r−g)；"
                 "保守 g2%/r8%、中性 g3%/r7%、乐观 g3%/r6.5%"
-            ),
-            "forward_dividend_yield_pct": None,  # 前瞻口径需结合机构EPS预测，仅文字说明
-            "forward_note": (
-                "前瞻口径：2026中期已派0.98元（分红比例74%），若全年维持75%+分红率，"
-                "结合机构2026年EPS中枢2.86-3.15元测算，全年分红约2.15-2.36元，"
-                "按当前股价前瞻股息率约5.5%-6%，高于TTM 4.3%"
             ),
         }
 
@@ -1962,6 +2298,8 @@ class FundamentalEngine:
             dividend_yield_pct=market.get("dividend_yield"),
             pe_ttm=market.get("pe_ttm"),
             payout_ratio_pct=float(meta["payout_ratio_pct"]) if meta.get("payout_ratio_pct") is not None else None,
+            industry=meta.get("industry"),
+            cyclical_industries=STRONG_CYCLICAL_INDUSTRIES,
         )
         gm = meta.get("latest_gross_margin")
         if gm is None and not fin_df.empty and "gross_margin" in fin_df.columns:
