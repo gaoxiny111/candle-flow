@@ -16,36 +16,6 @@ from app.services.market_flow import start_market_flow_scheduler, stop_market_fl
 from app.services.pay_qr import PAY_DIR, ensure_pay_qrs
 
 
-def _warmup_hot_endpoints() -> None:
-    """启动后后台预热热点链路，消除重启后的冷启动空窗。
-
-    两层：① 共振索引（内存态，重启即失；构建约 2 分钟，期间 resonance
-    全部 409）；② technical-overlay 榜单（冷 SQLite 页缓存约 35s）。
-    失败静默，不影响启动。
-    """
-    import threading
-    import time
-
-    def _run() -> None:
-        time.sleep(8)  # 等 uvicorn 完成端口绑定与 K 线同步调度器启动
-        db = None
-        try:
-            from app.database import SessionLocal
-            from app.services import market_scan as msmod
-            from app.services.market_scan import technical_overlay
-
-            msmod.resonance_index_build()  # force=False：复用单票缓存与 TTL
-            db = SessionLocal()
-            technical_overlay(db, top=60, offset=0)
-        except Exception:  # noqa: BLE001 - 预热失败只损失首访速度
-            pass
-        finally:
-            if db is not None:
-                db.close()
-
-    threading.Thread(target=_run, daemon=True, name="hot-endpoint-warmup").start()
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs("data", exist_ok=True)
@@ -53,7 +23,6 @@ async def lifespan(app: FastAPI):
     ensure_pay_qrs()
     start_kline_sync_scheduler()
     start_market_flow_scheduler()
-    _warmup_hot_endpoints()
     yield
     stop_market_flow_scheduler()
     stop_kline_sync_scheduler()

@@ -41,10 +41,9 @@ const router = createRouter({
       meta: { title: '主板战法', requiresAuth: false },
     },
     {
+      // 基本面榜单功能已下线；保留旧路径重定向，避免历史链接 404
       path: '/market-scan',
-      name: 'market-scan',
-      component: () => import('@/views/MarketScanView.vue'),
-      meta: { title: '基本面榜单', requiresAuth: false },
+      redirect: '/',
     },
     {
       path: '/fundamentals',
