@@ -26,6 +26,7 @@ const navItems = computed(() => [
   { path: '/flow', label: '宽基主力' },
   { path: '/bull-tactics', label: '主板战法' },
   { path: '/high-dividend', label: '高股息' },
+  { path: '/large-cap', label: '大盘股' },
   { path: '/backtest', label: '回测' },
   { path: '/settings', label: '设置' },
 ])
@@ -35,6 +36,7 @@ const isActive = (path: string) => {
   if (path === '/flow') return route.path.startsWith('/flow')
   if (path === '/bull-tactics') return route.path.startsWith('/bull-tactics')
   if (path === '/high-dividend') return route.path.startsWith('/high-dividend')
+  if (path === '/large-cap') return route.path.startsWith('/large-cap')
   return route.path.startsWith(path.split('/').slice(0, 2).join('/'))
 }
 </script>

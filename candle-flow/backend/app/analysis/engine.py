@@ -14,12 +14,15 @@ from app.analysis.base import ModuleResult, score_to_level
 from app.analysis.config import (
     CASHFLOW_VETO_MESSAGE,
     CASHFLOW_VETO_THRESHOLD,
-    E_GRADE_PENALTY,
     E_GRADE_SCORE,
+    E_GRADE_SOFT_PENALTY,
+    E_MID_SCORE,
+    E_MID_SOFT_PENALTY,
     MODULE_WEIGHTS,
     RISK_MAX_PENALTY,
     RISK_THRESHOLD,
 )
+from app.analysis.sector_profile import module_weights_for, resolve_sector_profile
 from app.analysis.dividend_profile import (
     CN_10Y_BOND_YIELD_PCT,
     DIVIDEND_ASSET_WACC_PCT,
@@ -189,11 +192,41 @@ def downgrade_rating(letter: str, steps: int = 1) -> str:
     return RATING_ORDER[min(len(RATING_ORDER) - 1, idx + max(0, steps))]
 
 
-def _penalized_module_score(score: float) -> float:
-    """E 档（<40）维度贡献按系数打折，避免均分掩盖致命短板。"""
+def _penalized_module_score(score: float, *, skip_soft: bool = False) -> float:
+    """低分软折价：<40 → ×0.8；<55 → ×0.95。否决维可 skip_soft 避免与降档叠罚。"""
+    if skip_soft:
+        return score
     if score < E_GRADE_SCORE:
-        return score * E_GRADE_PENALTY
+        return score * E_GRADE_SOFT_PENALTY
+    if score < E_MID_SCORE:
+        return score * E_MID_SOFT_PENALTY
     return score
+
+
+def _risk_overlap_factor(solvency_score: float | None, cashflow_score: float | None) -> float:
+    """偿债/现金流已低分时，风险综合扣分再打折（去重）。返回 0~1，1 表示全额扣。"""
+    overlap = 0.0
+    if solvency_score is not None and solvency_score < 55:
+        overlap += 0.4
+    if cashflow_score is not None and cashflow_score < 55:
+        overlap += 0.4
+    return max(0.2, 1.0 - min(0.8, overlap))
+
+
+def _cash_conversion_ok(cf: ModuleResult | None) -> bool:
+    """高成长保护：要求利润含金量尚可、非纸面富贵/微利稀释。"""
+    if cf is None:
+        return False
+    meta = cf.metadata or {}
+    if meta.get("paper_wealth"):
+        return False
+    if meta.get("micro_profit_diluted"):
+        return False
+    # 分红含金量重度惩罚视为现金转化不足
+    pen = meta.get("dividend_coverage_penalty")
+    if pen is not None and float(pen) >= 10:
+        return False
+    return True
 
 
 # 成长股估值软化：绝对估值越高，允许的历史分位上限越低（阶梯）。
@@ -503,6 +536,16 @@ class FundamentalEngine:
             **kwargs,
         }
 
+        # 行业口径隔离（模块跑之前）：金融/地产先关掉通用 FCF 等错口径
+        _name_s = str(meta.get("name") or market.get("name") or "")
+        _ind_s = str(meta.get("industry") or "")
+        sector_early = resolve_sector_profile(
+            industry=_ind_s, name=_name_s, symbol=sym
+        )
+        ctx["sector_kind"] = sector_early.kind
+        ctx["disable_generic_fcf"] = sector_early.disable_generic_fcf
+        meta["_sector_early"] = sector_early.to_dict()
+
         module_results: dict[str, ModuleResult] = {}
         for name, analyzer in self.analyzers.items():
             module_results[name] = analyzer.analyze(fin_df, **ctx)
@@ -528,56 +571,13 @@ class FundamentalEngine:
             meta,
             db=db,
             cashflow_score=cf.score if cf is not None else None,
+            skip_cf_haircut=sector_early.skip_valuation_cf_haircut,
         )
         val_score = float(valuation.get("composite_valuation_score", 50.0))
 
-        # 对照报告：盈利/成长/偿债/现金流/估值 加权；效率与行业仅展示。
-        # E 档维度按 E_GRADE_PENALTY 打折后再加权。
-        def _compose(v_score: float) -> float:
-            composite = 0.0
-            weight_sum = 0.0
-            for name, w in self.weights.items():
-                if name == "valuation":
-                    composite += _penalized_module_score(v_score) * w
-                    weight_sum += w
-                    continue
-                result = module_results.get(name)
-                if result is None:
-                    continue
-                composite += _penalized_module_score(result.score) * w
-                weight_sum += w
-            if weight_sum > 0:
-                composite /= weight_sum
-            risk = module_results["risk"]
-            if risk.score < RISK_THRESHOLD:
-                # 风险越低扣得越多，但限幅 RISK_MAX_PENALTY（默认 -25%）。
-                # 原实现是无上限的 composite *= risk/100：风险模块的扣分项
-                # （应收恶化/利润含金量低/存贷双高）在 cashflow、solvency 模块
-                # 已各自扣过一次，再做整体乘法等于三重计数 + 复利放大。
-                risk_gap = (RISK_THRESHOLD - risk.score) / RISK_THRESHOLD
-                composite *= 1.0 - RISK_MAX_PENALTY * max(0.0, min(1.0, risk_gap))
-            return round(max(0.0, min(100.0, composite)), 1)
-
-        composite = _compose(val_score)
-        letter = rating_label(composite)
-
-        # ── 高成长优质股保护：盈利+成长双强时，现金流低分不致命 ──
-        prof_s = module_results.get("profitability")
-        growth_s = module_results.get("growth")
-        cf_s = module_results.get("cashflow")
-        if (
-            prof_s is not None and prof_s.score >= 85
-            and growth_s is not None and growth_s.score >= 85
-            and cf_s is not None and cf_s.score <= 60
-            and composite < 70
-        ):
-            composite = 70.0
-            letter = rating_label(composite)
-
-        # ── 成长股/周期底部反转识别 ──────────────────────────
+        # ── 成长股识别（权重分轨前完成，保证画像一致）────────────────
         growth_mod = module_results.get("growth")
         prof_mod = module_results.get("profitability")
-        # 先尝试从已算好的 valuation 中拿 is_dividend_asset（如果有）
         _is_div_hint = bool((valuation or {}).get("is_dividend_asset")) if valuation else False
         gs = classify_growth_stock(
             symbol=sym,
@@ -604,6 +604,94 @@ class FundamentalEngine:
             prof_mod.metadata["is_growth_stock"] = gs.get("is_growth_stock")
             prof_mod.metadata["growth_stock_tier"] = gs.get("tier")
 
+        from app.analysis.cyclical_profile import classify_cyclical_stock
+
+        _is_growth_for_w = bool(gs.get("is_growth_stock")) or bool(
+            valuation.get("is_high_growth_quality")
+        )
+        _cyc_cls = classify_cyclical_stock(
+            symbol=sym,
+            industry=_ind_s,
+            pe_ttm=market.get("pe_ttm"),
+            profit_cagr_3y=(
+                float(_gm.metadata.get("profit_cagr_3y"))
+                if _gm is not None and _gm.metadata.get("profit_cagr_3y") is not None
+                else None
+            ),
+            profit_yoy=meta.get("profit_yoy"),
+            is_dividend_asset=_is_div_hint,
+            is_growth_stock=_is_growth_for_w,
+        )
+        sector = resolve_sector_profile(
+            industry=_ind_s,
+            name=_name_s,
+            symbol=sym,
+            is_dividend_asset=_is_div_hint,
+            is_growth_stock=_is_growth_for_w,
+            is_cyclical=bool(_cyc_cls.get("is_cyclical")),
+        )
+        active_weights = module_weights_for(sector)
+
+        # 对照报告：盈利/成长/偿债/现金流/估值 加权；效率与行业仅展示。
+        # 低分软折价；现金流否决维不再叠软折价。
+        def _compose(v_score: float, weights: dict[str, float] | None = None) -> float:
+            wmap = weights or active_weights
+            composite = 0.0
+            weight_sum = 0.0
+            cf_mod = module_results.get("cashflow")
+            sol_mod = module_results.get("solvency")
+            for name, w in wmap.items():
+                if name == "valuation":
+                    composite += _penalized_module_score(v_score) * w
+                    weight_sum += w
+                    continue
+                result = module_results.get(name)
+                if result is None:
+                    continue
+                # 现金流将触发否决降档时，合成侧不再 ×0.8，避免双重惩罚
+                skip = (
+                    name == "cashflow"
+                    and result.score < CASHFLOW_VETO_THRESHOLD
+                    and not sector.soft_cashflow_veto
+                )
+                composite += _penalized_module_score(result.score, skip_soft=skip) * w
+                weight_sum += w
+            if weight_sum > 0:
+                composite /= weight_sum
+            risk = module_results["risk"]
+            if risk.score < RISK_THRESHOLD:
+                risk_gap = (RISK_THRESHOLD - risk.score) / RISK_THRESHOLD
+                overlap = _risk_overlap_factor(
+                    sol_mod.score if sol_mod is not None else None,
+                    cf_mod.score if cf_mod is not None else None,
+                )
+                composite *= 1.0 - RISK_MAX_PENALTY * overlap * max(0.0, min(1.0, risk_gap))
+            return round(max(0.0, min(100.0, composite)), 1)
+
+        composite = _compose(val_score)
+        letter = rating_label(composite)
+
+        # ── 高成长保护：须利润含金量/现金转化尚可，防伪成长抬分 ──
+        prof_s = module_results.get("profitability")
+        growth_s = module_results.get("growth")
+        cf_s = module_results.get("cashflow")
+        growth_protect_note = ""
+        if (
+            prof_s is not None
+            and prof_s.score >= 85
+            and growth_s is not None
+            and growth_s.score >= 85
+            and cf_s is not None
+            and cf_s.score <= 60
+            and composite < 70
+        ):
+            if _cash_conversion_ok(cf_s):
+                composite = 70.0
+                letter = rating_label(composite)
+                growth_protect_note = "高成长+现金转化尚可，综合分保护至 70"
+            else:
+                growth_protect_note = "高成长但现金转化弱，不触发综合分保护"
+
         # 价值陷阱：E 档 / ROIC<WACC / ST·退市·连续亏损 → 估值分锁定 ≤28
         val_score, valuation, composite, letter = self._apply_value_trap_veto(
             val_score,
@@ -612,6 +700,8 @@ class FundamentalEngine:
             letter,
             module_results,
             name=str(meta.get("name") or market.get("name") or ""),
+            industry=_ind_s,
+            disable_roic_trap=sector.disable_roic_wacc_trap,
             compose_fn=_compose,
         )
 
@@ -642,11 +732,26 @@ class FundamentalEngine:
                 all_warnings.insert(0, msg)
 
         cashflow_veto = False
-        if cf is not None and cf.score < CASHFLOW_VETO_THRESHOLD:
+        if (
+            cf is not None
+            and cf.score < CASHFLOW_VETO_THRESHOLD
+            and not sector.soft_cashflow_veto
+        ):
             cashflow_veto = True
             letter = downgrade_rating(letter, 1)
             if CASHFLOW_VETO_MESSAGE not in all_warnings:
                 all_warnings.insert(0, CASHFLOW_VETO_MESSAGE)
+        elif (
+            cf is not None
+            and cf.score < CASHFLOW_VETO_THRESHOLD
+            and sector.soft_cashflow_veto
+        ):
+            note = f"{sector.label}不适用通用现金流否决（口径隔离）"
+            if note not in all_warnings:
+                all_warnings.append(note)
+
+        if growth_protect_note and growth_protect_note not in all_warnings:
+            all_warnings.append(growth_protect_note)
 
         # 生存级重大风险：顶部红灯，强制 E；观察级仅警告/扣分，不熔断
         compliance_veto = bool(major_risks.get("fatal"))
@@ -805,6 +910,8 @@ class FundamentalEngine:
             "composite_score": composite,
             "final_rating": letter,
             "final_rating_letter": letter,
+            "sector_profile": sector.to_dict(),
+            "module_weights": dict(active_weights),
             "dim_scores": dim_scores,
             "short_term_view": {"score": short_score, "view": short_view, "signals": short_signals},
             "long_term_view": {"score": long_score, "view": long_view, "signals": long_signals},
@@ -845,6 +952,7 @@ class FundamentalEngine:
         meta: dict,
         db: Session | None = None,
         cashflow_score: float | None = None,
+        skip_cf_haircut: bool = False,
     ) -> dict:
         result: dict[str, Any] = {}
         pe = market.get("pe_ttm")
@@ -1388,9 +1496,15 @@ class FundamentalEngine:
 
         haircut = 0.0
         # 高成长科技股：现金流滞后是常态，不因现金流低分扣减估值
+        # 金融/地产等：通用 FCF 口径不适用，跳过现金流折减
         revenue_yoy_hg = meta.get("revenue_yoy")
         is_high_growth_val = revenue_yoy_hg is not None and float(revenue_yoy_hg) >= 30
-        if not is_high_growth_val and cashflow_score is not None and cashflow_score < 45:
+        if (
+            not skip_cf_haircut
+            and not is_high_growth_val
+            and cashflow_score is not None
+            and cashflow_score < 45
+        ):
             cheap_looking = any(
                 (rel.get(k) or {}).get("signal") == "低估" for k in ("PE_TTM", "PB", "PEG")
             ) or base_score >= 70
@@ -1440,7 +1554,13 @@ class FundamentalEngine:
                 "profit_cycle_low": bool(_profit_low),
                 "true_undervalued": bool(_pe_cheap and _profit_low),
             }
-            if _trap_asset or _trap_peak:
+            # 盈利中枢确认：仅当利润已处周期中高位（或 peak 判据命中）才折减；
+            # 资产端三角命中但利润仍在中枢附近/之下 → 仅提示，防误伤修复初期。
+            _roe_above_mid = (
+                position_ratio is not None
+                and float(position_ratio) >= CYCLE_PEAK_POSITION_MIN
+            )
+            if _trap_peak or (_trap_asset and _roe_above_mid):
                 cycle_haircut = CYCLE_TRAP_HAIRCUT
                 result["cycle_trap_warning"] = True
                 _bits: list[str] = []
@@ -1461,6 +1581,13 @@ class FundamentalEngine:
                 rationale_parts.append(
                     result["cycle_trap_note"] + f"，估值合理性折减 {cycle_haircut:.0f} 分"
                 )
+            elif _trap_asset and not _roe_above_mid:
+                result["cycle_trap_warning"] = True
+                result["cycle_trap_note"] = (
+                    f"{_ind_c}：低PE+高PB+高ROE 呈周期特征，但盈利未显著高于"
+                    f"跨周期中性利润，仅提示周期风险、不作估值折减"
+                )
+                rationale_parts.append(result["cycle_trap_note"])
             elif _pe_cheap and not _profit_low:
                 rationale_parts.append(
                     "PE 显低但利润仍在跨周期中性利润之下（周期中低位），"
@@ -1619,8 +1746,43 @@ class FundamentalEngine:
         eps, roe = _num(meta.get("eps")), _num(meta.get("latest_roe"))
         if eps is not None and roe is not None and roe > 0:
             # 净资产 ≈ 净利/ROE，股本 ≈ 净利/EPS → BVPS ≈ EPS/(ROE/100)
-            return eps / (roe / 100.0), "EPS÷ROE 还原（无 PB 数据）"
+            # 中报 EPS 会低估 BVPS，优先行情 PB 路径
+            latest = str(meta.get("latest_report") or "")
+            if latest and not latest.endswith("1231"):
+                pass  # 继续尝试，但宁可用 PB
+            else:
+                return eps / (roe / 100.0), "EPS÷ROE 还原（无 PB 数据）"
         return None, "缺失"
+
+    @staticmethod
+    def _annual_eps_stats(
+        fin_df: pd.DataFrame, meta: dict
+    ) -> tuple[float | None, float | None]:
+        """从年报序列取最近全年 EPS 与近 5 年中位数（供周期锚，避开中报累计）。"""
+        vals: list[float] = []
+        if fin_df is not None and not fin_df.empty and "eps" in fin_df.columns:
+            # fin_df 由年报 yjbb 堆成时，每行即一年；若带 report_date 则只取 1231
+            for _, r in fin_df.iterrows():
+                rd = str(r.get("report_date") or "")
+                if rd and len(rd) >= 8 and not rd.endswith("1231"):
+                    continue
+                try:
+                    e = float(r.get("eps"))
+                except (TypeError, ValueError):
+                    continue
+                if e == e and e > 0:
+                    vals.append(e)
+        if not vals:
+            return None, None
+        latest = vals[-1]
+        window = vals[-5:]
+        med = sorted(window)[len(window) // 2] if window else None
+        # 偶数窗口取中间两值均值
+        if window and len(window) % 2 == 0:
+            s = sorted(window)
+            med = (s[len(s) // 2 - 1] + s[len(s) // 2]) / 2.0
+        _ = meta
+        return latest, med
 
     def _build_intrinsic_value(
         self,
@@ -1660,25 +1822,53 @@ class FundamentalEngine:
         # —— 与估值打分「中性利润 PE」用的是同一次 cross_cycle_stats 产出（铁律10），
         # 不是另算一套「5 年中位 EPS」。
         eps_normalized = None
+        shares_for_eps, shares_src = self._resolve_shares(fin_df, market, meta, warn=False)
         neutral = (cycle_stats or {}).get("neutral")
         if neutral is not None:
             try:
                 neutral_f = float(neutral)
             except (TypeError, ValueError):
                 neutral_f = 0.0
-            if neutral_f > 0:
-                shares, shares_src = self._resolve_shares(fin_df, market, meta, warn=False)
-                if shares and shares > 0:
-                    eps_normalized = neutral_f / shares
-                    _ = shares_src  # 仅取数；来源随 DCF 一并展示
+            # 默认 10 亿股不可靠：宁缺毋滥，避免假「正常化 EPS」
+            if (
+                neutral_f > 0
+                and shares_for_eps
+                and shares_for_eps > 0
+                and shares_src != "default_1e9"
+            ):
+                eps_normalized = neutral_f / shares_for_eps
+                _ = shares_src
+
+        # 年报 EPS 序列：供周期锚回退（禁止把中报累计 EPS 当全年）
+        eps_annual_latest, eps_5y_median = self._annual_eps_stats(fin_df, meta)
+        latest_report = str(meta.get("latest_report") or "")
+        eps_is_interim = bool(latest_report) and not latest_report.endswith("1231")
 
         bvps, bvps_src = self._bvps(fin_df, market, meta)
+        _ = bvps_src
 
         # 分红率：优先真实披露值；缺失时用红利分类里的估算值（该估算同时供
         # 红利框架的「分红比例」因子使用，保持同一份口径）。
         payout_pct = meta.get("payout_ratio_pct")
         if payout_pct is None:
             payout_pct = div_profile.get("payout_ratio_pct")
+
+        from app.analysis.config.company_profiles import get_company_profile
+
+        _prof = get_company_profile(
+            str(meta.get("name") or market.get("name") or ""),
+            str(meta.get("symbol") or market.get("symbol") or ""),
+        )
+        soft_cyclical = bool(
+            _prof.get("cyclical_integrated") or _prof.get("cyclical_soft")
+        )
+        # ROE 趋势：中报年化 vs 最新年报 ROE（有则用）
+        roe_trend = None
+        try:
+            if meta.get("annualized_interim_roe") is not None and meta.get("latest_roe") is not None:
+                roe_trend = float(meta["annualized_interim_roe"]) - float(meta["latest_roe"])
+        except (TypeError, ValueError):
+            roe_trend = None
 
         row: dict[str, Any] = {
             "industry": str(meta.get("industry") or "").strip(),
@@ -1689,11 +1879,20 @@ class FundamentalEngine:
             "dividend_yield": market.get("dividend_yield"),
             "payout_ratio_pct": payout_pct,
             "dividend_per_share": dps,
+            # eps_ttm：周期锚侧会再做 interim 年化；此处仍传最新披露值供留痕
             "eps_ttm": meta.get("eps"),
             "eps_normalized": eps_normalized,
+            "eps_5y_median": eps_5y_median,
+            "eps_annual_latest": eps_annual_latest,
+            "eps_report_date": latest_report or None,
+            "eps_is_interim": eps_is_interim,
+            "latest_report": latest_report or None,
             "bvps": bvps,
             "roe_ttm": meta.get("latest_roe"),
+            "roe_trend": roe_trend,
             "profit_yoy": meta.get("profit_yoy"),
+            "soft_cyclical": soft_cyclical,
+            "cyclical_integrated": soft_cyclical,
             # growth_score 此处不注入：引擎传的是权威 is_growth_stock，
             # 模块自带的 growth_score 阈值只服务于独立运行/单测。
             "growth_score": None,
@@ -1709,12 +1908,22 @@ class FundamentalEngine:
                 f"三阶段 DCF（真实 FCF 口径：{dcf_obj.get('fcf_source') or '未知'}；"
                 f"股本来源：{dcf_obj.get('shares_source') or '未知'}）"
             )
-            if not dcf_reliable:
+            if dcf_obj.get("role") == "high_growth_reference":
+                _note += (
+                    "；营收高增 DCF 为极端悲观压力测试，"
+                    "只作对照、不参与内在价值交叉"
+                )
+            elif not dcf_reliable:
                 _note += (
                     "；该 DCF 已被标记不可信（估值偏离或股本缺失），"
                     "仍参与交叉但按保守侧取 min（不会被其高值拉高）"
                 )
-            dcf_payload = {"value": dcf_value, "note": _note, "reliable": dcf_reliable}
+            dcf_payload = {
+                "value": dcf_value,
+                "note": _note,
+                "reliable": dcf_reliable,
+                "role": dcf_obj.get("role"),
+            }
 
         ddm_obj = result.get("ddm") or {}
         ddm_value = None
@@ -1757,6 +1966,8 @@ class FundamentalEngine:
         *,
         name: str,
         compose_fn,
+        industry: str = "",
+        disable_roic_trap: bool = False,
         cap: float = 28.0,
     ) -> tuple[float, dict[str, Any], float, str]:
         """
@@ -1771,7 +1982,14 @@ class FundamentalEngine:
         if letter == "E":
             reasons.append("综合评级已为 E")
         if prof is not None and prof.metadata.get("roic_below_wacc"):
-            reasons.append("ROIC低于WACC")
+            # 盈利模块优先用 3 年均值判定；仅单期且无归一化时不锁估值（防会计便宜误杀）
+            has_multi = prof.metadata.get("roic_normalized") is not None
+            years_below = int(prof.metadata.get("roic_below_wacc_years") or 0)
+            if has_multi or years_below >= 2:
+                reasons.append("ROIC低于WACC")
+            elif years_below == 0 and has_multi is False:
+                # 兼容：模块已标 below 但未写归一化字段 → 仍采纳（历史行为）
+                reasons.append("ROIC低于WACC")
         if risk is not None and risk.metadata.get("delist_risk"):
             reasons.append("存在退市/ST风险标识")
         if risk is not None and int(risk.metadata.get("consecutive_loss_years") or 0) >= 2:
@@ -1783,11 +2001,15 @@ class FundamentalEngine:
             if "存在退市/ST风险标识" not in reasons:
                 reasons.append("证券简称含ST/退")
 
-        # 高股息/高成长赛道/周期底部反转：ROIC<WACC 不得作为价值陷阱理由
-        if prof is not None and (
-            prof.metadata.get("is_dividend_asset")
-            or prof.metadata.get("is_high_growth_quality")
-            or prof.metadata.get("is_growth_stock")
+        # 银行/保险/公用/电信/红利/高成长：禁用 ROIC<WACC 锁估值
+        _ = industry
+        if disable_roic_trap or (
+            prof is not None
+            and (
+                prof.metadata.get("is_dividend_asset")
+                or prof.metadata.get("is_high_growth_quality")
+                or prof.metadata.get("is_growth_stock")
+            )
         ):
             reasons = [r for r in reasons if r != "ROIC低于WACC"]
 

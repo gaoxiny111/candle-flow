@@ -47,13 +47,19 @@ const router = createRouter({
       meta: { title: '高股息选股', requiresAuth: false },
     },
     {
+      path: '/large-cap',
+      name: 'large-cap',
+      component: () => import('@/views/LargeCapBoardView.vue'),
+      meta: { title: '大盘股基本面', requiresAuth: false },
+    },
+    {
       // 基本面榜单功能已下线；保留旧路径重定向，避免历史链接 404
       path: '/market-scan',
       redirect: '/',
     },
     {
       path: '/fundamentals',
-      redirect: '/',
+      redirect: '/large-cap',
     },
     {
       path: '/backtest',

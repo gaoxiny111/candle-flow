@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import {
   apiErrorText,
@@ -18,6 +18,8 @@ const loading = ref(false)
 const error = ref('')
 const report = ref<HighDividendReport | null>(null)
 const viewMode = ref<'all' | 'passed' | 'failed'>('all')
+let loadGen = 0
+let pollTimer: ReturnType<typeof setTimeout> | null = null
 
 const allItems = computed(() => report.value?.items || [])
 const items = computed(() => {
@@ -34,9 +36,32 @@ const rejectedCount = computed(
   () => report.value?.rejected ?? allItems.value.filter((x) => !x.passed).length,
 )
 
-async function load(refresh = false) {
-  loading.value = true
-  error.value = ''
+const isBuilding = computed(() => {
+  const s = report.value?.status
+  return s === 'computing' || s === 'refreshing'
+})
+
+function clearPoll() {
+  if (pollTimer != null) {
+    clearTimeout(pollTimer)
+    pollTimer = null
+  }
+}
+
+function schedulePoll(gen: number) {
+  clearPoll()
+  pollTimer = setTimeout(() => {
+    if (gen !== loadGen) return
+    void load(false, true)
+  }, 4000)
+}
+
+async function load(refresh = false, fromPoll = false) {
+  const gen = ++loadGen
+  if (!fromPoll) {
+    loading.value = true
+    error.value = ''
+  }
   try {
     const { data } = await fetchHighDividend({
       universe: universe.value,
@@ -44,14 +69,29 @@ async function load(refresh = false) {
       limit: universe.value === 'all' ? 200 : undefined,
       refresh,
     })
+    if (gen !== loadGen) return
     report.value = data.data || null
+    const status = report.value?.status
+    if (status === 'computing' || status === 'refreshing') {
+      // 冷启动 / 后台重算：轮询直到 ready（避免 Cloudflare 524 长连接）
+      schedulePoll(gen)
+    } else {
+      clearPoll()
+    }
   } catch (e) {
+    if (gen !== loadGen) return
     error.value = apiErrorText(e, '高股息筛选失败')
-    report.value = null
+    if (!fromPoll) report.value = null
+    clearPoll()
   } finally {
-    loading.value = false
+    if (gen === loadGen && !fromPoll) loading.value = false
   }
 }
+
+onUnmounted(() => {
+  loadGen += 1
+  clearPoll()
+})
 
 function fmtPct(v: number | null | undefined, digits = 2) {
   if (v == null || Number.isNaN(Number(v))) return '—'
@@ -83,12 +123,12 @@ onMounted(() => {
       <div>
         <h1>高股息选股</h1>
         <p class="sub">
-          连续分红 3～5 年 · 近3年均息 ≥ 4% · 近1年息 ≥ 3% · 支付率 30%～80% ·
-          PE ≤ 15 · PB ≤ 1.5 · ROE ≥ 10% · 经营现金流/净利 ≥ 0.8 · 市值 ≥ 200 亿
+          命中须 PE ≤ 15 · PB ≤ 1.5（不满足仍展示为未命中）· 连续分红 3～5 年 · 近3年均息 ≥ 4% ·
+          近1年息 ≥ 3% · 支付率 30%～80% · ROE ≥ 10% · 经营现金流/净利 ≥ 0.8 · 市值 ≥ 200 亿
         </p>
       </div>
-      <button type="button" class="primary" :disabled="loading" @click="load(true)">
-        {{ loading ? '筛选中…' : '重新筛选' }}
+      <button type="button" class="primary" :disabled="loading || isBuilding" @click="load(true)">
+        {{ loading || isBuilding ? '筛选中…' : '重新筛选' }}
       </button>
     </header>
 
@@ -143,11 +183,13 @@ onMounted(() => {
       <span>展示 {{ items.length }}</span>
       <span>{{ report.pool_note || report.universe }}</span>
       <span v-if="report.cached">缓存</span>
+      <span v-else-if="report.stale">旧缓存</span>
+      <span v-if="isBuilding" class="building">后台筛选中…</span>
     </div>
 
     <p v-if="error" class="err">{{ error }}</p>
-    <p v-else-if="loading && !allItems.length" class="muted">
-      正在拉取行情与分红（中证红利约 100 只，首次可能需 1～3 分钟）…
+    <p v-else-if="(loading || report?.status === 'computing') && !allItems.length" class="muted">
+      正在后台拉取行情与分红（中证红利约 100 只，约 1～3 分钟），本页会自动刷新…
     </p>
     <p v-else-if="!loading && !items.length" class="muted">
       {{ viewMode === 'passed' ? '暂无命中标的。' : viewMode === 'failed' ? '暂无未命中标的。' : '暂无数据。' }}
@@ -201,7 +243,11 @@ onMounted(() => {
             <td class="num hot">{{ fmtPct(it.avg_div_yield_3y ?? it.avg_div_yield_5y) }}</td>
             <td class="num">{{ fmtPct(it.last_year_yield) }}</td>
             <td class="num">{{ it.consecutive_div_years ?? '—' }}</td>
-            <td class="num">{{ fmtPct(it.payout_ratio, 1) }}</td>
+            <td class="num">
+              <template v-if="it.payout_ratio != null">{{ fmtPct(it.payout_ratio, 1) }}</template>
+              <span v-else-if="it.payout_soft" class="soft">软通过</span>
+              <template v-else>—</template>
+            </td>
             <td class="num">{{ fmtPct(it.roe, 1) }}</td>
             <td class="num">{{ fmtNum(it.ocf_to_np, 2) }}</td>
             <td class="num">{{ fmtNum(it.pe_ttm, 1) }}</td>
@@ -294,6 +340,7 @@ onMounted(() => {
 }
 .stats .ok { color: #389e0d; font-weight: 600; }
 .stats .bad { color: #cf1322; font-weight: 600; }
+.stats .building { color: #d48806; font-weight: 600; }
 .primary {
   background: var(--color-primary);
   color: #fff;
@@ -372,6 +419,10 @@ onMounted(() => {
   font-size: 12px;
   color: #cf1322;
   line-height: 1.35;
+}
+.soft {
+  color: #8c8c8c;
+  font-size: 12px;
 }
 .linkish {
   background: none;

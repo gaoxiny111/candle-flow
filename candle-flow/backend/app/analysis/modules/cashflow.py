@@ -123,11 +123,85 @@ def check_dividend_coverage(
 class CashflowAnalyzer(BaseAnalyzer):
     """经营现金流含金量、自由现金流、资本开支压力、增长质量背离。"""
 
+    def _analyze_financial_lite(self, financial_data: pd.DataFrame, **kwargs) -> ModuleResult:
+        """金融/地产轻量口径：不评 FCF/分红 FCF 覆盖，避免制造业阈值误杀。"""
+        indicators: list[IndicatorResult] = []
+        warnings: list[str] = []
+        kind = str(kwargs.get("sector_kind") or "financial")
+        label = {
+            "bank": "银行",
+            "insurance": "保险",
+            "broker": "券商/非银",
+            "property": "地产",
+        }.get(kind, "金融/地产")
+        fd = financial_data
+        ocf = fd.get("operating_cashflow", pd.Series(dtype=float))
+        net_profit = fd["net_profit"].replace(0, pd.NA) if "net_profit" in fd.columns else pd.Series(dtype=float)
+        score = 58.0
+        comment = f"{label}不适用制造业自由现金流口径，现金流维按行业中性评分"
+        if len(ocf.dropna()) and len(net_profit.dropna()):
+            cr = float((ocf / net_profit).replace([np.inf, -np.inf], np.nan).dropna().iloc[-1])
+            # 经营现金流/净利仅作参考：正值略加分，强负略减，不按 FCF 否决
+            if cr >= 0.8:
+                score = 68.0
+                comment = f"{label}：经营现金流/净利 {cr:.2f}（参考），不作 FCF 否决"
+            elif cr >= 0.3:
+                score = 60.0
+                comment = f"{label}：经营现金流/净利 {cr:.2f}（参考）"
+            elif cr >= 0:
+                score = 55.0
+                comment = f"{label}：经营现金流/净利 {cr:.2f}（偏弱，行业口径下不作否决）"
+            else:
+                score = 50.0
+                comment = f"{label}：经营现金流/净利 {cr:.2f}（阶段性为负常见，不作制造业否决）"
+            indicators.append(
+                IndicatorResult(
+                    name="经营现金流/净利润(行业参考)",
+                    value=round(cr, 2),
+                    score=score,
+                    level=score_to_level(score),
+                    trend="flat",
+                    weight=1.0,
+                    comment=comment,
+                )
+            )
+        else:
+            indicators.append(
+                IndicatorResult(
+                    name="现金流口径隔离",
+                    value=0.0,
+                    score=score,
+                    level=score_to_level(score),
+                    trend="flat",
+                    weight=1.0,
+                    comment=comment,
+                )
+            )
+        warnings.append(f"{label}已启用行业口径隔离：关闭通用 FCF/分红覆盖评分")
+        return ModuleResult(
+            module_name="现金流质量",
+            score=round(score, 1),
+            level=score_to_level(score),
+            indicators=indicators,
+            warnings=warnings,
+            metadata={
+                "paper_wealth": False,
+                "financial_lite": True,
+                "sector_kind": kind,
+                "disable_generic_fcf": True,
+                "scoring_note": comment,
+            },
+        )
+
     def analyze(self, financial_data: pd.DataFrame, **kwargs) -> ModuleResult:
         indicators: list[IndicatorResult] = []
         warnings: list[str] = []
         if financial_data.empty:
             return ModuleResult("现金流质量", 0, AnalysisLevel.DANGER, warnings=["暂无现金流数据"])
+
+        # 银行/保险/券商/地产：关闭通用 FCF 口径，给中性偏上分 + 说明
+        if kwargs.get("disable_generic_fcf"):
+            return self._analyze_financial_lite(financial_data, **kwargs)
 
         # 分销/贸易商业模式：低净利率、高周转，上游预付 + 下游长账期，
         # 扩张期经营现金流为负属行业常态，不能直接套用制造业阈值。

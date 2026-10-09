@@ -194,3 +194,25 @@ def get_high_dividend(
     return ApiResponse(data=data)
 
 
+@router.get("/fundamentals/large-cap-board")
+def get_large_cap_board(
+    min_cap_yi: float = Query(default=0.0, ge=0.0, le=5000.0),
+    top: int = Query(default=6000, ge=1, le=6000),
+    universe_limit: int = Query(default=6000, ge=50, le=6000),
+    refresh: bool = Query(default=False),
+):
+    """A股基本面榜：全量按 A/B/C/D/E 分组（默认不设市值门槛），缺分后台补算。"""
+    from app.services.large_cap_board import scan_large_cap_board
+
+    try:
+        data = scan_large_cap_board(
+            min_cap_yi=min_cap_yi,
+            top=top,
+            universe_limit=universe_limit,
+            refresh=refresh,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"大盘股榜失败：{e}") from e
+    return ApiResponse(data=data)
+
+

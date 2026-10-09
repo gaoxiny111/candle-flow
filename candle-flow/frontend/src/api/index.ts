@@ -872,6 +872,7 @@ export interface HighDividendItem {
   consecutive_div_years?: number | null
   last_year_div?: number | null
   payout_ratio?: number | null
+  payout_soft?: boolean
   roe?: number | null
   ocf_to_np?: number | null
   pe_ttm?: number | null
@@ -891,6 +892,9 @@ export interface HighDividendReport {
   universe?: string
   pool_note?: string
   cached?: boolean
+  stale?: boolean
+  status?: 'ready' | 'computing' | 'refreshing'
+  refresh_started?: boolean
   items: HighDividendItem[]
   notes?: string[]
   thresholds?: Record<string, number>
@@ -910,6 +914,67 @@ export const fetchHighDividend = (params?: {
       refresh: params?.refresh ?? false,
     },
     timeout: 300000,
+  })
+
+export interface LargeCapBoardItem {
+  code: string
+  symbol: string
+  name: string
+  price?: number | null
+  pe_ttm?: number | null
+  pb?: number | null
+  market_cap?: number | null
+  market_cap_yi?: number | null
+  composite_score?: number | null
+  final_rating?: string | null
+  grade_band?: 'A' | 'B' | 'C' | 'D' | 'E' | 'pending'
+  scored?: boolean
+  status?: 'ready' | 'pending'
+  sector_kind?: string | null
+  industry?: string | null
+  dividend_yield?: number | null
+  dim_scores?: Record<string, number>
+  warnings?: string[]
+  scoring_version?: string
+}
+
+export type LargeCapGrade = 'A' | 'B' | 'C' | 'D' | 'E' | 'pending'
+
+export interface LargeCapBoardReport {
+  count: number
+  universe_size?: number
+  scored_count?: number
+  pending_count?: number
+  min_cap_yi?: number
+  pool_note?: string
+  cached?: boolean
+  status?: 'ready' | 'computing' | 'partial' | 'refreshing'
+  refresh_started?: boolean
+  progress?: {
+    running?: boolean
+    planned?: number
+    done?: number
+    failed?: number
+    started_at?: number
+  }
+  items: LargeCapBoardItem[]
+  groups?: Record<LargeCapGrade, LargeCapBoardItem[]>
+  grade_counts?: Record<LargeCapGrade, number>
+  notes?: string[]
+}
+
+export const fetchLargeCapBoard = (params?: {
+  refresh?: boolean
+}) =>
+  api.get<ApiResponse<LargeCapBoardReport>>('/fundamentals/large-cap-board', {
+    params: {
+      // 沪深 A 股全量，不设市值门槛；前端按 A–E 分组展示
+      min_cap_yi: 0,
+      top: 6000,
+      universe_limit: 6000,
+      refresh: params?.refresh ?? false,
+    },
+    timeout: 60000,
   })
 
 export interface WatchFundamental {
@@ -1124,9 +1189,10 @@ export interface FundamentalAnalysisReport {
           anchors?: Record<string, number | string | null>
         }
       >
-      /** 被标记不可信的模型名（仍参与交叉，但整体改取保守侧 min） */
+      /** 被标记不可信、仍参与交叉并改取保守侧 min 的模型名。
+       *  营收高增压力测试 DCF 不在此列，它在 auxiliary.dcf。 */
       unreliable_models?: string[]
-      /** 辅助参考（不入交叉、不影响任何分数）：目前只有周期股的股息锚对照 */
+      /** 辅助参考（不入交叉、不影响任何分数）：周期股股息锚，或营收高增压力测试 DCF */
       auxiliary?: Record<
         string,
         { value?: number; note?: string | null; reliable?: boolean; reason?: string }

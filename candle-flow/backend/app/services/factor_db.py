@@ -340,7 +340,9 @@ _REQUIRED_SNAPSHOT_KEYS: tuple[str, ...] = ("profit_yoy", "scoring_version")
 #      一次性全量重建，把价格基准统一到当日收盘价。
 #      副作用：bump 后重建期间读层缓存指纹（max(built_at)）持续变化 → 扫描会
 #      反复重建读缓存，属预期内的一次性开销。
-SCORING_VERSION = "2026.09.30.1"
+# 2026.10.09.1：行业自适应权重 / 周期内在价值锚 / 现金流金融轻量等打分口径变更，
+#      旧快照不可与图表页综合分混用，须重建。
+SCORING_VERSION = "2026.10.09.1"
 
 
 def _outdated_snapshot_symbols() -> set[str]:

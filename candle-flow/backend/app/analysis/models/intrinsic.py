@@ -26,11 +26,17 @@
    ``intrinsic_value_dcf`` / ``intrinsic_value_ddm``。
 3. **交叉验证** ``compute_intrinsic_value``：≥2 个模型才算「交叉验证」。
    全部可信 → 取**中位数**；只要含一个被标 ``reliable=False`` 的模型 → 取
-   **min（保守侧）**，note 里写明「含高成长 DCF 等不可信模型」。只剩 1 个模型
+   **min（保守侧）**，note 里写明「含不可信模型」。只剩 1 个模型
    时明确标注「单模型，未交叉」；一个都没有则返回 None + 原因，绝不用默认值兜底。
 
-   不可信模型**不被剔除出池**：整条剔出去会让高成长票退化成「只剩 DDM 的
-   单模型」，而按原值参与中位数又会用无法外推的值抬高结果 —— 取 min 两头都避开。
+   不可信模型**不被剔除出池**（估值偏离、股本缺失等）：整条剔出去会丢掉交叉，
+   按原值入中位数又会被无法外推的高值抬高 —— 取 min 两头都避开。
+
+   **例外（2026-10-09）**：引擎把营收同比 ≥30% 的 DCF 标成
+   ``role="high_growth_reference"`` 时，这份 DCF 是被增速上限压低的极端悲观
+   压力测试。它若入池再取 min，会把最终值拖到自己身上（工业富联一类）。
+   故只记入 ``auxiliary``，不参与交叉。池里若只剩可信 DDM，标明单模型；
+   DDM 也被分红率闸掉则返回 None，不用这份 DCF 兜底。
 
 单位约定（与项目其余模块一致，**全部用百分数**）
 ----------------------------------------------
@@ -91,13 +97,22 @@ GROWTH_EXCLUDE_YIELD_PCT = 4.0    # 排除「高股息 + PE<15」的低估值票
 GROWTH_EXCLUDE_PE_MAX = 15.0
 
 # ── 模型参数 ────────────────────────────────────────────────────────────
-CYCLICAL_NORMAL_PE = 10.0         # 周期正常化 PE 锚（跨周期中性利润 × 10）
+# PE 锚：正常化**全年** EPS × 倍数。一体化周期（煤电运港）用略高倍数。
+CYCLICAL_NORMAL_PE = 12.0         # 一般周期：10–14 区间中枢
+CYCLICAL_NORMAL_PE_INTEGRATED = 13.0  # 长协/一体化周期（如神华）
 CYCLICAL_PB_ROE_MULT = 15.0       # 合理 PB = ROE(小数) × 15，即 ROE 10% → PB 1.5
 CYCLICAL_PB_FLOOR = 1.0           # 合理 PB 下限
-CYCLICAL_PB_PCTL_HIGH = 70.0      # PB 历史分位 > 70% → 折价 20%
-CYCLICAL_PB_PCTL_EXTREME = 85.0   # PB 历史分位 > 85% → 折价 40%
-CYCLICAL_DISCOUNT_HIGH = 0.8
-CYCLICAL_DISCOUNT_EXTREME = 0.6
+# 双锚交叉：加权而非 min（避免半年度 EPS 压低的 PE 锚单独决定结果）
+CYCLICAL_PE_WEIGHT = 0.6
+CYCLICAL_PB_WEIGHT = 0.4
+# PB 高位折价只作用于 PB 锚（或加权前的 PB），且远轻于旧版对 min 再 ×0.6
+CYCLICAL_PB_PCTL_HIGH = 70.0
+CYCLICAL_PB_PCTL_EXTREME = 90.0
+CYCLICAL_DISCOUNT_HIGH = 0.95          # PB 分位 >70：PB 锚 ×0.95
+CYCLICAL_DISCOUNT_EXTREME_ROE_DOWN = 0.85  # >90 且 ROE 走弱
+CYCLICAL_DISCOUNT_EXTREME_ROE_OK = 0.95    # >90 且 ROE 未走弱
+# 兼容旧测试名：极端档默认用「ROE 未走弱」的轻折价
+CYCLICAL_DISCOUNT_EXTREME = CYCLICAL_DISCOUNT_EXTREME_ROE_OK
 
 DIVIDEND_ANCHOR_ALPHA = 0.02      # 股息锚定：要求回报率 = 国债 + 2% 风险溢价
 DDM_ALPHA = 0.03                  # DDM：要求回报率 = 国债 + 3%
@@ -326,85 +341,154 @@ def intrinsic_value_dividend(
     )
 
 
+def _is_interim_report_date(report_date: Any) -> bool:
+    s = str(report_date or "").strip()
+    if len(s) >= 8 and s[:8].isdigit():
+        return not s[4:8] == "1231"
+    return False
+
+
+def _annualize_factor_for_report(report_date: Any) -> float | None:
+    """中报/季报累计 EPS → 粗估全年倍数；年报返回 1.0；无法识别返回 None。"""
+    s = str(report_date or "").strip()
+    if len(s) < 8 or not s[:8].isdigit():
+        return None
+    mmdd = s[4:8]
+    if mmdd == "1231":
+        return 1.0
+    return {"0331": 4.0, "0630": 2.0, "0930": 4.0 / 3.0}.get(mmdd)
+
+
+def _resolve_cyclical_eps(row: dict[str, Any]) -> tuple[float | None, str]:
+    """解析全年口径 EPS。禁止把半年度累计 EPS 直接当全年正常化利润。"""
+    eps_norm = _f(row.get("eps_normalized"))
+    if eps_norm is not None and eps_norm > 0:
+        return eps_norm, "跨周期中性利润/股本"
+
+    eps_med = _f(row.get("eps_5y_median"))
+    if eps_med is not None and eps_med > 0:
+        return eps_med, "近 5 年 EPS 中位数"
+
+    eps_annual = _f(row.get("eps_annual_latest"))
+    if eps_annual is not None and eps_annual > 0:
+        return eps_annual, "最近完整年报 EPS"
+
+    report_date = row.get("eps_report_date") or row.get("latest_report")
+    eps_raw = _f(row.get("eps_ttm"))
+    is_interim = bool(row.get("eps_is_interim")) or _is_interim_report_date(report_date)
+    if eps_raw is not None and eps_raw > 0:
+        if is_interim:
+            factor = _annualize_factor_for_report(report_date) or 2.0
+            return eps_raw * factor, (
+                f"最新累计 EPS {eps_raw:.2f}×{factor:g} 年化"
+                f"（报告期 {report_date}；禁止直接用半年度当全年）"
+            )
+        return eps_raw, "最新年报/TTM EPS"
+    return None, "EPS 不可得"
+
+
 def cyclical_anchors(row: dict[str, Any]) -> dict[str, Any]:
     """周期双锚明细（唯一实现，``intrinsic_value_cyclical`` 与组装层共用）。
 
-    - 正常化 PE 锚：跨周期中性利润对应的 EPS × 正常化 PE
-    - PB-ROE 锚：合理 PB = ROE × 15（下限 1.0），乘 BVPS
-    - 取两者保守值，再按 PB 历史分位折价（周期位置修正）
+    - 正常化 PE 锚：全年口径 EPS × PE 倍数（一体化周期略高）
+    - PB-ROE 锚：合理 PB × BVPS；高位折价只打在 PB 锚上
+    - 双锚加权（默认 0.6/0.4），不再对 min 再叠 40% 折价
     """
-    eps_norm = _f(row.get("eps_normalized"))
-    eps_src = "跨周期中性利润/股本"
-    if eps_norm is None:
-        eps_norm = _f(row.get("eps_5y_median"))
-        eps_src = "近 5 年 EPS 中位数"
-    if eps_norm is None:
-        eps_norm = _f(row.get("eps_ttm"))
-        eps_src = "最新 EPS（正常化数据缺失，回退）"
+    eps_norm, eps_src = _resolve_cyclical_eps(row)
+    integrated = bool(row.get("soft_cyclical") or row.get("cyclical_integrated"))
+    pe_mult = (
+        _f(row.get("cyclical_pe_mult"))
+        or (CYCLICAL_NORMAL_PE_INTEGRATED if integrated else CYCLICAL_NORMAL_PE)
+    )
 
     bvps = _f(row.get("bvps"))
     roe = _f(row.get("roe_ttm"))
     pb_pctl = _f(row.get("pb_percentile"))
+    roe_trend = _f(row.get("roe_trend"))  # 同比变动（pct），<0 走弱
 
     v_pe: float | None = None
-    if eps_norm is not None and eps_norm > 0:
-        v_pe = eps_norm * CYCLICAL_NORMAL_PE
+    if eps_norm is not None and eps_norm > 0 and pe_mult is not None:
+        v_pe = eps_norm * float(pe_mult)
 
     pb_target: float | None = None
     if roe is not None and roe > 0:
         pb_target = max(CYCLICAL_PB_FLOOR, roe / 100.0 * CYCLICAL_PB_ROE_MULT)
     elif roe is not None:
-        pb_target = CYCLICAL_PB_FLOOR  # ROE ≤ 0：只给净资产底线，不给溢价
-    v_pb: float | None = None
+        pb_target = CYCLICAL_PB_FLOOR
+    v_pb_raw: float | None = None
     if bvps is not None and bvps > 0 and pb_target is not None:
-        v_pb = bvps * pb_target
+        v_pb_raw = bvps * pb_target
 
-    vals = [v for v in (v_pe, v_pb) if v is not None]
-    intrinsic: float | None = None
+    # PB 高位折价：只作用于 PB 锚；一体化周期最多轻折 5%
     discount = 1.0
     discount_label = ""
-    if vals:
-        intrinsic = min(vals)
-        # 周期位置修正：先判极端档，否则 >70 的 0.8 会吃掉 >85 的 0.6（原式分支顺序有误）
-        if pb_pctl is not None:
-            if pb_pctl > CYCLICAL_PB_PCTL_EXTREME:
-                discount = CYCLICAL_DISCOUNT_EXTREME
+    v_pb = v_pb_raw
+    if v_pb is not None and pb_pctl is not None:
+        if pb_pctl > CYCLICAL_PB_PCTL_EXTREME:
+            if integrated:
+                discount = CYCLICAL_DISCOUNT_EXTREME_ROE_OK
                 discount_label = (
-                    f"PB 历史分位 {pb_pctl:.0f}%>"
-                    f"{CYCLICAL_PB_PCTL_EXTREME:.0f}%，周期高位折价 "
-                    f"{(1 - discount) * 100:.0f}%"
+                    f"PB 分位 {pb_pctl:.0f}% 偏高，一体化周期仅轻折价 "
+                    f"{(1 - discount) * 100:.0f}%（作用于 PB 锚）"
                 )
-            elif pb_pctl > CYCLICAL_PB_PCTL_HIGH:
-                discount = CYCLICAL_DISCOUNT_HIGH
+            elif roe_trend is not None and roe_trend < 0:
+                discount = CYCLICAL_DISCOUNT_EXTREME_ROE_DOWN
                 discount_label = (
-                    f"PB 历史分位 {pb_pctl:.0f}%>"
-                    f"{CYCLICAL_PB_PCTL_HIGH:.0f}%，周期偏高位折价 "
-                    f"{(1 - discount) * 100:.0f}%"
+                    f"PB 分位 {pb_pctl:.0f}%>{CYCLICAL_PB_PCTL_EXTREME:.0f}% 且 ROE 走弱，"
+                    f"PB 锚折价 {(1 - discount) * 100:.0f}%"
                 )
-        intrinsic *= discount
+            else:
+                discount = CYCLICAL_DISCOUNT_EXTREME_ROE_OK
+                discount_label = (
+                    f"PB 分位 {pb_pctl:.0f}%>{CYCLICAL_PB_PCTL_EXTREME:.0f}% 但 ROE 未走弱，"
+                    f"PB 锚轻折价 {(1 - discount) * 100:.0f}%"
+                )
+            v_pb = v_pb * discount
+        elif pb_pctl > CYCLICAL_PB_PCTL_HIGH:
+            discount = 1.0 if integrated else CYCLICAL_DISCOUNT_HIGH
+            if discount < 1.0:
+                discount_label = (
+                    f"PB 分位 {pb_pctl:.0f}%>{CYCLICAL_PB_PCTL_HIGH:.0f}%，"
+                    f"PB 锚轻折价 {(1 - discount) * 100:.0f}%"
+                )
+                v_pb = v_pb * discount
+
+    intrinsic: float | None = None
+    anchor_used: str | None = None
+    if v_pe is not None and v_pb is not None:
+        intrinsic = CYCLICAL_PE_WEIGHT * v_pe + CYCLICAL_PB_WEIGHT * v_pb
+        anchor_used = "weighted"
+    elif v_pe is not None:
+        intrinsic = v_pe
+        anchor_used = "normalized_pe"
+    elif v_pb is not None:
+        intrinsic = v_pb
+        anchor_used = "pb_roe"
 
     return {
         "eps_normalized": eps_norm,
         "eps_source": eps_src,
-        "normal_pe": CYCLICAL_NORMAL_PE,
+        "normal_pe": float(pe_mult) if pe_mult is not None else CYCLICAL_NORMAL_PE,
         "value_normalized_pe": v_pe,
         "bvps": bvps,
         "roe_ttm_pct": roe,
         "pb_target": pb_target,
         "value_pb_roe": v_pb,
-        "anchor_used": (
-            "normalized_pe" if v_pe is not None and (v_pb is None or v_pe <= v_pb)
-            else ("pb_roe" if v_pb is not None else None)
-        ),
+        "value_pb_roe_raw": v_pb_raw,
+        "anchor_used": anchor_used,
         "pb_percentile": pb_pctl,
         "discount": discount,
         "discount_label": discount_label,
-        "intrinsic_value_per_share": intrinsic,
+        "discount_target": "pb_anchor",
+        "soft_cyclical": integrated,
+        "pe_weight": CYCLICAL_PE_WEIGHT,
+        "pb_weight": CYCLICAL_PB_WEIGHT,
+        "intrinsic_value_per_share": None if intrinsic is None else round(intrinsic, 4),
     }
 
 
 def intrinsic_value_cyclical(row: dict[str, Any]) -> tuple[float | None, str]:
-    """周期资产：正常化 PE + PB-ROE 双锚取保守值，按 PB 分位折价；禁用峰值 DCF。"""
+    """周期资产：全年 EPS×PE + PB-ROE 加权；PB 高位轻折价；禁用峰值 DCF。"""
     a = cyclical_anchors(row)
     iv = a["intrinsic_value_per_share"]
     if iv is None:
@@ -413,17 +497,32 @@ def intrinsic_value_cyclical(row: dict[str, Any]) -> tuple[float | None, str]:
     parts: list[str] = []
     if a["value_normalized_pe"] is not None:
         parts.append(
-            f"正常化 EPS {a['eps_normalized']:.2f} 元（{a['eps_source']}）×"
+            f"正常化全年 EPS {a['eps_normalized']:.2f} 元（{a['eps_source']}）×"
             f"{a['normal_pe']:.0f}PE = {a['value_normalized_pe']:.2f} 元"
         )
-    if a["value_pb_roe"] is not None:
+    if a.get("value_pb_roe_raw") is not None:
+        parts.append(
+            f"PB 锚 合理PB {a['pb_target']:.2f}×BVPS {a['bvps']:.2f} = "
+            f"{a['value_pb_roe_raw']:.2f} 元"
+        )
+        if a["discount_label"] and a.get("value_pb_roe") is not None:
+            parts.append(
+                f"{a['discount_label']} → PB 锚 {a['value_pb_roe']:.2f} 元"
+            )
+    elif a["value_pb_roe"] is not None:
         parts.append(
             f"PB 锚 合理PB {a['pb_target']:.2f}×BVPS {a['bvps']:.2f} = "
             f"{a['value_pb_roe']:.2f} 元"
         )
-    parts.append(f"取保守值 {min(v for v in (a['value_normalized_pe'], a['value_pb_roe']) if v is not None):.2f} 元")
-    if a["discount_label"]:
-        parts.append(a["discount_label"])
+    if a["anchor_used"] == "weighted":
+        parts.append(
+            f"加权 "
+            f"{a['pe_weight']:.0%}×PE锚 + {a['pb_weight']:.0%}×PB锚 = {iv:.2f} 元"
+        )
+    else:
+        parts.append(f"单锚 {a['anchor_used']} = {iv:.2f} 元")
+    if a["soft_cyclical"]:
+        parts.append("一体化/长协周期：轻折价、略高 PE 倍数")
     parts.append(f"周期内在价值≈{iv:.2f} 元")
     return iv, "周期估值（禁用峰值 DCF）：" + "；".join(parts)
 
@@ -526,14 +625,15 @@ def compute_intrinsic_value(
           * 全部可信 → 取**中位数**，``cross_basis="median"``
           * 含任一 ``reliable=False`` → 取 **min（保守锚）**，
             ``cross_basis="conservative"``、``conservative=True``，note 写明
-            「含高成长 DCF 等不可信模型」
+            「含不可信模型」
       - 只有 1 个 → ``cross_model=False``，note 明确写「单模型，未交叉」
       - 0 个 → 返回 None + 原因（不兜底、不给默认值）
 
-    为什么不可信模型不剔除：高成长股 DCF 被引擎标 ``is_reliable=False``
-    （增速无法外推）是合理的风控，但不可靠 ≠ 不能入池 —— 整条剔出去会让这类
-    票只剩 DDM 单模型（丢掉交叉验证），按原值入中位数又会用无法外推的高值
-    抬高结果。取 min 则同时避免「丢交叉」和「被高值拉高」。
+    为什么一般不可信模型不剔除：估值偏离或股本缺失的 DCF 整条剔出去会丢掉
+    交叉，按原值入中位数又会被无法外推的高值抬高。取 min 两头都避开。
+
+    ``role="high_growth_reference"`` 是例外：这份 DCF 被增速上限压低，取 min
+    会被低值拖垮。它只进 ``auxiliary``，不入 ``models``。
 
     DDM 候选（无论注入还是自算）一律受 ``ddm_payout_allows`` 分红率闸门约束。
     """
@@ -547,8 +647,8 @@ def compute_intrinsic_value(
     price = _f(row.get("price"))
 
     models: dict[str, dict[str, Any]] = {}
-    # 辅助参考（display_only，**不入 models、不参与交叉验证**）：目前只有周期股
-    # 「命中周期但同时也是红利资产」时记下的股息锚，仅用于对照说明。
+    # 辅助参考（display_only，**不入 models、不参与交叉验证**）：
+    # 周期股的股息锚，以及营收高增时被标成压力测试的 DCF。
     auxiliary: dict[str, Any] = {}
 
     def _put(name: str, value: Any, note: str | None, reliable: bool = True) -> None:
@@ -557,9 +657,33 @@ def compute_intrinsic_value(
             return
         models[name] = {"value": v, "note": note, "reliable": reliable}
 
+    def _park(name: str, value: Any, note: str | None, reason: str) -> None:
+        v = _f(value)
+        if v is None or v <= 0:
+            return
+        auxiliary[name] = {
+            "value": round(v, 2),
+            "note": note,
+            "reliable": False,
+            "reason": reason,
+        }
+
     def _resolve_dcf() -> None:
-        """DCF 候选：注入优先（引擎那套真实 FCF 版），否则按简化式自算。"""
+        """DCF 候选：注入优先（引擎那套真实 FCF 版），否则按简化式自算。
+
+        ``role="high_growth_reference"``（营收同比 ≥30%）的注入值是被增速上限
+        压低的压力测试，只进 auxiliary，避免取 min 时被它拖垮。
+        """
         if dcf is not None and _f(dcf.get("value")) is not None:
+            if dcf.get("role") == "high_growth_reference":
+                _park(
+                    "dcf",
+                    dcf.get("value"),
+                    dcf.get("note"),
+                    "营收高增的 DCF 为极端悲观压力测试，增速无法外推，"
+                    "只作对照、不参与交叉取值",
+                )
+                return
             _put("dcf", dcf.get("value"), dcf.get("note"), bool(dcf.get("reliable", True)))
             return
         v, n = intrinsic_value_dcf(row)
@@ -594,15 +718,13 @@ def compute_intrinsic_value(
         # 供人工对照 —— 它不入 models、不参与交叉验证、不影响任何分数。
         _aux_v, _aux_n = intrinsic_value_dividend(row)
         if _aux_v is not None:
-            auxiliary["dividend_anchor"] = {
-                "value": round(_aux_v, 2),
-                "note": _aux_n,
-                "reliable": False,
-                "reason": (
-                    "周期股不用股息锚定价：景气高点的高股息来自峰值利润、"
-                    "现金流不可持续（仅作对照参考）"
-                ),
-            }
+            _park(
+                "dividend_anchor",
+                _aux_v,
+                _aux_n,
+                "周期股不用股息锚定价：景气高点的高股息来自峰值利润、"
+                "现金流不可持续（仅作对照参考）",
+            )
 
     else:  # growth / value
         _resolve_dcf()
@@ -617,6 +739,14 @@ def compute_intrinsic_value(
     }
 
     if not models:
+        if "dcf" in auxiliary:
+            _ref = auxiliary["dcf"]["value"]
+            empty_note = (
+                f"高成长 DCF（{_ref:.2f} 元）仅作对照、不参与取值；"
+                "其余模型不可用，无法给出内在价值"
+            )
+        else:
+            empty_note = "数据不足，无法计算内在价值"
         return {
             **base,
             "intrinsic_value_per_share": None,
@@ -628,7 +758,7 @@ def compute_intrinsic_value(
             "unreliable_models": [],
             "auxiliary": auxiliary,
             "margin_of_safety_pct": None,
-            "note": "数据不足，无法计算内在价值",
+            "note": empty_note,
         }
 
     # 2026-09-29 修订：不可信模型不再被剔除出池，改为「入池但取保守侧」。
@@ -642,9 +772,7 @@ def compute_intrinsic_value(
         if unreliable:
             final = min(vals)          # 保守锚：宁可低估，不可被不可信的高值拉高
             cross_basis = "conservative"
-            _unrel_label = "、".join(
-                "高成长 DCF" if k == "dcf" else k for k in unreliable
-            )
+            _unrel_label = "、".join(unreliable)
             note = (
                 f"交叉验证（含不可信模型 {_unrel_label}，取保守值 {final:.2f} 元；"
                 f"参与：{'+'.join(models)}）"
@@ -660,6 +788,10 @@ def compute_intrinsic_value(
         note = f"单模型参考，未交叉（仅 {only}）"
         if unreliable:
             note += "；该模型被标记不可信，结果仅供参考"
+        if "dcf" in auxiliary:
+            note += (
+                f"；高成长 DCF {auxiliary['dcf']['value']:.2f} 元仅作对照，未入池"
+            )
 
     margin = (final / price - 1) * 100 if price and price > 0 else None
     return {

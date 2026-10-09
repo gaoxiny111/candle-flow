@@ -509,11 +509,13 @@ function bullBearTone(view: string | undefined) {
             {{ STYLE_LABEL[report.valuation.intrinsic_value.style || 'value'] }}
             ·
             {{
-              report.valuation.intrinsic_value.cross_model
-                ? report.valuation.intrinsic_value.conservative
-                  ? '交叉验证（保守侧）'
-                  : '交叉验证'
-                : '单模型（未交叉）'
+              !report.valuation.intrinsic_value.model_count
+                ? '无法计算'
+                : report.valuation.intrinsic_value.cross_model
+                  ? report.valuation.intrinsic_value.conservative
+                    ? '交叉验证（保守侧）'
+                    : '交叉验证'
+                  : '单模型（未交叉）'
             }}
           </span>
         </h4>
@@ -550,6 +552,14 @@ function bullBearTone(view: string | undefined) {
           {{ report.valuation.intrinsic_value.auxiliary.dividend_anchor.value }} 元
           — {{ report.valuation.intrinsic_value.auxiliary.dividend_anchor.reason }}
         </p>
+        <p
+          v-if="report.valuation.intrinsic_value.auxiliary?.dcf"
+          class="muted"
+        >
+          高成长 DCF 对照（仅参考，不参与交叉/定价）：
+          {{ report.valuation.intrinsic_value.auxiliary.dcf.value }} 元
+          — {{ report.valuation.intrinsic_value.auxiliary.dcf.reason }}
+        </p>
       </section>
 
       <section v-if="report.valuation?.dcf" class="valuation card-inner">
@@ -561,9 +571,11 @@ function bullBearTone(view: string | undefined) {
                 ? '红利资产不适用'
                 : report.valuation.dcf.role === 'not_applicable_cyclical'
                   ? '周期股禁用峰值DCF'
-                  : report.valuation.dcf.suppressed
-                    ? '不参与定价'
-                    : '保守参考'
+                  : report.valuation.dcf.role === 'high_growth_reference'
+                    ? '极端悲观对照，不参与内在价值交叉'
+                    : report.valuation.dcf.suppressed
+                      ? '不参与定价'
+                      : '保守参考'
             }}
           </span>
         </h4>

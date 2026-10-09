@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pandas as pd
 import pytest
 
@@ -27,11 +29,40 @@ def test_annual_cash_dps_from_sina_payout():
         {
             "公告日期": ["2024-07-01", "2024-12-01", "2025-07-01"],
             "派息": [10.0, 5.0, 12.0],
+            "进度": ["实施", "实施", "实施"],
+            "除权除息日": ["2024-07-10", "2024-12-10", "2025-07-10"],
         }
     )
     s = hd._annual_cash_dps(hist)
     assert s.loc[2024] == pytest.approx(1.5)
     assert s.loc[2025] == pytest.approx(1.2)
+
+
+def test_annual_cash_dps_skips_plan_rows():
+    hist = pd.DataFrame(
+        {
+            "公告日期": ["2025-06-01", "2025-06-15"],
+            "派息": [10.0, 10.0],
+            "进度": ["预案", "实施"],
+            "除权除息日": [None, "2025-06-20"],
+        }
+    )
+    s = hd._annual_cash_dps(hist)
+    assert s.loc[2025] == pytest.approx(1.0)
+
+
+def test_payout_ratio_3y_sum_dps_over_eps():
+    cash = pd.Series({2023: 1.0, 2024: 1.2, 2025: 1.1})
+    eps = pd.Series({2023: 2.0, 2024: 2.4, 2025: 2.2})
+    # (1+1.2+1.1)/(2+2.4+2.2)=3.3/6.6=50%
+    assert hd._payout_ratio_3y(cash, eps) == pytest.approx(50.0)
+
+
+def test_payout_soft_when_missing():
+    row = _base_ok(payout_ratio=None, payout_soft=True)
+    assert hd._fail_reasons(row) == []
+    row2 = _base_ok(payout_ratio=0.1, payout_soft=False)
+    assert any("支付率" in r for r in hd._fail_reasons(row2))
 
 
 def test_annual_cash_dps_legacy_columns():
@@ -101,6 +132,24 @@ def test_fail_reasons_lists_missing_conditions():
     assert any("ROE" in r for r in reasons)
 
 
+def test_hard_pe_pb_gate():
+    assert hd._passes_hard_pe_pb(12.0, 1.2) is True
+    assert hd._passes_hard_pe_pb(15.0, 1.5) is True
+    assert hd._passes_hard_pe_pb(15.1, 1.2) is False
+    assert hd._passes_hard_pe_pb(12.0, 1.6) is False
+    assert hd._passes_hard_pe_pb(None, 1.2) is False
+    assert hd._passes_hard_pe_pb(-1.0, 1.2) is False
+    # 不满足仍进列表：标未命中并写入 fail_reasons
+    pe_fail = hd._fail_reasons(_base_ok(pe_ttm=20.0))
+    assert any("PE≤" in r for r in pe_fail)
+    pb_fail = hd._fail_reasons(_base_ok(pb=2.0))
+    assert any("PB≤" in r for r in pb_fail)
+    item = hd._row_to_item(pd.Series(_base_ok(pe_ttm=20.0, pb=2.0)))
+    assert item["passed"] is False
+    assert any("PE≤" in r for r in item["fail_reasons"])
+    assert any("PB≤" in r for r in item["fail_reasons"])
+
+
 def test_to_symbol():
     assert hd._to_symbol("601088") == "601088.SH"
     assert hd._to_symbol("000001") == "000001.SZ"
@@ -113,3 +162,78 @@ def test_exclude_beijing_exchange_codes():
     assert hd._is_hs_a_code("920000") is False
     assert hd._is_hs_a_code("830001") is False
     assert hd._is_hs_a_code("430047") is False
+
+
+def test_scan_returns_computing_without_blocking(monkeypatch, tmp_path):
+    """冷启动不得同步扫全池（否则 Cloudflare 524）。"""
+    hd.invalidate_cache()
+    monkeypatch.setattr(hd, "_DISK_CACHE_DIR", tmp_path)
+    called = {"n": 0}
+
+    def _fake_screen(**kwargs):
+        called["n"] += 1
+        time.sleep(0.05)
+        return {
+            "count": 1,
+            "matched": 1,
+            "rejected": 0,
+            "scanned": 1,
+            "universe": "csi_div",
+            "pool_note": "test",
+            "items": [hd._row_to_item(pd.Series(_base_ok()))],
+            "notes": [],
+            "thresholds": hd._thresholds(),
+        }
+
+    monkeypatch.setattr(hd, "screen_high_dividend_stocks", _fake_screen)
+
+    t0 = time.time()
+    out = hd.scan_high_dividend(universe="csi_div", top=50, refresh=False)
+    assert time.time() - t0 < 1.0
+    assert out["status"] == "computing"
+    assert out["items"] == []
+
+    # 等后台写完，再请求应命中缓存
+    for _ in range(50):
+        time.sleep(0.05)
+        with hd._LOCK:
+            if hd._CACHE["data"] is not None:
+                break
+    out2 = hd.scan_high_dividend(universe="csi_div", top=50, refresh=False)
+    assert out2["status"] in ("ready", "refreshing")
+    assert out2["matched"] == 1
+    assert called["n"] >= 1
+    hd.invalidate_cache()
+
+
+def test_scan_serves_stale_disk_and_schedules_refresh(monkeypatch, tmp_path):
+    hd.invalidate_cache()
+    monkeypatch.setattr(hd, "_DISK_CACHE_DIR", tmp_path)
+    key = f"{hd.CACHE_VERSION}:csi_div:None"
+    payload = {
+        "count": 1,
+        "matched": 1,
+        "rejected": 0,
+        "scanned": 1,
+        "universe": "csi_div",
+        "pool_note": "disk",
+        "items": [hd._row_to_item(pd.Series(_base_ok()))],
+        "notes": [],
+        "thresholds": hd._thresholds(),
+    }
+    hd._save_disk(key, payload, ts=time.time() - hd.CACHE_TTL_SEC - 10)
+
+    scheduled = {"n": 0}
+
+    def _fake_schedule(cache_key, universe, limit):
+        scheduled["n"] += 1
+        return True
+
+    monkeypatch.setattr(hd, "_schedule_refresh", _fake_schedule)
+
+    out = hd.scan_high_dividend(universe="csi_div", top=50, refresh=False)
+    assert out["matched"] == 1
+    assert out["stale"] is True
+    assert out["status"] == "refreshing"
+    assert scheduled["n"] == 1
+    hd.invalidate_cache()

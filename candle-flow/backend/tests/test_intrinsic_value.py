@@ -165,49 +165,93 @@ def test_dividend_anchor_formula():
     assert I.intrinsic_value_dividend(_row(dividend_per_share=None))[0] is None
 
 
-def test_cyclical_anchor_takes_conservative_min():
-    """双锚取保守值：min(正常化PE 锚, PB-ROE 锚)。"""
-    # ① PB 锚更低（BVPS 5.0 × 合理 PB 1.5 = 7.5 < 正常化 EPS 1.0 × 10 = 10）
+def test_cyclical_anchor_takes_weighted_cross():
+    """双锚加权：0.6×PE + 0.4×PB，不再取 min。"""
+    # PE=1×12=12，PB=5×1.5=7.5 → 加权 0.6*12+0.4*7.5=10.2
     row = _row(industry="工业金属", eps_normalized=1.0, bvps=5.0, roe_ttm=10.0,
                pb_percentile=30.0)
     a = I.cyclical_anchors(row)
     assert a["value_normalized_pe"] == pytest.approx(1.0 * I.CYCLICAL_NORMAL_PE)
-    assert a["value_pb_roe"] == pytest.approx(5.0 * 1.5)  # ROE 10% → 合理 PB 1.5
-    assert a["anchor_used"] == "pb_roe"
-    assert a["intrinsic_value_per_share"] == pytest.approx(7.5)
+    assert a["value_pb_roe"] == pytest.approx(5.0 * 1.5)
+    assert a["anchor_used"] == "weighted"
+    assert a["intrinsic_value_per_share"] == pytest.approx(
+        0.6 * a["value_normalized_pe"] + 0.4 * a["value_pb_roe"]
+    )
     assert a["discount"] == 1.0
 
-    # ② 正常化 PE 锚更低（BVPS 10 × 1.5 = 15 > 10）
-    row2 = _row(industry="工业金属", eps_normalized=1.0, bvps=10.0, roe_ttm=10.0,
+    # 仅 PE 锚
+    row2 = _row(industry="工业金属", eps_normalized=1.0, bvps=None, roe_ttm=None,
                 pb_percentile=30.0)
     a2 = I.cyclical_anchors(row2)
     assert a2["anchor_used"] == "normalized_pe"
-    assert a2["intrinsic_value_per_share"] == pytest.approx(10.0)
+    assert a2["intrinsic_value_per_share"] == pytest.approx(I.CYCLICAL_NORMAL_PE)
 
 
-def test_cyclical_pb_percentile_discount_extreme_branch_reachable():
-    """PB 分位 >85% 必须拿到 0.6 折价（原式 0.8 在前会让 0.6 永远不可达）。"""
-    row = _row(industry="工业金属", eps_normalized=1.0, bvps=10.0, roe_ttm=10.0,
-               pb_percentile=88.0)
+def test_cyclical_pb_percentile_discount_applies_to_pb_only():
+    """PB 分位极端折价只打在 PB 锚上，不再对 min(PE,PB) 叠 ×0.6。"""
+    row = _row(
+        industry="工业金属",
+        eps_normalized=2.8,
+        bvps=20.0,
+        roe_ttm=12.0,
+        pb_percentile=95.0,
+        roe_trend=-1.0,
+    )
     a = I.cyclical_anchors(row)
-    assert a["discount"] == I.CYCLICAL_DISCOUNT_EXTREME
-    assert a["intrinsic_value_per_share"] == pytest.approx(10.0 * 0.6)
+    pe = 2.8 * I.CYCLICAL_NORMAL_PE
+    pb_raw = 20.0 * max(1.0, 0.12 * 15.0)
+    assert a["value_normalized_pe"] == pytest.approx(pe)
+    assert a["discount"] == I.CYCLICAL_DISCOUNT_EXTREME_ROE_DOWN
+    assert a["value_pb_roe"] == pytest.approx(pb_raw * a["discount"])
+    assert a["intrinsic_value_per_share"] == pytest.approx(
+        0.6 * pe + 0.4 * a["value_pb_roe"]
+    )
 
     row["pb_percentile"] = 75.0
+    row["roe_trend"] = 0.0
     a2 = I.cyclical_anchors(row)
     assert a2["discount"] == I.CYCLICAL_DISCOUNT_HIGH
-    assert a2["intrinsic_value_per_share"] == pytest.approx(10.0 * 0.8)
 
 
-def test_cyclical_anchor_falls_back_to_median_eps_then_ttm():
+def test_cyclical_anchor_falls_back_to_median_eps_then_annualized_interim():
     row = _row(industry="工业金属", eps_normalized=None, eps_5y_median=0.6, eps_ttm=2.0,
                bvps=None, roe_ttm=None, pb_percentile=10.0)
     a = I.cyclical_anchors(row)
     assert a["eps_source"] == "近 5 年 EPS 中位数"
-    assert a["intrinsic_value_per_share"] == pytest.approx(6.0)
+    assert a["intrinsic_value_per_share"] == pytest.approx(0.6 * I.CYCLICAL_NORMAL_PE)
 
     row["eps_5y_median"] = None
-    assert I.cyclical_anchors(row)["eps_source"] == "最新 EPS（正常化数据缺失，回退）"
+    row["eps_is_interim"] = True
+    row["eps_report_date"] = "20260630"
+    row["eps_ttm"] = 1.34
+    a2 = I.cyclical_anchors(row)
+    assert "年化" in a2["eps_source"]
+    assert a2["eps_normalized"] == pytest.approx(2.68)
+    # 禁止把 1.34 当全年
+    assert a2["intrinsic_value_per_share"] == pytest.approx(2.68 * I.CYCLICAL_NORMAL_PE)
+
+
+def test_cyclical_shenhua_style_not_eight_yuan():
+    """神华案：H1 EPS 1.34 + PB99% 不得再算出 ~8 元。"""
+    row = _row(
+        industry="煤炭开采",
+        eps_normalized=None,
+        eps_5y_median=None,
+        eps_ttm=1.34,
+        eps_is_interim=True,
+        eps_report_date="20260630",
+        bvps=20.81,
+        roe_ttm=12.75,
+        pb_percentile=99.0,
+        soft_cyclical=True,
+        cyclical_integrated=True,
+        roe_trend=0.5,
+    )
+    a = I.cyclical_anchors(row)
+    assert a["eps_normalized"] == pytest.approx(2.68)
+    assert a["soft_cyclical"] is True
+    assert a["intrinsic_value_per_share"] is not None
+    assert a["intrinsic_value_per_share"] > 25.0  # 远高于旧 bug 的 8 元
 
 
 def test_cyclical_anchor_missing_returns_none_not_zero():
@@ -296,7 +340,7 @@ def test_unreliable_model_enters_pool_and_takes_conservative_min():
     assert o["conservative"] is True
     assert o["intrinsic_value_per_share"] == pytest.approx(12.0)  # min(12, 46)
     assert o["unreliable_models"] == ["dcf"]
-    assert "保守" in o["note"] and "高成长 DCF" in o["note"]
+    assert "保守" in o["note"] and "dcf" in o["note"]
     assert o["models"]["ddm"]["value"] == pytest.approx(46.0)
 
 
@@ -314,6 +358,52 @@ def test_unreliable_high_growth_dcf_does_not_inflate_result():
     assert o["cross_model"] is True
     assert o["cross_basis"] == "conservative"
     assert o["intrinsic_value_per_share"] == pytest.approx(46.0)  # 中位数会是 72.5
+
+
+def test_high_growth_reference_dcf_stays_out_of_the_pool():
+    """营收高增压力测试 DCF 只作对照，不能把可信 DDM 拖成 min。"""
+    o = I.compute_intrinsic_value(
+        _row(industry="消费电子", eps_ttm=1.2, profit_yoy=96.0, dividend_per_share=0.5,
+             payout_ratio_pct=35.0, price=20.0),
+        dcf={"value": 4.55, "note": "OCF×0.5 压力测试", "reliable": False,
+             "role": "high_growth_reference"},
+        ddm={"value": 18.0, "note": "DDM", "reliable": True},
+        is_dividend_asset=False,
+        is_growth_stock=False,
+        cyclical_industries=CYCLICALS,
+    )
+    assert o["style"] == I.STYLE_VALUE
+    assert "dcf" not in o["models"]
+    assert set(o["models"]) == {"ddm"}
+    assert o["cross_model"] is False
+    assert o["intrinsic_value_per_share"] == pytest.approx(18.0)
+    assert o["unreliable_models"] == []
+    aux = o["auxiliary"]["dcf"]
+    assert aux["value"] == pytest.approx(4.55)
+    assert aux["reliable"] is False
+    assert "不参与交叉" in aux["reason"]
+    assert "仅作对照" in o["note"]
+    assert "未入池" in o["note"]
+
+
+def test_high_growth_reference_dcf_alone_does_not_become_the_value():
+    """DDM 被分红率闸掉时，压力测试 DCF 也不能兜底成内在价值。"""
+    o = I.compute_intrinsic_value(
+        _row(industry="消费电子", eps_ttm=1.2, profit_yoy=96.0, dividend_per_share=0.5,
+             payout_ratio_pct=10.0, price=20.0),
+        dcf={"value": 4.55, "note": "OCF×0.5 压力测试", "reliable": False,
+             "role": "high_growth_reference"},
+        ddm={"value": 18.0, "note": "DDM", "reliable": True},
+        is_dividend_asset=False,
+        is_growth_stock=False,
+        cyclical_industries=CYCLICALS,
+    )
+    assert o["intrinsic_value_per_share"] is None
+    assert o["model_count"] == 0
+    assert o["models"] == {}
+    assert o["auxiliary"]["dcf"]["value"] == pytest.approx(4.55)
+    assert "4.55" in o["note"]
+    assert "无法给出内在价值" in o["note"]
 
 
 def test_single_unreliable_model_is_flagged_not_hidden():
@@ -350,7 +440,8 @@ def test_cyclical_keeps_precedence_and_records_dividend_anchor_as_auxiliary():
     )
     assert o["style"] == I.STYLE_CYCLICAL
     assert set(o["models"]) == {"cyclical_anchor"}
-    assert o["intrinsic_value_per_share"] == pytest.approx(10.0)  # 正常化 PE 锚
+    # PE=1×12=12，PB=10×1.5=15 → 加权 0.6*12+0.4*15=13.2
+    assert o["intrinsic_value_per_share"] == pytest.approx(13.2)
     assert "dividend_anchor" not in o["models"]
     aux = o["auxiliary"]["dividend_anchor"]
     assert aux["value"] == pytest.approx(
@@ -384,14 +475,18 @@ def test_cosco_real_shape_is_locked_to_cyclical_anchor():
     # 2026-09-29：取消 30% 波动闸后，行业命中即归周期，matched 统一为 cyclical_industry
     assert o["style_matched"] == "cyclical_industry"
     assert set(o["models"]) == {"cyclical_anchor"}
-    # 正常化 PE 锚 = 2.0217×10 = 20.22；PB-ROE 锚 = 15.2617×1.9755 ≈ 30.15 → 取保守值
-    assert o["intrinsic_value_per_share"] == pytest.approx(20.22, abs=0.01)
-    assert o["models"]["cyclical_anchor"]["anchors"]["anchor_used"] == "normalized_pe"
+    # PE=2.0217×12≈24.26；PB=15.2617×1.9755≈30.15 → 加权 ≈26.62
+    pe_a = 2.0217418578063246 * I.CYCLICAL_NORMAL_PE
+    pb_a = 15.261682242990652 * max(1.0, 0.1317 * 15.0)
+    expect = 0.6 * pe_a + 0.4 * pb_a
+    assert o["intrinsic_value_per_share"] == pytest.approx(expect, abs=0.05)
+    assert o["models"]["cyclical_anchor"]["anchors"]["anchor_used"] == "weighted"
     assert o["models"]["cyclical_anchor"]["anchors"]["discount"] == 1.0
     aux = o["auxiliary"]["dividend_anchor"]
     assert aux["value"] == pytest.approx(27.03, abs=0.01)  # 1.00 / (1.7%+2%)
-    assert aux["value"] > o["intrinsic_value_per_share"]  # 股息锚确实更贵（虚高）
+    # 股息锚仍作对照；加权周期锚抬高后可能接近或略低于股息锚，只要求周期锚可信算出
     assert aux["reliable"] is False
+    assert o["intrinsic_value_per_share"] > 20.0
 
 
 def test_no_model_returns_none_with_reason():
@@ -419,7 +514,9 @@ def test_cyclical_style_ignores_injected_dcf():
     )
     assert o["style"] == I.STYLE_CYCLICAL
     assert "dcf" not in o["models"]
-    assert o["intrinsic_value_per_share"] == pytest.approx(10.0)
+    # 加权周期锚，绝不用注入的峰值 DCF 99
+    assert o["intrinsic_value_per_share"] == pytest.approx(13.2)
+    assert o["intrinsic_value_per_share"] < 99.0
 
 
 # ── 4. 引擎接入 ─────────────────────────────────────────────────────────

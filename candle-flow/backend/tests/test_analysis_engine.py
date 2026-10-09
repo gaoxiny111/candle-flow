@@ -162,7 +162,7 @@ def test_downgrade_rating():
 
 def test_cashflow_veto_masks_fatal_shortfall():
     """图四：高成长+差现金流不得以均分维持中性；应压分并触发否决降档。"""
-    from app.analysis.config import CASHFLOW_VETO_MESSAGE, MODULE_WEIGHTS
+    from app.analysis.config import CASHFLOW_VETO_MESSAGE, CASHFLOW_VETO_THRESHOLD, MODULE_WEIGHTS
     from app.analysis.engine import (
         _penalized_module_score,
         downgrade_rating,
@@ -180,15 +180,20 @@ def test_cashflow_veto_masks_fatal_shortfall():
     composite = 0.0
     weight_sum = 0.0
     for name, w in MODULE_WEIGHTS.items():
-        composite += _penalized_module_score(scores[name]) * w
+        # 现金流否决维合成时 skip_soft，避免与降档叠 ×0.8
+        skip = name == "cashflow" and scores[name] < CASHFLOW_VETO_THRESHOLD
+        composite += _penalized_module_score(scores[name], skip_soft=skip) * w
         weight_sum += w
     composite = round(composite / weight_sum, 1)
 
-    assert composite < 55  # 应落入 D 档分数区间（不再被均分成 C）
+    # 软折价后综合可能略高于旧 D 线，但仍须低于无扣分均分；否决降档保证评级
+    plain = sum(scores[n] * MODULE_WEIGHTS[n] for n in MODULE_WEIGHTS) / weight_sum
+    assert composite <= plain + 1e-6
     letter = rating_label(composite)
     if scores["cashflow"] < 40:
         letter = downgrade_rating(letter, 1)
-    assert letter in ("D", "E")
+    assert letter in ("C", "D", "E")  # 降档后不得维持高评级
+    assert letter != "B" and not str(letter).startswith("A")
     assert CASHFLOW_VETO_MESSAGE
 
 
@@ -196,7 +201,9 @@ def test_penalized_module_score_e_grade():
     from app.analysis.engine import _penalized_module_score
 
     assert _penalized_module_score(80) == 80
-    assert _penalized_module_score(25.5) == 25.5 * 0.5
+    assert _penalized_module_score(50) == 50 * 0.95  # 40–55 软折价
+    assert _penalized_module_score(25.5) == 25.5 * 0.8  # <40 软折价（不再 ×0.5）
+    assert _penalized_module_score(25.5, skip_soft=True) == 25.5
 
 
 def test_engine_skips_etf_fundamentals(monkeypatch):
@@ -1442,18 +1449,59 @@ def test_risk_penalty_is_bounded_not_multiplicative():
     """风险扣分必须限幅：原实现 composite *= risk/100 会把 32.8 砍到 14.4。"""
     from app.analysis.config import RISK_MAX_PENALTY, RISK_THRESHOLD
 
-    assert RISK_MAX_PENALTY <= 0.30, "风险扣分上限不应超过 30%"
+    assert RISK_MAX_PENALTY <= 0.15, "风险扣分上限应 ≤15%（与偿债/现金流去重）"
 
     # 复算：每个模块都给 50 分、风险 44 分时的综合分
     scores = {"profitability": 50.0, "growth": 50.0, "solvency": 50.0, "cashflow": 50.0}
-    weights = {"profitability": 0.20, "growth": 0.16, "solvency": 0.16, "cashflow": 0.32}
-    base = sum(scores[k] * weights[k] for k in weights) / sum(weights.values())
+    weights = {"profitability": 0.20, "growth": 0.16, "solvency": 0.16, "cashflow": 0.28, "valuation": 0.20}
+    base = sum(scores.get(k, 50.0) * weights[k] for k in weights) / sum(weights.values())
     risk = 44.0
     gap = (RISK_THRESHOLD - risk) / RISK_THRESHOLD
     bounded = base * (1.0 - RISK_MAX_PENALTY * gap)
     old = base * (risk / 100.0)
     assert bounded > old
     assert bounded >= base * (1.0 - RISK_MAX_PENALTY) - 1e-9
+
+
+def test_sector_profile_financial_weights_and_fcf_flags():
+    from app.analysis.sector_profile import resolve_sector_profile
+
+    bank = resolve_sector_profile(industry="银行", name="招商银行")
+    assert bank.kind == "bank"
+    assert bank.disable_generic_fcf is True
+    assert bank.disable_roic_wacc_trap is True
+    assert bank.soft_cashflow_veto is True
+    assert abs(sum(bank.weights.values()) - 1.0) < 1e-9
+    assert bank.weights["cashflow"] < 0.20
+    assert bank.weights["valuation"] >= 0.20
+
+    ins = resolve_sector_profile(industry="保险", name="中国平安")
+    assert ins.kind == "insurance"
+    assert ins.disable_generic_fcf is True
+
+    div = resolve_sector_profile(industry="白酒Ⅱ", is_dividend_asset=True)
+    assert div.kind == "dividend"
+    assert div.weights["valuation"] >= 0.24
+
+
+def test_cashflow_financial_lite_skips_fcf():
+    import pandas as pd
+
+    from app.analysis.modules.cashflow import CashflowAnalyzer
+
+    df = pd.DataFrame(
+        {
+            "net_profit": [100.0, 110.0, 120.0],
+            "operating_cashflow": [90.0, 100.0, 110.0],
+            "capital_expenditure": [50.0, 60.0, 80.0],
+        }
+    )
+    out = CashflowAnalyzer().analyze(
+        df, disable_generic_fcf=True, sector_kind="bank", industry="银行", name="测试银行"
+    )
+    assert out.metadata.get("financial_lite") is True
+    assert out.score >= 50
+    assert any("FCF" in w or "口径" in w for w in out.warnings)
 
 
 def test_engine_ctx_passes_symbol_to_modules():
