@@ -327,7 +327,40 @@ def _group_by_grade(items: list[dict[str, Any]]) -> dict[str, list[dict[str, Any
     return groups
 
 
+def _slim_row(it: dict[str, Any]) -> dict[str, Any]:
+    """列表接口精简字段，避免 5000 只全量 JSON 拖垮 Cloudflare / 前端。"""
+    dims = it.get("dim_scores") or {}
+    scored = bool(it.get("scored"))
+    out: dict[str, Any] = {
+        "symbol": it.get("symbol"),
+        "code": it.get("code"),
+        "name": it.get("name") or "",
+        "composite_score": it.get("composite_score"),
+        "final_rating": it.get("final_rating"),
+        "grade_band": it.get("grade_band"),
+        "scored": scored,
+        "price": it.get("price"),
+        "pe_ttm": it.get("pe_ttm"),
+        "pb": it.get("pb"),
+        "dividend_yield": it.get("dividend_yield"),
+        "market_cap_yi": it.get("market_cap_yi"),
+        "industry": it.get("industry") or "",
+    }
+    if scored:
+        out["dim_scores"] = {
+            "盈利能力": dims.get("盈利能力"),
+            "成长性": dims.get("成长性"),
+            "现金流质量": dims.get("现金流质量"),
+            "偿债能力": dims.get("偿债能力"),
+            "估值合理性": dims.get("估值合理性"),
+        }
+    return out
+
+
 def _computing_stub(*, min_yi: float, top_n: int, reason: str) -> dict[str, Any]:
+    _ = top_n
+    empty_groups = {g: [] for g in GRADE_BANDS}
+    empty_groups["pending"] = []
     return {
         "count": 0,
         "universe_size": 0,
@@ -336,6 +369,8 @@ def _computing_stub(*, min_yi: float, top_n: int, reason: str) -> dict[str, Any]
         "min_cap_yi": min_yi,
         "pool_note": _pool_note(min_yi),
         "items": [],
+        "groups": empty_groups,
+        "grade_counts": {**{g: 0 for g in GRADE_BANDS}, "pending": 0},
         "status": "computing",
         "cached": False,
         "refresh_started": True,
@@ -353,8 +388,15 @@ def scan_large_cap_board(
     top: int = DEFAULT_TOP,
     universe_limit: int = DEFAULT_UNIVERSE_LIMIT,
     refresh: bool = False,
+    grade: str | None = None,
+    pending_limit: int = 200,
+    pending_offset: int = 0,
 ) -> dict[str, Any]:
-    """返回 A股大盘榜；缺池/缺分时后台补算。"""
+    """返回 A股榜；缺池/缺分时后台补算。
+
+    默认只下发已评分 A–E（精简字段）；未评分仅给计数，点「未评」再分页拉取，
+    避免 5000 条一次响应超时。
+    """
     global _LAST_BOARD, _LAST_TS, _AUTO_SCORED
 
     top_n = max(1, min(int(top), MAX_UNIVERSE))
@@ -366,12 +408,18 @@ def scan_large_cap_board(
     if min_yi < 0:
         min_yi = 0.0
 
+    grade_key = (grade or "all").strip().lower()
+    if grade_key in {"a", "b", "c", "d", "e"}:
+        grade_key = grade_key.upper()
+    elif grade_key not in {"all", "pending", "scored"}:
+        grade_key = "all"
+
     if refresh:
         with _LOCK:
             _AUTO_SCORED = False
             _LAST_BOARD = None
             _LAST_TS = 0.0
-        _clear_universe_disk(None)  # 清掉含旧 200 亿门槛的全部池缓存
+        _clear_universe_disk(None)
 
     with _LOCK:
         refreshing = _REFRESHING
@@ -400,7 +448,6 @@ def scan_large_cap_board(
                 reason="正在拉取 A股池，本页会自动刷新…",
             )
         else:
-            # 冷启动：立刻返回，后台拉池（避免 HTTP 卡东财行情）
             _schedule_universe_load(min_yi)
             return _computing_stub(
                 min_yi=min_yi,
@@ -409,7 +456,11 @@ def scan_large_cap_board(
             )
 
     symbols = [u["symbol"] for u in universe]
-    scored_map = _load_scored_map(symbols)
+    # 分批读因子库，避免单次 IN 5000 过慢
+    scored_map: dict[str, dict[str, Any]] = {}
+    chunk = 400
+    for i in range(0, len(symbols), chunk):
+        scored_map.update(_load_scored_map(symbols[i : i + chunk]))
 
     items: list[dict[str, Any]] = []
     pending_syms: list[str] = []
@@ -428,16 +479,35 @@ def scan_large_cap_board(
     if pending_syms and not refreshing and (refresh or not auto_done):
         started = _schedule_scoring(pending_syms)
 
-    groups = _group_by_grade(items)
-    # 扁平列表：A→E→未评，组内按综合分；不再做 top 截断（top 参数仅兼容旧调用）
-    _ = top_n
+    groups_full = _group_by_grade(items)
+    grade_counts = {g: len(groups_full[g]) for g in GRADE_BANDS}
+    grade_counts["pending"] = len(groups_full["pending"])
+    scored_count = sum(grade_counts[g] for g in GRADE_BANDS)
+
+    # 按需裁剪下发内容
+    lim = max(1, min(int(pending_limit), 500))
+    off = max(0, int(pending_offset))
+    groups_out: dict[str, list[dict[str, Any]]] = {g: [] for g in GRADE_BANDS}
+    groups_out["pending"] = []
+
+    if grade_key == "pending":
+        page = groups_full["pending"][off : off + lim]
+        groups_out["pending"] = [_slim_row(x) for x in page]
+    elif grade_key in GRADE_BANDS:
+        groups_out[grade_key] = [_slim_row(x) for x in groups_full[grade_key]]
+    else:
+        # all / scored：只下发已评分 A–E，未评仅计数（防超时）
+        for g in GRADE_BANDS:
+            groups_out[g] = [_slim_row(x) for x in groups_full[g]]
+
     shown: list[dict[str, Any]] = []
-    for g in GRADE_BANDS:
-        shown.extend(groups[g])
-    shown.extend(groups["pending"])
-    scored_count = sum(len(groups[g]) for g in GRADE_BANDS)
-    grade_counts = {g: len(groups[g]) for g in GRADE_BANDS}
-    grade_counts["pending"] = len(groups["pending"])
+    if grade_key == "pending":
+        shown = list(groups_out["pending"])
+    elif grade_key in GRADE_BANDS:
+        shown = list(groups_out[grade_key])
+    else:
+        for g in GRADE_BANDS:
+            shown.extend(groups_out[g])
 
     status = "ready"
     if pending_syms:
@@ -454,22 +524,24 @@ def scan_large_cap_board(
         "min_cap_yi": min_yi,
         "pool_note": _pool_note(min_yi),
         "items": shown,
-        "groups": groups,
+        "groups": groups_out,
         "grade_counts": grade_counts,
+        "grade": grade_key,
+        "pending_limit": lim if grade_key == "pending" else None,
+        "pending_offset": off if grade_key == "pending" else None,
         "status": status,
         "cached": cached_uni_rows is not None,
         "refresh_started": started,
         "progress": dict(_PROGRESS),
         "notes": [
             "股票池：沪深 A 股全量，不设市值门槛",
+            "默认只返回已评分 A–E；未评分请点「未评」分页加载（避免超时）",
             "展示按 A/B/C/D/E 主档分组（A- 归 A，B+/B- 归 B）",
-            "分数口径：盈利/成长/偿债/现金流/估值加权（行业自适应权重）",
             "未评分标的后台补算，本页自动刷新",
         ],
     }
     with _LOCK:
-        stash = dict(board)
-        stash["_universe"] = list(universe)
-        _LAST_BOARD = stash
+        # 只缓存股票池，分数每次重拼（避免把巨大 JSON 锁进内存）
+        _LAST_BOARD = {"_universe": list(universe)}
         _LAST_TS = time.time()
     return board

@@ -19,7 +19,8 @@ def test_thresholds_match_new_rules():
     assert hd.PAYOUT_MAX == 80.0
     assert hd.PE_MAX == 15.0
     assert hd.PB_MAX == 1.5
-    assert hd.ROE_MIN == 10.0
+    assert hd.ROE_AVG_3Y_MIN == 8.0
+    assert hd.ROE_LATEST_MIN == 6.0
     assert hd.OCF_NP_MIN == 0.8
     assert hd.MIN_MARKET_CAP == 200e8
 
@@ -102,6 +103,8 @@ def _base_ok(**over):
         "pe_ttm": 12.0,
         "pb": 1.2,
         "roe": 12.0,
+        "roe_avg_3y": 11.0,
+        "roe_report_date": "2024-12-31",
         "ocf_to_np": 1.1,
         "market_cap": 3e11,
         "data_ok": True,
@@ -117,7 +120,7 @@ def test_apply_filters_new_rules():
             _base_ok(code="000001", name="息不够", avg_div_yield_3y=3.0),
             _base_ok(code="000002", name="连续年数超5", consecutive_div_years=8),
             _base_ok(code="000003", name="支付率过高", payout_ratio=90.0),
-            _base_ok(code="000004", name="ROE低", roe=8.0),
+            _base_ok(code="000004", name="ROE均低", roe=7.0, roe_avg_3y=7.0),
             _base_ok(code="000005", name="市值不够", market_cap=100e8),
         ]
     )
@@ -127,9 +130,70 @@ def test_apply_filters_new_rules():
 
 def test_fail_reasons_lists_missing_conditions():
     assert hd._fail_reasons(_base_ok()) == []
-    reasons = hd._fail_reasons(_base_ok(avg_div_yield_3y=2.0, roe=5.0))
+    reasons = hd._fail_reasons(_base_ok(avg_div_yield_3y=2.0, roe=5.0, roe_avg_3y=5.0))
     assert any("近3年均息" in r for r in reasons)
-    assert any("ROE" in r for r in reasons)
+    assert any("近3年ROE均" in r for r in reasons)
+    assert any("最新ROE" in r for r in reasons)
+
+
+def test_roe_dual_thresholds():
+    # 均值够、最新够 → 通过
+    assert hd._fail_reasons(_base_ok(roe=6.0, roe_avg_3y=8.0)) == []
+    # 均值不够
+    assert any("近3年ROE均" in r for r in hd._fail_reasons(_base_ok(roe=10.0, roe_avg_3y=7.5)))
+    # 最新不够
+    assert any("最新ROE" in r for r in hd._fail_reasons(_base_ok(roe=5.5, roe_avg_3y=9.0)))
+    # 缺近3年均
+    assert any("近3年ROE均" in r for r in hd._fail_reasons(_base_ok(roe=10.0, roe_avg_3y=None)))
+    item = hd._row_to_item(pd.Series(_base_ok(roe=6.5, roe_avg_3y=8.5)))
+    assert item["passed"] is True
+    assert item["roe"] == 6.5
+    assert item["roe_avg_3y"] == 8.5
+
+
+def test_latest_annual_fundamentals_roe_avg_3y(monkeypatch):
+    """年报加权 ROE：最新一期 + 近 3 年均值；不足 3 年年报则均值缺失。"""
+
+    class _FakeAk:
+        @staticmethod
+        def stock_financial_analysis_indicator(symbol: str):
+            if symbol == "601088":
+                return pd.DataFrame(
+                    {
+                        "日期": [
+                            "2022-12-31",
+                            "2023-12-31",
+                            "2024-12-31",
+                            "2024-06-30",
+                            "2021-12-31",
+                        ],
+                        "加权净资产收益率(%)": [8.0, 9.0, 13.5, 20.0, 7.0],
+                        "净资产收益率(%)": [7.5, 8.5, 10.0, 19.0, 6.5],
+                        "摊薄每股收益(元)": [0.8, 1.0, 1.2, 0.6, 0.7],
+                        "经营现金净流量与净利润的比率(%)": [1.0, 1.1, 1.2, 0.9, 1.0],
+                    }
+                )
+            # 仅 2 年年报 → 无近3年均
+            return pd.DataFrame(
+                {
+                    "日期": ["2023-12-31", "2024-12-31", "2024-06-30"],
+                    "加权净资产收益率(%)": [9.0, 10.0, 15.0],
+                    "净资产收益率(%)": [8.0, 9.0, 14.0],
+                    "摊薄每股收益(元)": [1.0, 1.1, 0.5],
+                    "经营现金净流量与净利润的比率(%)": [1.0, 1.0, 1.0],
+                }
+            )
+
+    monkeypatch.setitem(__import__("sys").modules, "akshare", _FakeAk)
+    fund = hd._latest_annual_fundamentals("601088")
+    assert fund["report_date"] == "2024-12-31"
+    assert fund["roe"] == 13.5
+    assert fund["roe_avg_3y"] == pytest.approx((8.0 + 9.0 + 13.5) / 3, abs=0.01)
+    assert fund["eps"] == 1.2
+
+    short = hd._latest_annual_fundamentals("000001")
+    assert short["roe"] == 10.0
+    assert short["roe_avg_3y"] is None
 
 
 def test_hard_pe_pb_gate():
@@ -170,6 +234,22 @@ def test_scan_returns_computing_without_blocking(monkeypatch, tmp_path):
     monkeypatch.setattr(hd, "_DISK_CACHE_DIR", tmp_path)
     called = {"n": 0}
 
+    def _fake_quick(**kwargs):
+        return {
+            "count": 1,
+            "matched": 0,
+            "rejected": 1,
+            "scanned": 1,
+            "deep_scanned": 1,
+            "spot_rejected": 0,
+            "universe": "csi_div",
+            "pool_note": "quick",
+            "items": [hd._row_to_item(pd.Series(_base_ok()))],
+            "notes": [],
+            "thresholds": hd._thresholds(),
+            "partial": True,
+        }
+
     def _fake_screen(**kwargs):
         called["n"] += 1
         time.sleep(0.05)
@@ -183,8 +263,10 @@ def test_scan_returns_computing_without_blocking(monkeypatch, tmp_path):
             "items": [hd._row_to_item(pd.Series(_base_ok()))],
             "notes": [],
             "thresholds": hd._thresholds(),
+            "partial": False,
         }
 
+    monkeypatch.setattr(hd, "build_quick_spot_board", _fake_quick)
     monkeypatch.setattr(hd, "screen_high_dividend_stocks", _fake_screen)
 
     t0 = time.time()
@@ -197,7 +279,7 @@ def test_scan_returns_computing_without_blocking(monkeypatch, tmp_path):
     for _ in range(50):
         time.sleep(0.05)
         with hd._LOCK:
-            if hd._CACHE["data"] is not None:
+            if hd._CACHE["data"] is not None and not hd._CACHE["data"].get("partial"):
                 break
     out2 = hd.scan_high_dividend(universe="csi_div", top=50, refresh=False)
     assert out2["status"] in ("ready", "refreshing")
@@ -237,3 +319,80 @@ def test_scan_serves_stale_disk_and_schedules_refresh(monkeypatch, tmp_path):
     assert out["status"] == "refreshing"
     assert scheduled["n"] == 1
     hd.invalidate_cache()
+def test_large_cap_universe_filters_by_market_cap(monkeypatch):
+    spot = pd.DataFrame(
+        {
+            "code": ["600000", "600001", "000001"],
+            "name": ["大盘A", "小盘B", "大盘C"],
+            "price": [10.0, 5.0, 8.0],
+            "pe_ttm": [8.0, 20.0, 9.0],
+            "pb": [0.8, 2.0, 1.0],
+            "market_cap": [300e8, 50e8, 250e8],
+        }
+    )
+    monkeypatch.setattr(hd, "_fetch_spot", lambda: spot)
+    monkeypatch.setattr(
+        hd,
+        "_calc_div_metrics",
+        lambda code, price: hd._empty_metrics(str(code), "mock"),
+    )
+    out = hd.screen_high_dividend_stocks(universe="large_cap")
+    assert out["universe"] == "large_cap"
+    assert "市值≥200亿" in out["pool_note"]
+    assert out["scanned"] == 2
+    codes = {it["code"] for it in out["items"]}
+    assert codes == {"600000", "000001"}
+
+
+def test_default_universe_is_large_cap():
+    assert hd.DEFAULT_UNIVERSE == "large_cap"
+
+
+def test_spot_reject_skips_deep_fetch(monkeypatch):
+    """PE/PB 未过门不进深扫，仍出现在未命中列表。"""
+    spot = pd.DataFrame(
+        {
+            "code": ["600000", "600010"],
+            "name": ["估值OK", "PE过高"],
+            "price": [10.0, 12.0],
+            "pe_ttm": [8.0, 40.0],
+            "pb": [0.9, 1.0],
+            "market_cap": [300e8, 280e8],
+        }
+    )
+    deep_codes: list[str] = []
+
+    def _fake_calc(code, price):
+        deep_codes.append(str(code))
+        return hd._empty_metrics(str(code), "mock")
+
+    monkeypatch.setattr(hd, "_fetch_spot", lambda: spot)
+    monkeypatch.setattr(hd, "_calc_div_metrics", _fake_calc)
+    out = hd.screen_high_dividend_stocks(universe="large_cap")
+    assert out["deep_scanned"] == 1
+    assert out["spot_rejected"] == 1
+    assert deep_codes == ["600000"]
+    pe_hi = next(it for it in out["items"] if it["code"] == "600010")
+    assert pe_hi["passed"] is False
+    assert any("PE" in r for r in pe_hi["fail_reasons"])
+
+
+def test_quick_spot_board_lists_pending(monkeypatch):
+    spot = pd.DataFrame(
+        {
+            "code": ["600000", "600010"],
+            "name": ["估值OK", "PE过高"],
+            "price": [10.0, 12.0],
+            "pe_ttm": [8.0, 40.0],
+            "pb": [0.9, 1.0],
+            "market_cap": [300e8, 280e8],
+        }
+    )
+    monkeypatch.setattr(hd, "_fetch_spot", lambda: spot)
+    out = hd.build_quick_spot_board(universe="large_cap")
+    assert out["partial"] is True
+    assert out["scanned"] == 2
+    assert len(out["items"]) == 2
+    ok = next(it for it in out["items"] if it["code"] == "600000")
+    assert "分红计算中" in (ok.get("fail_reasons") or [])
+

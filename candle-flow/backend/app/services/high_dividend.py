@@ -6,11 +6,11 @@
   - 最近 1 年股息率 ≥ 3%
   - 股利支付率 30%～80%，且 ≤ 100%
   - PE(TTM) ≤ 15、PB ≤ 1.5（命中硬条件；不满足仍展示为未命中）
-  - ROE（最近年报）≥ 10%
+  - 近 3 年年报 ROE 均值 ≥ 8%，且最新年报 ROE ≥ 6%（加权净资产收益率优先）
   - 经营现金流净额 / 净利润 ≥ 0.8
   - 总市值 ≥ 200 亿
 
-初始池默认中证红利（000922）；``universe=all`` 可扫沪深市值前 N。
+初始池默认 **A股大盘（市值≥200亿）**；可选中证红利 / 沪深市值前 N。
 """
 
 from __future__ import annotations
@@ -36,14 +36,21 @@ PAYOUT_MIN, PAYOUT_MAX = 30.0, 80.0
 PAYOUT_HARD_MAX = 100.0
 PE_MAX = 15.0
 PB_MAX = 1.5
-ROE_MIN = 10.0
+ROE_AVG_3Y_MIN = 8.0  # 近 3 年年报 ROE 均值
+ROE_LATEST_MIN = 6.0  # 最新年报 ROE
 OCF_NP_MIN = 0.8
 MIN_MARKET_CAP = 200e8  # 200 亿
 AVG_YIELD_YEARS = 3
 
 CSI_DIVIDEND_INDEX = "000922"
 CACHE_TTL_SEC = 6 * 3600
-CACHE_VERSION = "v9"
+CACHE_VERSION = "v14"  # ROE：近3年均≥8% + 最新≥6%
+UNIVERSES = ("large_cap", "csi_div", "all")
+DEFAULT_UNIVERSE = "large_cap"
+# 深扫并发（每票约 2 次 AkShare）
+DEEP_WORKERS = 16
+# 深扫每完成 N 只就写盘，避免整段失败后页面一直空
+DEEP_CHECKPOINT_EVERY = 25
 # 支付率过小视为失真（新浪「股息发放率」常给 0.0006 这类假值）
 PAYOUT_NOISE_MAX = 1.0
 # 中证红利 ~100 只 × 分红+财务两接口，同步扫会超过 Cloudflare 120s → 磁盘缓存 + 后台刷新
@@ -287,12 +294,56 @@ def _payout_ratio_3y(cash_div: pd.Series, eps_by_year: pd.Series) -> float | Non
     return sum_dps / sum_eps * 100.0
 
 
+def _pick_roe_weighted(row: Any) -> float | None:
+    """优先加权 ROE，摊薄列仅兜底。"""
+    get = row.get if hasattr(row, "get") else lambda k, d=None: row[k] if k in row.index else d
+    for col in ("加权净资产收益率(%)", "净资产收益率(%)"):
+        v = get(col)
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            continue
+        s = str(v).strip()
+        if s in ("", "--", "nan", "None"):
+            continue
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _annual_roe_series(fin: pd.DataFrame) -> pd.Series:
+    """年报加权 ROE（%），按财年索引（每年取该年最晚一期）。"""
+    if fin is None or fin.empty or "日期" not in fin.columns:
+        return pd.Series(dtype=float)
+    df = fin.copy()
+    df["日期"] = pd.to_datetime(df["日期"], errors="coerce")
+    df = df.dropna(subset=["日期"])
+    if df.empty:
+        return pd.Series(dtype=float)
+    ann = df[df["日期"].dt.month == 12]
+    if ann.empty:
+        return pd.Series(dtype=float)
+    ann = ann.assign(_year=ann["日期"].dt.year)
+    # 同年多行时取日期最新
+    ann = ann.sort_values("日期").groupby("_year", as_index=False).tail(1)
+    roes: dict[int, float] = {}
+    for _, row in ann.iterrows():
+        v = _pick_roe_weighted(row)
+        if v is not None:
+            roes[int(row["_year"])] = v
+    if not roes:
+        return pd.Series(dtype=float)
+    return pd.Series(roes).sort_index()
+
+
 def _latest_annual_fundamentals(code: str) -> dict[str, Any]:
-    """最近年报：ROE、经营现金流/净利润、年报 EPS 序列。"""
+    """年报基本面：最新 ROE、近 3 年 ROE 均值，以及 EPS / 经营现金流比率。"""
     import akshare as ak
 
     empty: dict[str, Any] = {
         "roe": None,
+        "roe_avg_3y": None,
+        "report_date": None,
         "eps": None,
         "ocf_np": None,
         "eps_by_year": pd.Series(dtype=float),
@@ -304,27 +355,46 @@ def _latest_annual_fundamentals(code: str) -> dict[str, Any]:
     if df is None or df.empty or "日期" not in df.columns:
         return empty
 
-    eps_by_year = _annual_eps_series(df)
-    ann = df[df["日期"].astype(str).str.contains(r"-12-31", regex=True)].copy()
-    if ann.empty:
-        ann = df.copy()
-    row = ann.iloc[-1]
+    df = df.copy()
+    df["日期"] = pd.to_datetime(df["日期"], errors="coerce")
+    df = df.dropna(subset=["日期"])
+    if df.empty:
+        return empty
 
-    roe = _to_float(row.get("净资产收益率(%)"))
-    if roe is None:
-        roe = _to_float(row.get("加权净资产收益率(%)"))
+    eps_by_year = _annual_eps_series(df)
+    roe_by_year = _annual_roe_series(df)
+
+    roe = None
+    roe_avg_3y = None
+    report_date = None
+    if not roe_by_year.empty:
+        recent = roe_by_year.tail(AVG_YIELD_YEARS)
+        roe = float(recent.iloc[-1])
+        if len(recent) >= AVG_YIELD_YEARS:
+            roe_avg_3y = float(recent.mean())
+        # 报告期：该最新财年对应的年报日期
+        y = int(recent.index[-1])
+        ann = df[(df["日期"].dt.month == 12) & (df["日期"].dt.year == y)]
+        if not ann.empty:
+            report_date = ann["日期"].max()
+
+    # EPS / OCF：取最近年报行（按日期）
+    annual = df[df["日期"].dt.month == 12]
+    src = annual if not annual.empty else df
+    row = src.loc[src["日期"].idxmax()]
 
     eps = _to_float(row.get("摊薄每股收益(元)"))
     if eps is None:
         eps = _to_float(row.get("加权每股收益(元)"))
 
     ocf_np = _to_float(row.get("经营现金净流量与净利润的比率(%)"))
-    # 接口列名带 (%)，实际多为比率（约 0.5~2）；若像百分数则折算
     if ocf_np is not None and ocf_np > 10:
         ocf_np = ocf_np / 100.0
 
     return {
         "roe": roe,
+        "roe_avg_3y": None if roe_avg_3y is None else round(roe_avg_3y, 2),
+        "report_date": report_date.strftime("%Y-%m-%d") if report_date is not None and pd.notna(report_date) else None,
         "eps": eps,
         "ocf_np": ocf_np,
         "eps_by_year": eps_by_year,
@@ -342,6 +412,8 @@ def _empty_metrics(code: str, reason: str = "分红数据不足") -> dict[str, A
         "payout_ratio": None,
         "payout_soft": False,
         "roe": None,
+        "roe_avg_3y": None,
+        "roe_report_date": None,
         "ocf_to_np": None,
         "data_ok": False,
         "data_note": reason,
@@ -403,10 +475,29 @@ def _calc_div_metrics(code: str, price: float) -> dict[str, Any]:
         "payout_ratio": None if payout is None else round(float(payout), 2),
         "payout_soft": payout_soft,
         "roe": None if fund.get("roe") is None else round(float(fund["roe"]), 2),
+        "roe_avg_3y": (
+            None if fund.get("roe_avg_3y") is None else round(float(fund["roe_avg_3y"]), 2)
+        ),
+        "roe_report_date": fund.get("report_date"),
         "ocf_to_np": None if fund.get("ocf_np") is None else round(float(fund["ocf_np"]), 3),
         "data_ok": True,
         "data_note": "",
     }
+
+
+_SCAN_PROGRESS: dict[str, Any] = {
+    "running": False,
+    "phase": "",
+    "planned": 0,
+    "done": 0,
+    "deep": 0,
+    "light": 0,
+}
+
+
+def _set_scan_progress(**kwargs: Any) -> None:
+    with _LOCK:
+        _SCAN_PROGRESS.update(kwargs)
 
 
 def _collect_dividend_records(df: pd.DataFrame) -> list[dict[str, Any]]:
@@ -416,8 +507,9 @@ def _collect_dividend_records(df: pd.DataFrame) -> list[dict[str, Any]]:
     if df is None or df.empty or "code" not in df.columns:
         return records
     pairs = list(zip(df["code"].tolist(), df["price"].tolist()))
-    workers = min(12, max(4, len(pairs)))
+    workers = min(DEEP_WORKERS, max(4, len(pairs)))
     done = 0
+    _set_scan_progress(running=True, phase="deep", planned=len(pairs), done=0, deep=len(pairs))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futs = {
             pool.submit(
@@ -435,14 +527,200 @@ def _collect_dividend_records(df: pd.DataFrame) -> list[dict[str, Any]]:
                 m = _empty_metrics(str(futs[fut]), "计算异常")
             if m:
                 records.append(m)
-            if done % 10 == 0:
+            if done % 10 == 0 or done == len(pairs):
+                _set_scan_progress(done=done)
                 logger.info(
-                    "高股息筛选进度 %s/%s，已回填 %s 只",
+                    "高股息深扫进度 %s/%s，已回填 %s 只",
                     done,
                     len(pairs),
                     len(records),
                 )
     return records
+
+
+def _item_spot_reject(row: pd.Series) -> dict[str, Any]:
+    """估值未过门：不打分红/财报接口，仅用行情标未命中（大幅加速大盘池）。"""
+    cap = _to_float(row.get("market_cap"))
+    code = str(row.get("code") or "")
+    fails: list[str] = []
+    pe = _to_float(row.get("pe_ttm"))
+    pb = _to_float(row.get("pb"))
+    if pe is None or pe <= 0 or pe > PE_MAX:
+        fails.append(f"PE≤{PE_MAX:g}")
+    if pb is None or pb <= 0 or pb > PB_MAX:
+        fails.append(f"PB≤{PB_MAX:g}")
+    if cap is None or cap < MIN_MARKET_CAP:
+        fails.append(f"市值≥{MIN_MARKET_CAP / 1e8:.0f}亿")
+    if not fails:
+        fails.append("估值未过门")
+    return {
+        "code": code,
+        "symbol": _to_symbol(code),
+        "name": str(row.get("name") or ""),
+        "price": _to_float(row.get("price")),
+        "avg_div_yield_3y": None,
+        "avg_div_yield_5y": None,
+        "last_year_yield": None,
+        "consecutive_div_years": None,
+        "last_year_div": None,
+        "payout_ratio": None,
+        "payout_soft": False,
+        "roe": None,
+        "roe_avg_3y": None,
+        "roe_report_date": None,
+        "ocf_to_np": None,
+        "pe_ttm": pe,
+        "pb": pb,
+        "market_cap": cap,
+        "market_cap_yi": None if cap is None else round(cap / 1e8, 2),
+        "passed": False,
+        "fail_reasons": fails,
+    }
+
+
+def _item_deep_pending(row: pd.Series) -> dict[str, Any]:
+    """估值过门、分红尚未算完：先上榜，标「分红计算中」。"""
+    cap = _to_float(row.get("market_cap"))
+    code = str(row.get("code") or "")
+    return {
+        "code": code,
+        "symbol": _to_symbol(code),
+        "name": str(row.get("name") or ""),
+        "price": _to_float(row.get("price")),
+        "avg_div_yield_3y": None,
+        "avg_div_yield_5y": None,
+        "last_year_yield": None,
+        "consecutive_div_years": None,
+        "last_year_div": None,
+        "payout_ratio": None,
+        "payout_soft": False,
+        "roe": None,
+        "roe_avg_3y": None,
+        "roe_report_date": None,
+        "ocf_to_np": None,
+        "pe_ttm": _to_float(row.get("pe_ttm")),
+        "pb": _to_float(row.get("pb")),
+        "market_cap": cap,
+        "market_cap_yi": None if cap is None else round(cap / 1e8, 2),
+        "passed": False,
+        "fail_reasons": ["分红计算中"],
+    }
+
+
+def _sort_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _sort_key(it: dict[str, Any]) -> tuple:
+        y = it.get("avg_div_yield_3y")
+        yv = float(y) if y is not None else -1.0
+        return (0 if it.get("passed") else 1, -yv)
+
+    items.sort(key=_sort_key)
+    return items
+
+
+def _report_from_items(
+    items: list[dict[str, Any]],
+    *,
+    universe: str,
+    pool_note: str,
+    scanned: int,
+    deep_n: int,
+    light_n: int,
+    partial: bool = False,
+) -> dict[str, Any]:
+    items = _sort_items(list(items))
+    matched = sum(1 for it in items if it.get("passed"))
+    rejected = len(items) - matched
+    notes = _notes() + [
+        pool_note,
+        f"估值过门深扫 {deep_n} 只；行情未过门快标 {light_n} 只",
+    ]
+    if partial:
+        notes.append("分红深扫进行中，已缓存行情快照；本页会自动刷新补全")
+    else:
+        notes.append("列表含未命中标的，并标注未通过条件")
+    return {
+        "count": len(items),
+        "matched": matched,
+        "rejected": rejected,
+        "scanned": scanned,
+        "deep_scanned": deep_n,
+        "spot_rejected": light_n,
+        "universe": universe,
+        "pool_note": pool_note,
+        "items": items,
+        "notes": notes,
+        "thresholds": _thresholds(),
+        "partial": partial,
+    }
+
+
+def _resolve_universe_df(
+    universe: str,
+    limit: int | None,
+) -> tuple[pd.DataFrame, str]:
+    df_spot = _fetch_spot()
+    if universe == "csi_div":
+        codes = set(_fetch_csi_dividend_codes())
+        df = df_spot[df_spot["code"].isin(codes)].copy()
+        pool_note = f"中证红利({CSI_DIVIDEND_INDEX}) 成分股（含未命中，含 PE/PB 未过）"
+    elif universe == "large_cap":
+        cap = pd.to_numeric(df_spot["market_cap"], errors="coerce")
+        df = df_spot[cap >= MIN_MARKET_CAP].copy()
+        df = df.sort_values("market_cap", ascending=False)
+        pool_note = "A股大盘（市值≥200亿，含未命中）"
+    else:
+        df = df_spot.sort_values("market_cap", ascending=False).copy()
+        pool_note = "沪深 A 股（已剔北交所/ST，含未命中）"
+        if limit is not None and limit > 0:
+            df = df.head(int(limit)).copy()
+            pool_note += f"，前 {int(limit)} 只"
+    return df, pool_note
+
+
+def _split_deep_light(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    deep_mask = df.apply(
+        lambda r: _passes_hard_pe_pb(r.get("pe_ttm"), r.get("pb")),
+        axis=1,
+    )
+    return df.loc[deep_mask].copy(), df.loc[~deep_mask].copy()
+
+
+def _merge_deep_records(df_deep: pd.DataFrame, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if df_deep.empty:
+        return []
+    if not records:
+        out: list[dict[str, Any]] = []
+        for _, row in df_deep.iterrows():
+            stub = row.copy()
+            for k, v in _empty_metrics(str(row["code"])).items():
+                stub[k] = v
+            out.append(_row_to_item(stub))
+        return out
+    df_div = pd.DataFrame(records)
+    merged = df_deep.merge(df_div, on="code", how="left")
+    for col, default in (
+        ("data_ok", False),
+        ("data_note", "分红数据不足"),
+        ("avg_div_yield_3y", None),
+        ("last_year_yield", None),
+        ("consecutive_div_years", None),
+        ("payout_ratio", None),
+        ("payout_soft", False),
+        ("roe", None),
+        ("roe_avg_3y", None),
+        ("roe_report_date", None),
+        ("ocf_to_np", None),
+    ):
+        if col not in merged.columns:
+            merged[col] = default
+        else:
+            if col == "data_ok":
+                merged[col] = merged[col].fillna(False)
+            elif col == "payout_soft":
+                merged[col] = merged[col].fillna(False)
+            elif col == "data_note":
+                merged[col] = merged[col].fillna("分红数据不足")
+    return [_row_to_item(row) for _, row in merged.iterrows()]
 
 
 def _fail_reasons(row: dict[str, Any] | pd.Series) -> list[str]:
@@ -463,6 +741,7 @@ def _fail_reasons(row: dict[str, Any] | pd.Series) -> list[str]:
     pe = _to_float(get("pe_ttm"))
     pb = _to_float(get("pb"))
     roe = _to_float(get("roe"))
+    roe_avg = _to_float(get("roe_avg_3y"))
     ocf = _to_float(get("ocf_to_np"))
     cap = _to_float(get("market_cap"))
 
@@ -487,8 +766,10 @@ def _fail_reasons(row: dict[str, Any] | pd.Series) -> list[str]:
         reasons.append(f"PE≤{PE_MAX:g}")
     if pb is None or pb <= 0 or pb > PB_MAX:
         reasons.append(f"PB≤{PB_MAX:g}")
-    if roe is None or roe < ROE_MIN:
-        reasons.append(f"ROE≥{ROE_MIN:g}%")
+    if roe_avg is None or roe_avg < ROE_AVG_3Y_MIN:
+        reasons.append(f"近3年ROE均≥{ROE_AVG_3Y_MIN:g}%")
+    if roe is None or roe < ROE_LATEST_MIN:
+        reasons.append(f"最新ROE≥{ROE_LATEST_MIN:g}%")
     if ocf is None or ocf < OCF_NP_MIN:
         reasons.append(f"现金流/净利≥{OCF_NP_MIN:g}")
     if cap is None or cap < MIN_MARKET_CAP:
@@ -519,7 +800,8 @@ def _notes() -> list[str]:
     return [
         "命中硬条件：PE≤15 且 PB≤1.5（不满足仍展示，标为未命中）",
         "近5年窗口内连续现金分红3～5年 · 近3年均息≥4% · 最近1年息≥3%",
-        "股利支付率30%～80%（近3年Σ派息/ΣEPS；失真缺失时软通过）· ROE≥10%",
+        "股利支付率30%～80%（近3年Σ派息/ΣEPS；失真缺失时软通过）",
+        "近3年年报加权ROE均值≥8% · 最新年报加权ROE≥6%",
         "经营现金流/净利润≥0.8 · 市值≥200亿；股息率=年度每股现金分红/现价",
     ]
 
@@ -534,7 +816,8 @@ def _thresholds() -> dict[str, float]:
         "payout_max": PAYOUT_MAX,
         "pe_max": PE_MAX,
         "pb_max": PB_MAX,
-        "roe_min": ROE_MIN,
+        "roe_avg_3y_min": ROE_AVG_3Y_MIN,
+        "roe_latest_min": ROE_LATEST_MIN,
         "ocf_to_np_min": OCF_NP_MIN,
         "market_cap_min_yi": MIN_MARKET_CAP / 1e8,
     }
@@ -564,6 +847,13 @@ def _row_to_item(row: pd.Series) -> dict[str, Any]:
         "payout_ratio": _to_float(row.get("payout_ratio")),
         "payout_soft": bool(row.get("payout_soft", False)),
         "roe": _to_float(row.get("roe")),
+        "roe_avg_3y": _to_float(row.get("roe_avg_3y")),
+        "roe_report_date": (
+            None
+            if row.get("roe_report_date") is None
+            or (isinstance(row.get("roe_report_date"), float) and np.isnan(row.get("roe_report_date")))
+            else str(row.get("roe_report_date"))
+        ),
         "ocf_to_np": _to_float(row.get("ocf_to_np")),
         "pe_ttm": _to_float(row.get("pe_ttm")),
         "pb": _to_float(row.get("pb")),
@@ -574,28 +864,65 @@ def _row_to_item(row: pd.Series) -> dict[str, Any]:
     }
 
 
-def screen_high_dividend_stocks(
+def build_quick_spot_board(
     *,
-    universe: str = "csi_div",
+    universe: str = DEFAULT_UNIVERSE,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    logger.info("高股息筛选：获取 A 股实时行情…")
-    df_spot = _fetch_spot()
+    """仅行情：秒级可缓存上榜（估值未过门快标 + 过门标「分红计算中」）。"""
+    logger.info("高股息快照：拉取行情 universe=%s", universe)
+    df, pool_note = _resolve_universe_df(universe, limit)
+    if df.empty:
+        _set_scan_progress(running=False, phase="", planned=0, done=0, deep=0, light=0)
+        return {
+            "count": 0,
+            "matched": 0,
+            "rejected": 0,
+            "scanned": 0,
+            "universe": universe,
+            "pool_note": pool_note + "（初始池为空）",
+            "items": [],
+            "notes": _notes() + [pool_note, "初始池为空"],
+            "thresholds": _thresholds(),
+            "partial": True,
+        }
+    df_deep, df_light = _split_deep_light(df)
+    _set_scan_progress(
+        running=True,
+        phase="quick",
+        planned=len(df_deep),
+        done=0,
+        deep=len(df_deep),
+        light=len(df_light),
+    )
+    items: list[dict[str, Any]] = []
+    if not df_light.empty:
+        items.extend(_item_spot_reject(row) for _, row in df_light.iterrows())
+    if not df_deep.empty:
+        items.extend(_item_deep_pending(row) for _, row in df_deep.iterrows())
+    return _report_from_items(
+        items,
+        universe=universe,
+        pool_note=pool_note,
+        scanned=len(df),
+        deep_n=len(df_deep),
+        light_n=len(df_light),
+        partial=True,
+    )
 
-    if universe == "csi_div":
-        codes = set(_fetch_csi_dividend_codes())
-        df = df_spot[df_spot["code"].isin(codes)].copy()
-        pool_note = f"中证红利({CSI_DIVIDEND_INDEX}) 成分股（含未命中，含 PE/PB 未过）"
-    else:
-        df = df_spot.sort_values("market_cap", ascending=False).copy()
-        pool_note = "沪深 A 股（已剔北交所/ST，含未命中）"
-        if limit is not None and limit > 0:
-            df = df.head(int(limit)).copy()
-            pool_note += f"，前 {int(limit)} 只"
+
+def screen_high_dividend_stocks(
+    *,
+    universe: str = DEFAULT_UNIVERSE,
+    limit: int | None = None,
+    on_checkpoint: Any | None = None,
+) -> dict[str, Any]:
+    logger.info("高股息筛选：获取 A 股实时行情…")
+    df, pool_note = _resolve_universe_df(universe, limit)
 
     if df.empty:
-        # 空表布尔索引在部分 pandas 版本会丢掉列名 → 后续 KeyError('code')
         logger.warning("高股息筛选：初始池为空（行情源可能无可用价）")
+        _set_scan_progress(running=False, phase="", planned=0, done=0, deep=0, light=0)
         return {
             "count": 0,
             "matched": 0,
@@ -606,82 +933,94 @@ def screen_high_dividend_stocks(
             "items": [],
             "notes": _notes() + [pool_note, "初始池为空：东财不可用且新浪现价为0时请稍后重试"],
             "thresholds": _thresholds(),
+            "partial": False,
         }
 
-    logger.info("高股息筛选：计算股息/支付率/ROE/OCF，候选 %s 只…", len(df))
-    records = _collect_dividend_records(df)
     scanned = len(df)
+    df_deep, df_light = _split_deep_light(df)
+    _set_scan_progress(
+        running=True,
+        phase="split",
+        planned=len(df_deep),
+        done=0,
+        deep=len(df_deep),
+        light=len(df_light),
+    )
+    logger.info(
+        "高股息筛选：池 %s，估值过门深扫 %s，行情未过门快标 %s",
+        scanned,
+        len(df_deep),
+        len(df_light),
+    )
 
-    empty = {
-        "count": 0,
-        "matched": 0,
-        "rejected": 0,
-        "scanned": scanned,
-        "universe": universe,
-        "pool_note": pool_note,
-        "items": [],
-        "notes": _notes() + [pool_note, "本次无有效记录可合并"],
-        "thresholds": _thresholds(),
-    }
-    df_div = pd.DataFrame(records)
-    if df_div.empty:
-        # 仍列出池内标的，全部记为数据不足
-        items = []
-        for _, row in df.iterrows():
-            stub = row.copy()
-            for k, v in _empty_metrics(str(row["code"])).items():
-                stub[k] = v
-            items.append(_row_to_item(stub))
-        empty["items"] = items
-        empty["count"] = len(items)
-        empty["rejected"] = len(items)
-        return empty
+    light_items = (
+        [_item_spot_reject(row) for _, row in df_light.iterrows()] if not df_light.empty else []
+    )
 
-    merged = df.merge(df_div, on="code", how="left")
-    # merge 后分红字段可能为 NaN → 补空指标
-    for col, default in (
-        ("data_ok", False),
-        ("data_note", "分红数据不足"),
-        ("avg_div_yield_3y", None),
-        ("last_year_yield", None),
-        ("consecutive_div_years", None),
-        ("payout_ratio", None),
-        ("payout_soft", False),
-        ("roe", None),
-        ("ocf_to_np", None),
-    ):
-        if col not in merged.columns:
-            merged[col] = default
-        else:
-            if col == "data_ok":
-                merged[col] = merged[col].fillna(False)
-            elif col == "payout_soft":
-                merged[col] = merged[col].fillna(False)
-            elif col == "data_note":
-                merged[col] = merged[col].fillna("分红数据不足")
+    def _checkpoint(records: list[dict[str, Any]], done: int, total: int) -> None:
+        if on_checkpoint is None:
+            return
+        # 已完成的深扫票 + 未完成的 pending + 行情未过门
+        done_codes = {str(r.get("code")) for r in records}
+        pending_rows = df_deep[~df_deep["code"].astype(str).isin(done_codes)]
+        deep_done = _merge_deep_records(df_deep[df_deep["code"].astype(str).isin(done_codes)], records)
+        deep_pend = [_item_deep_pending(row) for _, row in pending_rows.iterrows()]
+        board = _report_from_items(
+            light_items + deep_done + deep_pend,
+            universe=universe,
+            pool_note=pool_note,
+            scanned=scanned,
+            deep_n=len(df_deep),
+            light_n=len(df_light),
+            partial=done < total,
+        )
+        try:
+            on_checkpoint(board)
+        except Exception:  # noqa: BLE001
+            logger.debug("高股息 checkpoint 回调失败", exc_info=True)
 
-    items = [_row_to_item(row) for _, row in merged.iterrows()]
-    # 命中在前，再按近3年均息降序；未命中按均息降序
-    def _sort_key(it: dict[str, Any]) -> tuple:
-        y = it.get("avg_div_yield_3y")
-        yv = float(y) if y is not None else -1.0
-        return (0 if it.get("passed") else 1, -yv)
+    records: list[dict[str, Any]] = []
+    if not df_deep.empty:
+        # 带进度的深扫
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    items.sort(key=_sort_key)
-    matched = sum(1 for it in items if it.get("passed"))
-    rejected = len(items) - matched
+        pairs = list(zip(df_deep["code"].tolist(), df_deep["price"].tolist()))
+        workers = min(DEEP_WORKERS, max(4, len(pairs)))
+        _set_scan_progress(running=True, phase="deep", planned=len(pairs), done=0, deep=len(pairs))
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {
+                pool.submit(
+                    _calc_div_metrics,
+                    str(code),
+                    float(price) if price is not None else 0.0,
+                ): code
+                for code, price in pairs
+            }
+            for fut in as_completed(futs):
+                done += 1
+                try:
+                    m = fut.result()
+                except Exception:  # noqa: BLE001
+                    m = _empty_metrics(str(futs[fut]), "计算异常")
+                if m:
+                    records.append(m)
+                _set_scan_progress(done=done)
+                if done % DEEP_CHECKPOINT_EVERY == 0 or done == len(pairs):
+                    logger.info("高股息深扫进度 %s/%s", done, len(pairs))
+                    _checkpoint(records, done, len(pairs))
 
-    return {
-        "count": len(items),
-        "matched": matched,
-        "rejected": rejected,
-        "scanned": scanned,
-        "universe": universe,
-        "pool_note": pool_note,
-        "items": items,
-        "notes": _notes() + [pool_note, "列表含未命中标的，并标注未通过条件"],
-        "thresholds": _thresholds(),
-    }
+    deep_items = _merge_deep_records(df_deep, records)
+    _set_scan_progress(running=False, phase="done", done=len(df_deep))
+    return _report_from_items(
+        light_items + deep_items,
+        universe=universe,
+        pool_note=pool_note,
+        scanned=scanned,
+        deep_n=len(df_deep),
+        light_n=len(df_light),
+        partial=False,
+    )
 
 
 def _to_symbol(code: str) -> str:
@@ -744,12 +1083,25 @@ def _slice_report(data: dict[str, Any], top: int) -> dict[str, Any]:
     return out
 
 
+def _pool_wait_hint(universe: str) -> str:
+    if universe == "large_cap":
+        return "A股大盘约 600～700 只：先按 PE/PB 快筛，仅估值过门者拉分红（通常 1～3 分钟）"
+    if universe == "csi_div":
+        return f"中证红利({CSI_DIVIDEND_INDEX})约 100 只，约 1～2 分钟"
+    return "沪深演示池，约 1～2 分钟"
+
+
 def _computing_stub(universe: str, pool_note: str = "") -> dict[str, Any]:
-    note = pool_note or (
-        f"中证红利({CSI_DIVIDEND_INDEX}) 成分股"
-        if universe == "csi_div"
-        else "沪深 A 股"
-    )
+    if pool_note:
+        note = pool_note
+    elif universe == "csi_div":
+        note = f"中证红利({CSI_DIVIDEND_INDEX}) 成分股"
+    elif universe == "large_cap":
+        note = "A股大盘（市值≥200亿）"
+    else:
+        note = "沪深 A 股"
+    with _LOCK:
+        prog = dict(_SCAN_PROGRESS)
     return {
         "count": 0,
         "matched": 0,
@@ -758,21 +1110,34 @@ def _computing_stub(universe: str, pool_note: str = "") -> dict[str, Any]:
         "universe": universe,
         "pool_note": note,
         "items": [],
-        "notes": _notes() + [note, "后台筛选中，请稍候自动刷新"],
+        "notes": _notes() + [note, _pool_wait_hint(universe), "后台筛选中，请稍候自动刷新"],
         "thresholds": _thresholds(),
+        "progress": prog,
+        "wait_hint": _pool_wait_hint(universe),
     }
 
 
-def _store_result(cache_key: str, data: dict[str, Any]) -> None:
+def _store_result(
+    cache_key: str,
+    data: dict[str, Any],
+    *,
+    keep_refreshing: bool = False,
+) -> None:
     now = time.time()
     with _LOCK:
         _CACHE.update(ts=now, key=cache_key, data=data)
-        _REFRESHING.discard(cache_key)
+        if keep_refreshing or data.get("partial"):
+            _REFRESHING.add(cache_key)
+        else:
+            _REFRESHING.discard(cache_key)
     _save_disk(cache_key, data, ts=now)
 
 
 def _schedule_refresh(cache_key: str, universe: str, limit: int | None) -> bool:
-    """单飞后台刷新；已在跑则返回 False。"""
+    """单飞后台刷新；已在跑则返回 False。
+
+    先写行情快照（立刻有列表可看），再深扫分红并阶段性落盘。
+    """
     with _LOCK:
         if cache_key in _REFRESHING:
             return False
@@ -781,8 +1146,29 @@ def _schedule_refresh(cache_key: str, universe: str, limit: int | None) -> bool:
     def _job() -> None:
         try:
             logger.info("高股息后台筛选开始 key=%s", cache_key)
-            data = screen_high_dividend_stocks(universe=universe, limit=limit)
-            _store_result(cache_key, data)
+            # ① 行情快照：数秒内可缓存，避免页面一直空
+            try:
+                quick = build_quick_spot_board(universe=universe, limit=limit)
+                if quick.get("items"):
+                    _store_result(cache_key, quick, keep_refreshing=True)
+                    logger.info(
+                        "高股息快照已缓存 key=%s scanned=%s deep=%s",
+                        cache_key,
+                        quick.get("scanned"),
+                        quick.get("deep_scanned"),
+                    )
+            except Exception:  # noqa: BLE001
+                logger.exception("高股息快照失败 key=%s，继续尝试全量", cache_key)
+
+            def _ckpt(board: dict[str, Any]) -> None:
+                _store_result(cache_key, board, keep_refreshing=True)
+
+            data = screen_high_dividend_stocks(
+                universe=universe,
+                limit=limit,
+                on_checkpoint=_ckpt,
+            )
+            _store_result(cache_key, data, keep_refreshing=False)
             logger.info(
                 "高股息后台筛选完成 key=%s matched=%s scanned=%s",
                 cache_key,
@@ -800,7 +1186,7 @@ def _schedule_refresh(cache_key: str, universe: str, limit: int | None) -> bool:
 
 def scan_high_dividend(
     *,
-    universe: str = "csi_div",
+    universe: str = DEFAULT_UNIVERSE,
     limit: int | None = None,
     refresh: bool = False,
     top: int = 50,
@@ -810,8 +1196,12 @@ def scan_high_dividend(
     - 内存/磁盘有结果：立刻返回；过期或 refresh 时后台单飞重算
     - 冷启动无缓存：立刻返回 status=computing，后台计算，前端轮询
     """
-    uni = universe if universe in ("csi_div", "all") else "csi_div"
-    lim = None if uni == "csi_div" else (limit if limit and limit > 0 else 200)
+    uni = universe if universe in UNIVERSES else DEFAULT_UNIVERSE
+    # large_cap / csi_div：池内全量扫描；all：可截前 N
+    if uni in ("large_cap", "csi_div"):
+        lim = None
+    else:
+        lim = limit if limit and limit > 0 else 200
     cache_key = f"{CACHE_VERSION}:{uni}:{lim}"
     now = time.time()
 
@@ -837,14 +1227,25 @@ def scan_high_dividend(
     fresh = mem_data is not None and (now - mem_ts) < CACHE_TTL_SEC
     need_refresh = refresh or not fresh
 
+    with _LOCK:
+        prog = dict(_SCAN_PROGRESS)
+
     if mem_data is not None:
-        if need_refresh and not refreshing:
+        partial = bool(mem_data.get("partial"))
+        if (need_refresh or partial) and not refreshing:
             _schedule_refresh(cache_key, uni, lim)
             refreshing = True
         out = _slice_report(mem_data, top)
-        out["cached"] = fresh and not refresh
+        out["cached"] = fresh and not refresh and not partial
         out["stale"] = not fresh
-        out["status"] = "refreshing" if (need_refresh or refreshing) else "ready"
+        out["partial"] = partial
+        out["status"] = (
+            "refreshing"
+            if (need_refresh or refreshing or partial)
+            else "ready"
+        )
+        out["progress"] = prog
+        out["wait_hint"] = _pool_wait_hint(uni)
         return out
 
     # 冷启动：不阻塞，后台算
@@ -854,6 +1255,8 @@ def scan_high_dividend(
     out["stale"] = False
     out["status"] = "computing"
     out["refresh_started"] = started
+    out["progress"] = prog
+    out["wait_hint"] = _pool_wait_hint(uni)
     return out
 
 

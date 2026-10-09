@@ -12,7 +12,7 @@ import { useWatchlistStore } from '@/stores/watchlist'
 
 const watchlist = useWatchlistStore()
 
-const universe = ref<'csi_div' | 'all'>('csi_div')
+const universe = ref<'large_cap' | 'csi_div' | 'all'>('large_cap')
 const top = ref(100)
 const loading = ref(false)
 const error = ref('')
@@ -39,6 +39,26 @@ const rejectedCount = computed(
 const isBuilding = computed(() => {
   const s = report.value?.status
   return s === 'computing' || s === 'refreshing'
+})
+
+const waitHint = computed(() => {
+  if (report.value?.wait_hint) return report.value.wait_hint
+  if (universe.value === 'large_cap') {
+    return 'A股大盘约 600～700 只：先按 PE/PB 快筛，仅估值过门者拉分红（通常 1～3 分钟）'
+  }
+  if (universe.value === 'csi_div') {
+    return '中证红利约 100 只，约 1～2 分钟'
+  }
+  return '演示池筛选中，约 1～2 分钟'
+})
+
+const progressText = computed(() => {
+  const p = report.value?.progress
+  if (!p?.running && !isBuilding.value) return ''
+  const planned = p?.planned ?? 0
+  const done = p?.done ?? 0
+  if (planned > 0) return `深扫分红 ${done}/${planned}`
+  return '后台筛选中…'
 })
 
 function clearPoll() {
@@ -124,7 +144,7 @@ onMounted(() => {
         <h1>高股息选股</h1>
         <p class="sub">
           命中须 PE ≤ 15 · PB ≤ 1.5（不满足仍展示为未命中）· 连续分红 3～5 年 · 近3年均息 ≥ 4% ·
-          近1年息 ≥ 3% · 支付率 30%～80% · ROE ≥ 10% · 经营现金流/净利 ≥ 0.8 · 市值 ≥ 200 亿
+          近1年息 ≥ 3% · 支付率 30%～80% · 近3年ROE均 ≥ 8% · 最新ROE ≥ 6% · 经营现金流/净利 ≥ 0.8 · 市值 ≥ 200 亿
         </p>
       </div>
       <button type="button" class="primary" :disabled="loading || isBuilding" @click="load(true)">
@@ -136,7 +156,8 @@ onMounted(() => {
       <label>
         初始池
         <select v-model="universe">
-          <option value="csi_div">中证红利成分股（推荐）</option>
+          <option value="large_cap">A股大盘（市值≥200亿）</option>
+          <option value="csi_div">中证红利成分股</option>
           <option value="all">沪深市值前 200（演示）</option>
         </select>
       </label>
@@ -184,12 +205,16 @@ onMounted(() => {
       <span>{{ report.pool_note || report.universe }}</span>
       <span v-if="report.cached">缓存</span>
       <span v-else-if="report.stale">旧缓存</span>
-      <span v-if="isBuilding" class="building">后台筛选中…</span>
+      <span v-if="report?.partial">快照缓存</span>
+      <span v-if="isBuilding" class="building">{{ progressText || '后台筛选中…' }}</span>
     </div>
 
     <p v-if="error" class="err">{{ error }}</p>
     <p v-else-if="(loading || report?.status === 'computing') && !allItems.length" class="muted">
-      正在后台拉取行情与分红（中证红利约 100 只，约 1～3 分钟），本页会自动刷新…
+      正在后台筛选（{{ waitHint }}），本页会自动刷新…
+    </p>
+    <p v-else-if="report?.partial && allItems.length" class="muted">
+      已用行情快照出榜，分红深扫进行中（{{ progressText || '…' }}），列表会自动补全。
     </p>
     <p v-else-if="!loading && !items.length" class="muted">
       {{ viewMode === 'passed' ? '暂无命中标的。' : viewMode === 'failed' ? '暂无未命中标的。' : '暂无数据。' }}
@@ -208,7 +233,8 @@ onMounted(() => {
             <th>近1年息</th>
             <th>连续分红年</th>
             <th>支付率</th>
-            <th>ROE</th>
+            <th>最新ROE</th>
+            <th>近3年ROE均</th>
             <th>现金流/净利</th>
             <th>PE</th>
             <th>PB</th>
@@ -249,6 +275,7 @@ onMounted(() => {
               <template v-else>—</template>
             </td>
             <td class="num">{{ fmtPct(it.roe, 1) }}</td>
+            <td class="num">{{ fmtPct(it.roe_avg_3y, 1) }}</td>
             <td class="num">{{ fmtNum(it.ocf_to_np, 2) }}</td>
             <td class="num">{{ fmtNum(it.pe_ttm, 1) }}</td>
             <td class="num">{{ fmtNum(it.pb, 2) }}</td>

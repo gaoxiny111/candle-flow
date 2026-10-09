@@ -889,27 +889,39 @@ export interface HighDividendReport {
   rejected?: number
   total_matched?: number
   scanned?: number
+  deep_scanned?: number
+  spot_rejected?: number
   universe?: string
   pool_note?: string
   cached?: boolean
   stale?: boolean
   status?: 'ready' | 'computing' | 'refreshing'
   refresh_started?: boolean
+  partial?: boolean
   items: HighDividendItem[]
   notes?: string[]
   thresholds?: Record<string, number>
+  wait_hint?: string
+  progress?: {
+    running?: boolean
+    phase?: string
+    planned?: number
+    done?: number
+    deep?: number
+    light?: number
+  }
 }
 
 export const fetchHighDividend = (params?: {
-  universe?: 'csi_div' | 'all'
+  universe?: 'large_cap' | 'csi_div' | 'all'
   top?: number
   limit?: number
   refresh?: boolean
 }) =>
   api.get<ApiResponse<HighDividendReport>>('/fundamentals/high-dividend', {
     params: {
-      universe: params?.universe ?? 'csi_div',
-      top: params?.top ?? 50,
+      universe: params?.universe ?? 'large_cap',
+      top: params?.top ?? 100,
       limit: params?.limit,
       refresh: params?.refresh ?? false,
     },
@@ -965,16 +977,22 @@ export interface LargeCapBoardReport {
 
 export const fetchLargeCapBoard = (params?: {
   refresh?: boolean
+  grade?: 'all' | LargeCapGrade | 'scored'
+  pending_limit?: number
+  pending_offset?: number
 }) =>
   api.get<ApiResponse<LargeCapBoardReport>>('/fundamentals/large-cap-board', {
     params: {
-      // 沪深 A 股全量，不设市值门槛；前端按 A–E 分组展示
       min_cap_yi: 0,
       top: 6000,
       universe_limit: 6000,
       refresh: params?.refresh ?? false,
+      grade: params?.grade ?? 'all',
+      pending_limit: params?.pending_limit,
+      pending_offset: params?.pending_offset,
     },
-    timeout: 60000,
+    // 已评分精简载荷；未评分分页，避免 60s 超时
+    timeout: 45000,
   })
 
 export interface WatchFundamental {

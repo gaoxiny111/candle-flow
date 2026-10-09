@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import {
   apiErrorText,
@@ -14,10 +14,14 @@ import { useWatchlistStore } from '@/stores/watchlist'
 const watchlist = useWatchlistStore()
 
 const GRADES: LargeCapGrade[] = ['A', 'B', 'C', 'D', 'E']
+const PENDING_PAGE = 200
 const loading = ref(false)
 const error = ref('')
 const report = ref<LargeCapBoardReport | null>(null)
-/** 全部 = 分档竖排；点字母则只看该档 */
+const pendingItems = ref<LargeCapBoardItem[]>([])
+const pendingOffset = ref(0)
+const pendingHasMore = ref(false)
+/** 全部 = 只竖排已评分 A–E；未评单独分页 */
 const viewGrade = ref<'all' | LargeCapGrade>('all')
 let loadGen = 0
 let pollTimer: ReturnType<typeof setTimeout> | null = null
@@ -26,22 +30,19 @@ const gradeCounts = computed(() => report.value?.grade_counts || {})
 
 const sections = computed(() => {
   const groups = report.value?.groups
-  const fallback = report.value?.items || []
-  const byBand = (band: LargeCapGrade): LargeCapBoardItem[] => {
-    if (groups?.[band]) return groups[band]
-    if (band === 'pending') return fallback.filter((x) => !x.scored)
-    return fallback.filter((x) => (x.grade_band || x.final_rating?.[0]?.toUpperCase()) === band)
-  }
+  const byBand = (band: Exclude<LargeCapGrade, 'pending'>): LargeCapBoardItem[] =>
+    groups?.[band] || []
 
+  if (viewGrade.value === 'pending') {
+    return [{ grade: 'pending' as LargeCapGrade, title: '未评分', items: pendingItems.value }]
+  }
   if (viewGrade.value === 'all') {
-    return [
-      ...GRADES.map((g) => ({ grade: g, title: `${g} 级`, items: byBand(g) })),
-      { grade: 'pending' as LargeCapGrade, title: '未评分', items: byBand('pending') },
-    ].filter((s) => s.items.length > 0)
+    return GRADES.map((g) => ({ grade: g, title: `${g} 级`, items: byBand(g) })).filter(
+      (s) => s.items.length > 0,
+    )
   }
   const g = viewGrade.value
-  const title = g === 'pending' ? '未评分' : `${g} 级`
-  return [{ grade: g, title, items: byBand(g) }]
+  return [{ grade: g, title: `${g} 级`, items: byBand(g) }]
 })
 
 const totalListed = computed(() =>
@@ -74,20 +75,21 @@ function schedulePoll(gen: number) {
   clearPoll()
   pollTimer = setTimeout(() => {
     if (gen !== loadGen) return
-    void load(false, true)
-  }, 5000)
+    void loadScored(false, true)
+  }, 8000)
 }
 
-async function load(refresh = false, fromPoll = false) {
+async function loadScored(refresh = false, fromPoll = false) {
   const gen = ++loadGen
   if (!fromPoll) {
     loading.value = true
     error.value = ''
   }
   try {
-    const { data } = await fetchLargeCapBoard({ refresh })
+    const { data } = await fetchLargeCapBoard({ refresh, grade: 'all' })
     if (gen !== loadGen) return
     report.value = data.data || null
+    error.value = ''
     const status = report.value?.status
     if (status === 'computing' || status === 'refreshing') {
       schedulePoll(gen)
@@ -96,13 +98,73 @@ async function load(refresh = false, fromPoll = false) {
     }
   } catch (e) {
     if (gen !== loadGen) return
-    error.value = apiErrorText(e, '大盘股榜加载失败')
-    if (!fromPoll) report.value = null
-    clearPoll()
+    // 轮询失败保留旧数据，避免整页被 timeout 刷没
+    if (!fromPoll) {
+      error.value = apiErrorText(e, '大盘股榜加载失败')
+      if (!report.value) report.value = null
+    }
+    if (!fromPoll) clearPoll()
   } finally {
     if (gen === loadGen && !fromPoll) loading.value = false
   }
 }
+
+async function loadPending(reset = true) {
+  const gen = loadGen
+  loading.value = true
+  error.value = ''
+  try {
+    const offset = reset ? 0 : pendingOffset.value
+    const { data } = await fetchLargeCapBoard({
+      grade: 'pending',
+      pending_limit: PENDING_PAGE,
+      pending_offset: offset,
+    })
+    if (gen !== loadGen) return
+    const payload = data.data
+    if (payload) {
+      // 同步计数/进度，不覆盖已评分 groups
+      if (!report.value) {
+        report.value = payload
+      } else {
+        report.value = {
+          ...report.value,
+          grade_counts: payload.grade_counts || report.value.grade_counts,
+          pending_count: payload.pending_count,
+          scored_count: payload.scored_count,
+          universe_size: payload.universe_size,
+          status: payload.status,
+          progress: payload.progress,
+          pool_note: payload.pool_note,
+        }
+      }
+      const page = payload.groups?.pending || payload.items || []
+      pendingItems.value = reset ? page : pendingItems.value.concat(page)
+      pendingOffset.value = offset + page.length
+      const totalPending = payload.pending_count ?? 0
+      pendingHasMore.value = pendingOffset.value < totalPending
+    }
+  } catch (e) {
+    if (gen !== loadGen) return
+    error.value = apiErrorText(e, '未评分列表加载失败')
+  } finally {
+    if (gen === loadGen) loading.value = false
+  }
+}
+
+async function load(refresh = false) {
+  if (viewGrade.value === 'pending') {
+    await loadPending(true)
+  } else {
+    await loadScored(refresh, false)
+  }
+}
+
+watch(viewGrade, (g) => {
+  if (g === 'pending') {
+    void loadPending(true)
+  }
+})
 
 onUnmounted(() => {
   loadGen += 1
@@ -151,7 +213,7 @@ function countOf(g: LargeCapGrade | 'all') {
 }
 
 onMounted(() => {
-  void load(false)
+  void loadScored(false, false)
 })
 </script>
 
@@ -161,7 +223,8 @@ onMounted(() => {
       <div>
         <h1>大盘股基本面</h1>
         <p class="sub">
-          与图表页「基本面」同源综合分。股票池：沪深 A 股全量（不设市值门槛），按 A / B / C / D / E 评级分组展示。
+          与图表页「基本面」同源综合分。股票池：沪深 A 股全量（不设市值门槛），按 A / B / C / D / E 评级分组。
+          「全部」仅展示已评分；未评分点「未评」分页加载。
         </p>
       </div>
       <button type="button" class="primary" :disabled="loading || isBuilding" @click="load(true)">
@@ -216,10 +279,12 @@ onMounted(() => {
     </div>
 
     <p v-if="error" class="err">{{ error }}</p>
-    <p v-else-if="(loading || isBuilding) && !totalListed" class="muted">
-      正在拉取 A股池并启动后台打分，本页会自动刷新…
+    <p v-else-if="loading && !totalListed" class="muted">
+      正在加载已评分榜单…
     </p>
-    <p v-else-if="!loading && !totalListed" class="muted">暂无数据。</p>
+    <p v-else-if="!loading && !totalListed && viewGrade !== 'pending'" class="muted">
+      暂无已评分数据，后台打分完成后自动刷新。
+    </p>
 
     <section
       v-for="sec in sections"
@@ -230,7 +295,7 @@ onMounted(() => {
         {{ sec.title }}
         <span class="cnt">{{ sec.items.length }}</span>
       </h2>
-      <div class="table-wrap">
+      <div v-if="sec.items.length" class="table-wrap">
         <table class="lcb-table">
           <thead>
             <tr>
@@ -274,7 +339,7 @@ onMounted(() => {
                 </RouterLink>
               </td>
               <td>{{ it.name || '—' }}</td>
-              <td>{{ it.industry || it.sector_kind || '—' }}</td>
+              <td>{{ it.industry || '—' }}</td>
               <td class="num">{{ fmtNum(it.price) }}</td>
               <td class="num">{{ fmtNum(it.pe_ttm, 1) }}</td>
               <td class="num">{{ fmtNum(it.pb, 2) }}</td>
@@ -292,7 +357,14 @@ onMounted(() => {
           </tbody>
         </table>
       </div>
+      <p v-else class="muted">暂无</p>
     </section>
+
+    <div v-if="viewGrade === 'pending' && pendingHasMore" class="more">
+      <button type="button" class="primary" :disabled="loading" @click="loadPending(false)">
+        加载更多未评分
+      </button>
+    </div>
 
     <ul v-if="report?.notes?.length" class="notes">
       <li v-for="(n, i) in report.notes" :key="i">{{ n }}</li>
@@ -445,6 +517,10 @@ onMounted(() => {
   color: var(--color-primary);
   cursor: pointer;
   padding: 0;
+}
+.more {
+  display: flex;
+  justify-content: center;
 }
 .notes {
   margin: 0;

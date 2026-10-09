@@ -107,11 +107,23 @@ def test_board_groups_by_abcde() -> None:
     assert out["grade_counts"]["pending"] == 1
     assert [x["symbol"] for x in out["groups"]["A"]] == ["601318.SH", "600519.SH"]
     assert out["groups"]["D"][0]["symbol"] == "601668.SH"
-    assert out["groups"]["pending"][0]["symbol"] == "600036.SH"
-    # 扁平列表：先 A 档再 D 档再未评
+    # 默认 all：未评只计不落包，防超时
+    assert out["groups"]["pending"] == []
     assert out["items"][0]["symbol"] == "601318.SH"
-    assert out["count"] == 4  # 全量，不截断
+    assert out["count"] == 3
+    assert "warnings" not in out["items"][0]
     sched.assert_called_once()
+
+    with (
+        patch.object(board, "_load_universe_disk", return_value=universe),
+        patch.object(board, "_load_scored_map", return_value=scored),
+        patch.object(board, "_schedule_scoring", return_value=False),
+    ):
+        with board._LOCK:
+            board._AUTO_SCORED = True
+        pend = board.scan_large_cap_board(refresh=False, grade="pending")
+    assert len(pend["groups"]["pending"]) == 1
+    assert pend["groups"]["pending"][0]["symbol"] == "600036.SH"
 
 
 def test_board_does_not_reschedule_after_auto_round() -> None:

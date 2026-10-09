@@ -174,12 +174,12 @@ def run_screen(body: ScreenRequest, db: Session = Depends(get_db)):
 
 @router.get("/fundamentals/high-dividend")
 def get_high_dividend(
-    universe: str = Query(default="csi_div", pattern="^(csi_div|all)$"),
-    top: int = Query(default=50, ge=1, le=500),
+    universe: str = Query(default="large_cap", pattern="^(large_cap|csi_div|all)$"),
+    top: int = Query(default=100, ge=1, le=500),
     limit: int | None = Query(default=None, ge=1, le=500),
     refresh: bool = Query(default=False),
 ):
-    """高股息选股（AkShare：行情 + 分红历史 → 多条件过滤）。"""
+    """高股息选股（默认初始池：A股大盘市值≥200亿）。"""
     from app.services.high_dividend import scan_high_dividend
 
     try:
@@ -200,8 +200,11 @@ def get_large_cap_board(
     top: int = Query(default=6000, ge=1, le=6000),
     universe_limit: int = Query(default=6000, ge=50, le=6000),
     refresh: bool = Query(default=False),
+    grade: str | None = Query(default="all"),
+    pending_limit: int = Query(default=200, ge=1, le=500),
+    pending_offset: int = Query(default=0, ge=0),
 ):
-    """A股基本面榜：全量按 A/B/C/D/E 分组（默认不设市值门槛），缺分后台补算。"""
+    """A股基本面榜：按 A/B/C/D/E 分组。默认只返回已评分，未评分分页拉取。"""
     from app.services.large_cap_board import scan_large_cap_board
 
     try:
@@ -210,6 +213,9 @@ def get_large_cap_board(
             top=top,
             universe_limit=universe_limit,
             refresh=refresh,
+            grade=grade,
+            pending_limit=pending_limit,
+            pending_offset=pending_offset,
         )
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"大盘股榜失败：{e}") from e
