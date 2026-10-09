@@ -279,18 +279,25 @@ class KlineService:
         now = now.astimezone(CN_TZ)
         return (now.hour, now.minute) >= (15, 0)
 
-    def merge_today_spot(self, symbol: str, force: bool = False) -> bool:
-        """日线源常不含当天，**收盘后**用现价补一根今日 K 线（东财 / 腾讯 / 新浪）。
+    def merge_today_spot(
+        self,
+        symbol: str,
+        force: bool = False,
+        *,
+        allow_intraday: bool = False,
+    ) -> bool:
+        """用现价补/刷新今日日 K（东财 / 腾讯 / 新浪）。
 
-        两条硬约束（防盘中污染）：
-        1. 仅在 **15:00 之后** 调用（``force=True`` 可绕过，仅供离线回补脚本）；
-        2. **绝不回写已完成交易日** —— ``spot_date < trading_today()`` 直接拒绝，
-           否则会把历史日（如 09-22）的正确收盘/成交量覆盖成实时快照。
+        默认仅在 **15:00 之后** 合并，避免盘中快照污染全库批量同步与量比。
+        图表单票展示可传 ``allow_intraday=True``（或 ``force=True``）写入未完成
+        的今日 bar，收盘后仍会被正式日线覆盖。
+
+        **绝不回写已完成交易日** —— ``spot_date < trading_today()`` 直接拒绝。
         """
         today = trading_today()
         if not is_cn_weekday(today):
             return False
-        if not force and not self._is_after_close():
+        if not force and not allow_intraday and not self._is_after_close():
             return False
         spot = akshare_client.fetch_spot(symbol)
         if not spot:

@@ -201,6 +201,12 @@ def test_merge_today_spot_rejected_intraday(monkeypatch):
         assert latest.date == date(2026, 9, 22), "盘中不得新增今日 bar"
         assert float(latest.close) == 48.2
         assert int(latest.volume) == 1_000_000, "历史 bar 不得被盘中快照覆盖"
+
+        # 图表路径：allow_intraday 允许写入未完成今日 bar
+        assert svc.merge_today_spot(symbol, allow_intraday=True) is True
+        today_bar = svc.get_latest(symbol)
+        assert today_bar.date == date(2026, 9, 23)
+        assert float(today_bar.close) == 47.9
     finally:
         db.query(KlineData).filter(KlineData.symbol == symbol).delete()
         db.commit()

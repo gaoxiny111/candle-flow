@@ -65,6 +65,29 @@ def confirm_signal(body: SignalConfirmRequest, db: Session = Depends(get_db)):
     return ApiResponse(data=svc.to_signal_out(signal, quote))
 
 
+@router.get("/signals/bottom-fishing")
+def bottom_fishing_signals(
+    symbols: Optional[str] = Query(None, description="逗号分隔代码；登录用户可省略则用自选"),
+    lookback_days: int = Query(5, ge=1, le=20),
+    only_hits: bool = Query(True),
+    db: Session = Depends(get_db),
+    user: UserConfig | None = Depends(get_optional_user),
+):
+    """关注池抄底信号：缩量企稳 / 放量大阳线。"""
+    from app.services.bottom_fishing import scan_symbols
+
+    symbol_list = _watchlist_symbols(user, symbols)
+    if not symbol_list and symbols:
+        symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    data = scan_symbols(
+        db,
+        symbol_list,
+        lookback_days=lookback_days,
+        only_hits=only_hits,
+    )
+    return ApiResponse(data=data)
+
+
 @router.get("/signals/{signal_id}")
 def get_signal(signal_id: int, db: Session = Depends(get_db)):
     svc = SignalService(db)

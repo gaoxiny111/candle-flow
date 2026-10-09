@@ -214,6 +214,7 @@ class AKShareClient:
             "high": high,
             "low": low,
             "close": close,
+            "prev_close": prev if prev and prev > 0 else None,
             "volume": int(volume or 0),
             "source": "eastmoney",
         }
@@ -271,6 +272,7 @@ class AKShareClient:
             "high": high,
             "low": low,
             "close": close,
+            "prev_close": prev if prev and prev > 0 else None,
             "volume": int(volume or 0),
             "source": "tencent",
         }
@@ -329,6 +331,7 @@ class AKShareClient:
             "high": high,
             "low": low,
             "close": close,
+            "prev_close": prev if prev and prev > 0 else None,
             "volume": int(volume or 0),
             "source": "sina",
         }

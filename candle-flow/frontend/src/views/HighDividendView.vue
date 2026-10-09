@@ -13,12 +13,26 @@ import { useWatchlistStore } from '@/stores/watchlist'
 const watchlist = useWatchlistStore()
 
 const universe = ref<'csi_div' | 'all'>('csi_div')
-const top = ref(50)
+const top = ref(100)
 const loading = ref(false)
 const error = ref('')
 const report = ref<HighDividendReport | null>(null)
+const viewMode = ref<'all' | 'passed' | 'failed'>('all')
 
-const items = computed(() => report.value?.items || [])
+const allItems = computed(() => report.value?.items || [])
+const items = computed(() => {
+  const list = allItems.value
+  if (viewMode.value === 'passed') return list.filter((x) => x.passed)
+  if (viewMode.value === 'failed') return list.filter((x) => !x.passed)
+  return list
+})
+
+const matchedCount = computed(
+  () => report.value?.matched ?? report.value?.total_matched ?? allItems.value.filter((x) => x.passed).length,
+)
+const rejectedCount = computed(
+  () => report.value?.rejected ?? allItems.value.filter((x) => !x.passed).length,
+)
 
 async function load(refresh = false) {
   loading.value = true
@@ -69,7 +83,8 @@ onMounted(() => {
       <div>
         <h1>高股息选股</h1>
         <p class="sub">
-          AkShare 框架：近 5 年均息 ≥ 4% · 分红年数 ≥ 3 · PE &lt; 30 · PB &lt; 5 · 市值 &gt; 50 亿
+          连续分红 3～5 年 · 近3年均息 ≥ 4% · 近1年息 ≥ 3% · 支付率 30%～80% ·
+          PE ≤ 15 · PB ≤ 1.5 · ROE ≥ 10% · 经营现金流/净利 ≥ 0.8 · 市值 ≥ 200 亿
         </p>
       </div>
       <button type="button" class="primary" :disabled="loading" @click="load(true)">
@@ -88,46 +103,90 @@ onMounted(() => {
       <label>
         条数
         <select v-model.number="top">
-          <option :value="30">30</option>
           <option :value="50">50</option>
           <option :value="100">100</option>
+          <option :value="200">200</option>
         </select>
       </label>
+      <div class="view-tabs" role="tablist">
+        <button
+          type="button"
+          class="tab"
+          :class="{ active: viewMode === 'all' }"
+          @click="viewMode = 'all'"
+        >
+          全部
+        </button>
+        <button
+          type="button"
+          class="tab"
+          :class="{ active: viewMode === 'passed' }"
+          @click="viewMode = 'passed'"
+        >
+          命中
+        </button>
+        <button
+          type="button"
+          class="tab"
+          :class="{ active: viewMode === 'failed' }"
+          @click="viewMode = 'failed'"
+        >
+          未命中
+        </button>
+      </div>
     </div>
 
     <div v-if="report" class="stats">
       <span>扫描 {{ report.scanned ?? '—' }}</span>
-      <span>命中 {{ report.total_matched ?? report.count }}</span>
-      <span>展示 {{ report.count }}</span>
+      <span class="ok">命中 {{ matchedCount }}</span>
+      <span class="bad">未命中 {{ rejectedCount }}</span>
+      <span>展示 {{ items.length }}</span>
       <span>{{ report.pool_note || report.universe }}</span>
       <span v-if="report.cached">缓存</span>
     </div>
 
     <p v-if="error" class="err">{{ error }}</p>
-    <p v-else-if="loading && !items.length" class="muted">
+    <p v-else-if="loading && !allItems.length" class="muted">
       正在拉取行情与分红（中证红利约 100 只，首次可能需 1～3 分钟）…
     </p>
-    <p v-else-if="!loading && !items.length" class="muted">暂无命中标的。</p>
+    <p v-else-if="!loading && !items.length" class="muted">
+      {{ viewMode === 'passed' ? '暂无命中标的。' : viewMode === 'failed' ? '暂无未命中标的。' : '暂无数据。' }}
+    </p>
 
     <div v-if="items.length" class="table-wrap">
       <table class="hd-table">
         <thead>
           <tr>
             <th>#</th>
+            <th>状态</th>
             <th>代码</th>
             <th>名称</th>
             <th>最新价</th>
-            <th>近5年均息</th>
-            <th>分红年数</th>
+            <th>近3年均息</th>
+            <th>近1年息</th>
+            <th>连续分红年</th>
+            <th>支付率</th>
+            <th>ROE</th>
+            <th>现金流/净利</th>
             <th>PE</th>
             <th>PB</th>
             <th>市值(亿)</th>
+            <th>未通过</th>
             <th></th>
           </tr>
         </thead>
         <tbody>
-          <tr v-for="(it, idx) in items" :key="it.symbol">
+          <tr
+            v-for="(it, idx) in items"
+            :key="it.symbol"
+            :class="{ failed: !it.passed }"
+          >
             <td>{{ idx + 1 }}</td>
+            <td>
+              <span class="badge" :class="it.passed ? 'badge-ok' : 'badge-bad'">
+                {{ it.passed ? '命中' : '未命中' }}
+              </span>
+            </td>
             <td>
               <RouterLink
                 class="sym"
@@ -139,11 +198,19 @@ onMounted(() => {
             </td>
             <td>{{ it.name || '—' }}</td>
             <td class="num">{{ fmtNum(it.price) }}</td>
-            <td class="num hot">{{ fmtPct(it.avg_div_yield_5y) }}</td>
+            <td class="num hot">{{ fmtPct(it.avg_div_yield_3y ?? it.avg_div_yield_5y) }}</td>
+            <td class="num">{{ fmtPct(it.last_year_yield) }}</td>
             <td class="num">{{ it.consecutive_div_years ?? '—' }}</td>
+            <td class="num">{{ fmtPct(it.payout_ratio, 1) }}</td>
+            <td class="num">{{ fmtPct(it.roe, 1) }}</td>
+            <td class="num">{{ fmtNum(it.ocf_to_np, 2) }}</td>
             <td class="num">{{ fmtNum(it.pe_ttm, 1) }}</td>
             <td class="num">{{ fmtNum(it.pb, 2) }}</td>
             <td class="num">{{ fmtNum(it.market_cap_yi, 0) }}</td>
+            <td class="fails">
+              <template v-if="it.passed">—</template>
+              <template v-else>{{ (it.fail_reasons || []).join(' · ') || '—' }}</template>
+            </td>
             <td>
               <button type="button" class="linkish" @click="addWatch(it)">加自选</button>
             </td>
@@ -200,6 +267,24 @@ onMounted(() => {
   border-radius: 6px;
   padding: 0.3rem 0.5rem;
 }
+.view-tabs {
+  display: inline-flex;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.tab {
+  border: 0;
+  background: var(--bg-light);
+  color: var(--text-secondary);
+  padding: 0.35rem 0.75rem;
+  cursor: pointer;
+  font-size: 0.88rem;
+}
+.tab.active {
+  background: var(--color-primary);
+  color: #fff;
+}
 .stats {
   display: flex;
   flex-wrap: wrap;
@@ -207,6 +292,8 @@ onMounted(() => {
   font-size: 0.88rem;
   color: var(--text-secondary);
 }
+.stats .ok { color: #389e0d; font-weight: 600; }
+.stats .bad { color: #cf1322; font-weight: 600; }
 .primary {
   background: var(--color-primary);
   color: #fff;
@@ -247,6 +334,10 @@ onMounted(() => {
   font-weight: 600;
   color: var(--text-secondary);
 }
+.hd-table tr.failed {
+  opacity: 0.72;
+  background: rgba(0, 0, 0, 0.015);
+}
 .num {
   font-variant-numeric: tabular-nums;
   text-align: right !important;
@@ -259,6 +350,28 @@ onMounted(() => {
   color: var(--color-primary);
   text-decoration: none;
   font-weight: 600;
+}
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.badge-ok {
+  background: rgba(82, 196, 26, 0.12);
+  color: #389e0d;
+}
+.badge-bad {
+  background: rgba(0, 0, 0, 0.06);
+  color: #8c8c8c;
+}
+.fails {
+  max-width: 280px;
+  white-space: normal;
+  font-size: 12px;
+  color: #cf1322;
+  line-height: 1.35;
 }
 .linkish {
   background: none;

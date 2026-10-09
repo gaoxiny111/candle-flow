@@ -7,7 +7,8 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import DataSourceError
 from app.database import get_db
 from app.schemas.common import ApiResponse, ResponseMeta
-from app.schemas.kline import KlineOut, KlineSyncRequest, KlineSyncResponse
+from app.schemas.kline import KlineOut, KlineSyncRequest, KlineSyncResponse, LiveQuoteOut
+from app.services.akshare_client import akshare_client
 from app.services.kline_service import KlineService
 from app.services.stock_universe import resolve_symbol
 from app.utils.symbol import SymbolError
@@ -65,8 +66,8 @@ def list_kline(
             items = svc.sanitize_rows(items)
         except Exception:
             logger.warning("incremental kline sync failed for %s", symbol, exc_info=True)
-    # Opening the chart should always try to attach/refresh today's bar (no Sync click).
-    merged = svc.merge_today_spot(symbol)
+    # 图表打开：盘中也用实时价刷新「今日」这根日 K（仅当前标的，不跑全库）。
+    merged = svc.merge_today_spot(symbol, allow_intraday=True)
     if not merged and svc.latest_is_stale(symbol):
         merged = svc.ensure_today_bar(symbol)
     if merged:
@@ -75,6 +76,66 @@ def list_kline(
     return ApiResponse(
         data=[KlineOut.model_validate(i) for i in items],
         meta=ResponseMeta(page=page, page_size=page_size, total=len(items)),
+    )
+
+
+@router.get("/kline/quote")
+def live_quote(
+    symbol: str = Query(...),
+    update_daily: bool = Query(default=True),
+    db: Session = Depends(get_db),
+):
+    """盘中实时价；默认顺带刷新该票今日日 K（allow_intraday），供图表轮询。"""
+    from datetime import datetime
+
+    from app.services.akshare_client import CN_TZ, trading_today
+
+    resolved = _resolve_symbol(symbol, db)
+    if isinstance(resolved, ApiResponse):
+        return resolved
+    symbol = resolved
+
+    svc = KlineService(db)
+    if update_daily:
+        try:
+            svc.merge_today_spot(symbol, allow_intraday=True)
+        except Exception:
+            logger.warning("quote-time daily merge failed for %s", symbol, exc_info=True)
+
+    spot = akshare_client.fetch_spot(symbol)
+    if not spot or spot.get("close") is None:
+        return ApiResponse(code=404101, message="暂无实时行情", data=None)
+
+    price = float(spot["close"])
+    prev = spot.get("prev_close")
+    if prev is None:
+        latest = svc.get_latest(symbol)
+        if latest is not None:
+            rows, _ = svc.get_klines(symbol, page=1, page_size=3)
+            rows = sorted(rows, key=lambda r: r.date)
+            if rows and rows[-1].date == trading_today() and len(rows) >= 2:
+                prev = float(rows[-2].close)
+            else:
+                prev = float(latest.close)
+
+    change = None if prev is None else round(price - float(prev), 4)
+    pct = None if prev in (None, 0) else round((price - float(prev)) / float(prev) * 100.0, 2)
+    qd = spot.get("date")
+    return ApiResponse(
+        data=LiveQuoteOut(
+            symbol=symbol,
+            price=price,
+            prev_close=float(prev) if prev is not None else None,
+            change=change,
+            change_pct=pct,
+            open=float(spot["open"]) if spot.get("open") is not None else None,
+            high=float(spot["high"]) if spot.get("high") is not None else None,
+            low=float(spot["low"]) if spot.get("low") is not None else None,
+            volume=int(spot["volume"]) if spot.get("volume") is not None else None,
+            quote_date=qd,
+            source=str(spot.get("source") or "spot"),
+            as_of=datetime.now(CN_TZ),
+        )
     )
 
 

@@ -6,8 +6,19 @@ import { usePatternStore } from '@/stores/pattern'
 import { useSignalStore } from '@/stores/signal'
 import { useConfigStore } from '@/stores/config'
 import { useWatchlistStore } from '@/stores/watchlist'
-import { apiErrorText, analyzeFundamentalsBatch, fetchValuations, resolveSymbolQuery } from '@/api'
-import type { FundamentalAnalysisReport, JobProgress, SymbolValuation } from '@/api'
+import {
+  apiErrorText,
+  analyzeFundamentalsBatch,
+  fetchBottomFishing,
+  fetchValuations,
+  resolveSymbolQuery,
+} from '@/api'
+import type {
+  BottomFishingItem,
+  FundamentalAnalysisReport,
+  JobProgress,
+  SymbolValuation,
+} from '@/api'
 import { directionZh, patternNameZh } from '@/utils/labels'
 import { isEtfSymbol, rememberSymbol, symbolName, tryNormalizeSymbol } from '@/utils/symbol'
 import SymbolSearch from '@/components/SymbolSearch.vue'
@@ -28,6 +39,10 @@ const analysisError = ref('')
 const analysisProgress = ref<JobProgress | null>(null)
 const analysisBySymbol = ref<Record<string, FundamentalAnalysisReport>>({})
 const watchKind = ref<'stock' | 'etf'>('stock')
+const bottomItems = ref<BottomFishingItem[]>([])
+const bottomLoading = ref(false)
+const bottomError = ref('')
+const bottomLookback = ref(5)
 let percentileTimer: ReturnType<typeof setTimeout> | null = null
 let analysisToken = 0
 
@@ -37,8 +52,48 @@ const watchedPatterns = computed(() => {
 })
 const recentPatterns = computed(() => watchedPatterns.value.slice(0, 12))
 
+const bottomHits = computed(() =>
+  bottomItems.value.filter((x) => x.has_signal && (x.hits?.length || x.latest?.bottom_signal)),
+)
+
+function bottomDisplay(row: BottomFishingItem) {
+  if (row.latest?.bottom_signal) return row.latest
+  const hit = row.hits?.[row.hits.length - 1]
+  if (!hit) return null
+  return hit
+}
+
+const anyYangSurge = computed(() =>
+  bottomHits.value.some((row) => Boolean(bottomDisplay(row)?.yang_surge)),
+)
+
 function guestSymbols() {
   return config.isAuthenticated ? undefined : watchlist.symbols
+}
+
+async function loadBottomFishing() {
+  const syms = watchlist.symbols
+  if (!syms.length) {
+    bottomItems.value = []
+    bottomError.value = ''
+    return
+  }
+  bottomLoading.value = true
+  bottomError.value = ''
+  try {
+    const { data } = await fetchBottomFishing(syms, bottomLookback.value)
+    const payload = data.data
+    bottomItems.value = payload?.items || []
+    if (payload?.lookback_days) bottomLookback.value = payload.lookback_days
+    for (const row of bottomItems.value) {
+      if (row.name) rememberSymbol(row.symbol, row.name)
+    }
+  } catch (e) {
+    bottomError.value = apiErrorText(e, '抄底信号加载失败')
+    bottomItems.value = []
+  } finally {
+    bottomLoading.value = false
+  }
 }
 
 async function loadWatchlistData() {
@@ -47,6 +102,7 @@ async function loadWatchlistData() {
     pattern.fetchPatterns(undefined, true, symbols),
     signal.fetchSignals(undefined, undefined, true, symbols),
     loadValuations(),
+    loadBottomFishing(),
   ])
 }
 
@@ -433,6 +489,80 @@ function openDetail(sym: string) {
 
     </section>
 
+    <section class="card bottom-fishing">
+      <div class="watch-head">
+        <h2>抄底信号</h2>
+        <div class="watch-head-actions">
+          <span v-if="bottomLoading" class="hold-scanning">扫描中…</span>
+          <span v-else class="hold-scanning">近 {{ bottomLookback }} 个交易日</span>
+          <button
+            type="button"
+            class="btn-secondary"
+            :disabled="bottomLoading || !watchlist.symbols.length"
+            @click="loadBottomFishing"
+          >
+            {{ bottomLoading ? '扫描中…' : '刷新' }}
+          </button>
+        </div>
+      </div>
+      <p class="bottom-hint">
+        规则：缩量企稳（近3日至少2日量&lt;20日均量70%且收盘不创新低）·
+        <span :class="{ 'bf-hint-off': !anyYangSurge }">放量大阳线（涨幅&gt;3%且量较前日放大≥1.5倍）</span>
+      </p>
+      <p v-if="bottomError" class="follow-error">{{ bottomError }}</p>
+      <div v-if="!watchlist.symbols.length" class="empty">先加自选股 / ETF，再扫描抄底信号。</div>
+      <div v-else-if="bottomLoading && !bottomHits.length" class="empty">正在扫描关注池…</div>
+      <div v-else-if="!bottomHits.length" class="empty">近 {{ bottomLookback }} 日暂无抄底信号。</div>
+      <div v-else class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>标的</th>
+              <th>名称</th>
+              <th>信号</th>
+              <th>最近日期</th>
+              <th>收盘</th>
+              <th>涨跌幅</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="row in bottomHits"
+              :key="row.symbol"
+              class="pattern-row"
+              @click="openDetail(row.symbol)"
+            >
+              <td class="symbol-code">{{ row.symbol }}</td>
+              <td class="symbol-name">{{ row.name || symbolName(row.symbol) || '—' }}</td>
+              <td class="bf-tags">
+                <span
+                  class="bf-tag"
+                  :class="bottomDisplay(row)?.shrink_stabilize ? 'bf-shrink' : 'bf-off'"
+                >缩量企稳</span>
+                <span
+                  class="bf-tag"
+                  :class="bottomDisplay(row)?.yang_surge ? 'bf-yang' : 'bf-off'"
+                  title="涨幅>3%且量较前日放大≥1.5倍"
+                >放量大阳线</span>
+              </td>
+              <td>{{ bottomDisplay(row)?.date || '—' }}</td>
+              <td>{{ bottomDisplay(row)?.close != null ? Number(bottomDisplay(row)!.close).toFixed(2) : '—' }}</td>
+              <td>
+                <span
+                  v-if="bottomDisplay(row)?.pct_chg != null"
+                  :class="(bottomDisplay(row)!.pct_chg as number) >= 0 ? 'quote-up' : 'quote-down'"
+                >
+                  {{ ((bottomDisplay(row)!.pct_chg as number) >= 0 ? '+' : '')
+                    + (bottomDisplay(row)!.pct_chg as number).toFixed(2) }}%
+                </span>
+                <span v-else>—</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="card recent-patterns">
       <h2>最近形态</h2>
       <div v-if="!watchlist.symbols.length" class="empty">在搜索结果里点「加自选」，这里只展示自选股的蜡烛形态。</div>
@@ -518,6 +648,36 @@ function openDetail(sym: string) {
 }
 .chip-x:hover { background: rgba(0, 0, 0, 0.08); color: #f5222d; }
 .recent-patterns h2 { margin-bottom: var(--space-md); }
+.bottom-fishing h2 { margin: 0; }
+.bottom-hint {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0 0 var(--space-md);
+}
+.bf-tags { white-space: nowrap; }
+.bf-tag {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.bf-shrink {
+  background: rgba(24, 144, 255, 0.12);
+  color: #096dd9;
+}
+.bf-yang {
+  background: rgba(245, 34, 45, 0.1);
+  color: #cf1322;
+}
+.bf-off {
+  background: rgba(0, 0, 0, 0.04);
+  color: #bfbfbf;
+  font-weight: 500;
+}
+.bf-hint-off { color: #bfbfbf; }
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th, td { padding: var(--space-sm) var(--space-md); text-align: left; border-bottom: 1px solid var(--border-color); }
 th { color: var(--text-secondary); font-weight: 500; }

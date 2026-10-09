@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, watch, computed } from 'vue'
+import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ChartContainer from '@/components/ChartContainer.vue'
 import SignalPanel from '@/components/SignalPanel.vue'
@@ -13,7 +13,7 @@ import { usePatternStore } from '@/stores/pattern'
 import { useSignalStore } from '@/stores/signal'
 import { useConfigStore } from '@/stores/config'
 import { useWatchlistStore } from '@/stores/watchlist'
-import { resolveSymbolQuery } from '@/api'
+import { resolveSymbolQuery, fetchLiveQuote, type LiveQuote } from '@/api'
 import { patternNameZh } from '@/utils/labels'
 import { rememberSymbol, formatSymbol, tryNormalizeSymbol, isEtfSymbol, isIndexSymbol } from '@/utils/symbol'
 import { mapPatternsToWeekly, toWeekly, weeklyBias } from '@/utils/timeframe'
@@ -46,7 +46,11 @@ const symbol = computed(() => {
   }
 })
 
-const quote = computed(() => {
+const liveQuote = ref<LiveQuote | null>(null)
+let quoteTimer: ReturnType<typeof setInterval> | null = null
+const QUOTE_POLL_MS = 20000
+
+const barQuote = computed(() => {
   const list = kline.klineList
   if (!list.length) return null
   const last = list[list.length - 1]
@@ -64,6 +68,95 @@ const quote = computed(() => {
   }).format(new Date())
   return { lastPrice, change, pct, label: barDate === today ? '今日' : barDate.slice(5) }
 })
+
+/** 有实时价时优先展示；否则回退日 K 最后一根 */
+const quote = computed(() => {
+  const live = liveQuote.value
+  if (live && Number.isFinite(live.price)) {
+    const change = live.change ?? 0
+    const pct = live.change_pct ?? 0
+    return { lastPrice: live.price, change, pct, label: '实时', live: true as const }
+  }
+  const bar = barQuote.value
+  return bar ? { ...bar, live: false as const } : null
+})
+
+function shanghaiToday() {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date())
+}
+
+/** 把实时价合进日 K 最后一根，图表立刻显示「今天」 */
+function patchDailyBarWithLive(q: LiveQuote) {
+  if (!Number.isFinite(q.price) || !kline.klineList.length) return
+  const today = shanghaiToday()
+  const list = [...kline.klineList]
+  const last = list[list.length - 1]
+  const lastDate = String(last.date).slice(0, 10)
+  const price = Number(q.price)
+  const open = Number(q.open ?? (lastDate === today ? last.open : price))
+  const high = Math.max(Number(q.high ?? price), price, open)
+  const low = Math.min(Number(q.low ?? price), price, open)
+  const volume = q.volume != null ? Number(q.volume) : Number(last.volume || 0)
+  if (lastDate === today) {
+    list[list.length - 1] = {
+      ...last,
+      open: Number(last.open) || open,
+      high: Math.max(Number(last.high), high),
+      low: Math.min(Number(last.low), low),
+      close: price,
+      volume: volume || Number(last.volume || 0),
+      source: last.source || q.source || 'spot',
+    }
+  } else {
+    list.push({
+      date: today,
+      open,
+      high,
+      low,
+      close: price,
+      volume: volume || 0,
+      symbol: q.symbol || symbol.value,
+      source: q.source || 'spot',
+    })
+  }
+  kline.klineList = list
+}
+
+async function refreshLiveQuote(sym?: string) {
+  const s = sym || symbol.value
+  if (!s) return
+  try {
+    const { data } = await fetchLiveQuote(s)
+    if (data.code === 200 && data.data?.price != null) {
+      liveQuote.value = data.data
+      if (chartPeriod.value === 'daily') {
+        patchDailyBarWithLive(data.data)
+      }
+    }
+  } catch {
+    // 保留上一笔实时价；完全失败时仍可看日 K 报价
+  }
+}
+
+function startQuotePolling() {
+  stopQuotePolling()
+  void refreshLiveQuote()
+  quoteTimer = setInterval(() => {
+    void refreshLiveQuote()
+  }, QUOTE_POLL_MS)
+}
+
+function stopQuotePolling() {
+  if (quoteTimer) {
+    clearInterval(quoteTimer)
+    quoteTimer = null
+  }
+}
 
 const chartPeriod = computed(() => (kline.currentPeriod === 'weekly' ? 'weekly' : 'daily'))
 const displayKlines = computed(() =>
@@ -132,6 +225,8 @@ async function loadAll(sym: string) {
       return
     }
     await kline.switchSymbol(normalized)
+    liveQuote.value = null
+    startQuotePolling()
     try {
       await pattern.scanPatterns(normalized)
     } catch {
@@ -193,6 +288,11 @@ onMounted(async () => {
   if (isEtf.value) activeTab.value = 'pattern'
   loadAll(symbol.value)
 })
+
+onUnmounted(() => {
+  stopQuotePolling()
+})
+
 watch(symbol, (s) => {
   if (isEtfSymbol(s)) activeTab.value = 'pattern'
   loadAll(s)
@@ -226,7 +326,11 @@ watch(symbol, (s) => {
         >
           {{ watched ? '★ 已关注' : '☆ 关注' }}
         </button>
-        <span v-if="quote" :class="['quote-chip', quote.change > 0 ? 'up' : quote.change < 0 ? 'down' : 'flat']">
+        <span
+          v-if="quote"
+          :class="['quote-chip', quote.live ? 'live' : '', quote.change > 0 ? 'up' : quote.change < 0 ? 'down' : 'flat']"
+          :title="quote.live ? '盘中实时价（不写入日K）' : '日K最后收盘'"
+        >
           {{ quote.label }} {{ quote.lastPrice.toFixed(2) }}
           {{ formatQuoteChange() }}
         </span>
@@ -391,6 +495,7 @@ watch(symbol, (s) => {
 .quote-chip.up { color: #f5222d; background: #fff1f0; }
 .quote-chip.down { color: #52c41a; background: #f6ffed; }
 .quote-chip.flat { color: var(--text-secondary); }
+.quote-chip.live { box-shadow: inset 0 0 0 1px color-mix(in srgb, currentColor 35%, transparent); }
 .input-error { color: #f5222d; font-size: 13px; }
 .main-layout { display: grid; grid-template-columns: 1fr 320px; gap: var(--space-md); min-height: 500px; }
 .tech-narrative-slot { margin-top: var(--space-md); }

@@ -115,6 +115,27 @@ export const fetchKline = async (symbol: string, pageSize = 500, refresh = false
   return { data: checkApi(res) }
 }
 
+export interface LiveQuote {
+  symbol: string
+  price: number
+  prev_close?: number | null
+  change?: number | null
+  change_pct?: number | null
+  open?: number | null
+  high?: number | null
+  low?: number | null
+  volume?: number | null
+  quote_date?: string | null
+  source?: string
+  as_of?: string | null
+}
+
+export const fetchLiveQuote = (symbol: string) =>
+  api.get<ApiResponse<LiveQuote>>('/kline/quote', {
+    params: { symbol },
+    timeout: 15000,
+  })
+
 export const syncKline = async (symbol: string, force = true) => {
   const res = await api.post<ApiResponse<KlineSyncResult>>('/kline/sync', {
     symbol,
@@ -267,6 +288,52 @@ export const fetchSignals = (symbol?: string, status?: string, watchlistOnly = f
 
 export const confirmSignal = (signal_id: number, action: 'confirm' | 'dismiss') =>
   api.post<ApiResponse<SignalItem>>('/signals/confirm', { signal_id, action })
+
+export interface BottomFishingHit {
+  date: string
+  close: number
+  pct_chg: number | null
+  shrink_stabilize: boolean
+  yang_surge: boolean
+  labels: string[]
+}
+
+export interface BottomFishingLatest {
+  date: string
+  close: number
+  pct_chg: number | null
+  shrink_stabilize: boolean
+  yang_surge: boolean
+  bottom_signal: boolean
+  labels: string[]
+}
+
+export interface BottomFishingItem {
+  symbol: string
+  name: string
+  ok: boolean
+  message: string
+  has_signal?: boolean
+  hits: BottomFishingHit[]
+  latest: BottomFishingLatest | null
+}
+
+export interface BottomFishingResult {
+  lookback_days: number
+  scanned: number
+  hit_count: number
+  items: BottomFishingItem[]
+}
+
+export const fetchBottomFishing = (symbols: string[], lookbackDays = 5) =>
+  api.get<ApiResponse<BottomFishingResult>>('/signals/bottom-fishing', {
+    params: {
+      symbols: symbols.join(','),
+      lookback_days: lookbackDays,
+      only_hits: true,
+    },
+    timeout: 120000,
+  })
 
 export interface JobProgress {
   job_id?: string
@@ -799,17 +866,26 @@ export interface HighDividendItem {
   symbol: string
   name: string
   price?: number | null
+  avg_div_yield_3y?: number | null
   avg_div_yield_5y?: number | null
+  last_year_yield?: number | null
   consecutive_div_years?: number | null
   last_year_div?: number | null
+  payout_ratio?: number | null
+  roe?: number | null
+  ocf_to_np?: number | null
   pe_ttm?: number | null
   pb?: number | null
   market_cap?: number | null
   market_cap_yi?: number | null
+  passed?: boolean
+  fail_reasons?: string[]
 }
 
 export interface HighDividendReport {
   count: number
+  matched?: number
+  rejected?: number
   total_matched?: number
   scanned?: number
   universe?: string
