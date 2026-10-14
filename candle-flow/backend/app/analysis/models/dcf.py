@@ -22,8 +22,17 @@ class DCFModel:
         high_growth_rate: float,
         transition_growth_rate: float,
         shares_outstanding: float,
+        *,
+        growth_cap: float = 0.15,
     ) -> dict:
-        return self._calc(base_fcf, high_growth_rate, transition_growth_rate, shares_outstanding, scenario="neutral")
+        return self._calc(
+            base_fcf,
+            high_growth_rate,
+            transition_growth_rate,
+            shares_outstanding,
+            scenario="neutral",
+            growth_cap=growth_cap,
+        )
 
     def value_three_scenarios(
         self,
@@ -75,6 +84,7 @@ class DCFModel:
         scenario: str = "neutral",
         *,
         wacc_override: float | None = None,
+        growth_cap: float = 0.15,
     ) -> dict:
         wacc = wacc_override if wacc_override is not None else self.wacc
         if base_fcf <= 0 or shares_outstanding <= 0:
@@ -85,9 +95,10 @@ class DCFModel:
                 "is_reliable": False,
             }
 
-        # 限制增长率，避免乐观外推把估值打爆
-        high_growth_rate = min(max(float(high_growth_rate), 0.0), 0.15)
-        transition_growth_rate = min(max(float(transition_growth_rate), 0.0), 0.10)
+        # 限制增长率：中性默认 ≤15%；乐观高增情景可放宽到 25%
+        _cap = max(0.05, float(growth_cap))
+        high_growth_rate = min(max(float(high_growth_rate), 0.0), _cap)
+        transition_growth_rate = min(max(float(transition_growth_rate), 0.0), min(0.12, _cap * 0.6))
 
         if wacc <= self.terminal_growth:
             return {

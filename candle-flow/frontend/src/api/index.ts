@@ -921,7 +921,8 @@ export const fetchHighDividend = (params?: {
   api.get<ApiResponse<HighDividendReport>>('/fundamentals/high-dividend', {
     params: {
       universe: params?.universe ?? 'large_cap',
-      top: params?.top ?? 100,
+      // 默认拉全量缓存，前端本地名称搜索 + 分页
+      top: params?.top ?? 5000,
       limit: params?.limit,
       refresh: params?.refresh ?? false,
     },
@@ -1077,6 +1078,8 @@ export interface ComparableValuation {
   comparables: CompPeer[]
   avg_pe?: number | null
   avg_pb?: number | null
+  median_pe?: number | null
+  median_pb?: number | null
   valuation_range: {
     pe_based?: CompValRange
     pb_based?: CompValRange
@@ -1088,6 +1091,7 @@ export interface ComparableValuation {
     price?: number | null
   }
   signal?: string | null
+  reference_only?: boolean
   warning?: string | null
   peer_count?: number
   insufficient_sample?: boolean
@@ -1241,6 +1245,15 @@ export interface FundamentalAnalysisReport {
     pe_percentile_na?: string | null
     market_cap?: number | null
     dividend_yield?: number | null
+    pe_ttm_basis?: string | null
+    pe_ttm_note?: string | null
+    eps_normal?: number | null
+    eps_normal_lo?: number | null
+    eps_normal_hi?: number | null
+    pe_normal?: number | null
+    pe_normal_lo?: number | null
+    pe_normal_hi?: number | null
+    pe_normal_note?: string | null
   }
   warnings: string[]
   summary: string

@@ -175,7 +175,7 @@ def run_screen(body: ScreenRequest, db: Session = Depends(get_db)):
 @router.get("/fundamentals/high-dividend")
 def get_high_dividend(
     universe: str = Query(default="large_cap", pattern="^(large_cap|csi_div|all)$"),
-    top: int = Query(default=100, ge=1, le=500),
+    top: int = Query(default=5000, ge=1, le=6000),
     limit: int | None = Query(default=None, ge=1, le=500),
     refresh: bool = Query(default=False),
 ):

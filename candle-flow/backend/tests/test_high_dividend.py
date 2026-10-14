@@ -288,7 +288,8 @@ def test_scan_returns_computing_without_blocking(monkeypatch, tmp_path):
     hd.invalidate_cache()
 
 
-def test_scan_serves_stale_disk_and_schedules_refresh(monkeypatch, tmp_path):
+def test_scan_serves_stale_disk_without_auto_refresh(monkeypatch, tmp_path):
+    """过期缓存仍直接返回，不后台重扫；仅 refresh=True 才调度。"""
     hd.invalidate_cache()
     monkeypatch.setattr(hd, "_DISK_CACHE_DIR", tmp_path)
     key = f"{hd.CACHE_VERSION}:csi_div:None"
@@ -316,7 +317,13 @@ def test_scan_serves_stale_disk_and_schedules_refresh(monkeypatch, tmp_path):
     out = hd.scan_high_dividend(universe="csi_div", top=50, refresh=False)
     assert out["matched"] == 1
     assert out["stale"] is True
-    assert out["status"] == "refreshing"
+    assert out["cached"] is True
+    assert out["status"] == "ready"
+    assert scheduled["n"] == 0
+
+    out2 = hd.scan_high_dividend(universe="csi_div", top=50, refresh=True)
+    assert out2["matched"] == 1
+    assert out2["status"] == "refreshing"
     assert scheduled["n"] == 1
     hd.invalidate_cache()
 def test_large_cap_universe_filters_by_market_cap(monkeypatch):

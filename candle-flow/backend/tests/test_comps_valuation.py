@@ -6,9 +6,18 @@ import pandas as pd
 
 from app.analysis.models.comps import (
     calculate_comparable_valuation,
+    clean_comp_multiples,
     select_comparables,
     target_fundamentals,
 )
+
+
+def test_clean_comp_pe_drops_negative_and_extremes():
+    raw = [-100.61, -101.47, -63.26, 234.22, 167.19, 18.0, 22.0, 20.0, 19.0, 21.0]
+    cleaned = clean_comp_multiples(raw, abs_max=300.0)
+    assert all(v > 0 for v in cleaned)
+    assert all(v < 100 for v in cleaned)  # 234/167 相对中位被剔
+    assert 18.0 in cleaned and 22.0 in cleaned
 
 
 def test_target_fundamentals_from_fin_and_market():
@@ -159,8 +168,69 @@ def test_calculate_comparable_valuation_enough_peers(monkeypatch):
     )
     assert result["peer_count"] == 5
     assert result["insufficient_sample"] is False
-    assert result["avg_pe"] == 10.0
+    assert result["avg_pe"] == 10.0  # 中位数锚（样本全为 10）
+    assert result["median_pe"] == 10.0
+    assert result["pe_n_used"] == 5
     assert result["signal"] == "低估"
+    assert result["reference_only"] is False
+    assert result["valuation_range"]["pe_based"]["method"] == "median_iqr"
+
+
+def test_high_industry_pe_signal_downgraded_to_reference(monkeypatch):
+    """可比中位 PE>60：相对低估降级为「参考」，不单独支撑低估。"""
+    market = {
+        "symbol": "300251.SZ",
+        "price": 11.65,
+        "pe_ttm": 20.5,
+        "pb": 3.0,
+        "market_cap": 300e8,
+    }
+    meta = {
+        "symbol": "300251.SZ",
+        "industry": "影视动漫",
+        "latest_report": "20251231",
+        "name": "光线传媒",
+        "profit_yoy_extreme": False,
+    }
+    fin = pd.DataFrame(
+        [{"net_profit": 15e8, "net_assets": 80e8, "revenue": 40e8, "eps": 0.57, "roe": 18.0}],
+        index=["20251231"],
+    )
+    peers = [
+        {
+            "symbol": f"30025{i}.SZ",
+            "name": f"影视{i}",
+            "net_profit": 2e8,
+            "net_assets": 20e8,
+            "revenue": 10e8,
+            "eps": 0.2,
+            "roe": 8.0,
+        }
+        for i in range(1, 6)
+    ]
+    monkeypatch.setattr("app.analysis.models.comps._industry_peer_rows", lambda *a, **k: peers)
+    monkeypatch.setattr(
+        "app.analysis.models.comps._batch_quotes",
+        lambda symbols, db=None: {
+            s.upper(): {
+                "symbol": s,
+                "name": s,
+                "pe_ttm": 97.0,
+                "pb": 4.0,
+                "market_cap": 50e8,
+                "price": 20.0,
+            }
+            for s in symbols
+        },
+    )
+    result = calculate_comparable_valuation(
+        "300251.SZ", market=market, meta=meta, fin_df=fin, db=None
+    )
+    assert result["median_pe"] is not None and result["median_pe"] > 60
+    assert result["reference_only"] is True
+    assert result["signal"] in ("参考", "合理", "高估", None)
+    assert result["signal"] != "低估"
+    assert "可比中位PE" in (result.get("warning") or "")
 
 
 def test_annual_report_date_falls_back_for_interim():

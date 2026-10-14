@@ -224,7 +224,7 @@ onMounted(() => {
         <h1>大盘股基本面</h1>
         <p class="sub">
           与图表页「基本面」同源综合分。股票池：沪深 A 股全量（不设市值门槛），按 A / B / C / D / E 评级分组。
-          「全部」仅展示已评分；未评分点「未评」分页加载。
+          「全部」仅展示已评分；未评分点「未评」分页加载。股票池用缓存；后台自动打分已暂停，全量重算点「重新打分」。
         </p>
       </div>
       <button type="button" class="primary" :disabled="loading || isBuilding" @click="load(true)">
@@ -283,7 +283,7 @@ onMounted(() => {
       正在加载已评分榜单…
     </p>
     <p v-else-if="!loading && !totalListed && viewGrade !== 'pending'" class="muted">
-      暂无已评分数据，后台打分完成后自动刷新。
+      暂无已评分数据。后台自动打分已暂停，需要时请点「重新打分」。
     </p>
 
     <section

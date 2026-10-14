@@ -43,7 +43,8 @@ MIN_MARKET_CAP = 200e8  # 200 亿
 AVG_YIELD_YEARS = 3
 
 CSI_DIVIDEND_INDEX = "000922"
-CACHE_TTL_SEC = 6 * 3600
+# 软过期标记（仅影响 stale 展示）；有缓存时不因过期自动重扫，须点「重新筛选」
+CACHE_TTL_SEC = 7 * 24 * 3600
 CACHE_VERSION = "v14"  # ROE：近3年均≥8% + 最新≥6%
 UNIVERSES = ("large_cap", "csi_div", "all")
 DEFAULT_UNIVERSE = "large_cap"
@@ -1064,17 +1065,21 @@ def _save_disk(cache_key: str, data: dict[str, Any], ts: float | None = None) ->
 
 
 def _slice_report(data: dict[str, Any], top: int) -> dict[str, Any]:
+    """按 top 截断下发；top 很大时返回全量（前端可本地搜索/分页）。"""
     out = dict(data)
     items = list(out.get("items") or [])
     matched_all = sum(1 for it in items if it.get("passed"))
     rejected_all = len(items) - matched_all
-    top_n = max(1, min(int(top), 500))
-    passed = [it for it in items if it.get("passed")]
-    failed = [it for it in items if not it.get("passed")]
-    if len(passed) >= top_n:
-        shown = passed[:top_n]
+    top_n = max(1, min(int(top), 6000))
+    if top_n >= len(items):
+        shown = items
     else:
-        shown = passed + failed[: max(0, top_n - len(passed))]
+        passed = [it for it in items if it.get("passed")]
+        failed = [it for it in items if not it.get("passed")]
+        if len(passed) >= top_n:
+            shown = passed[:top_n]
+        else:
+            shown = passed + failed[: max(0, top_n - len(passed))]
     out["items"] = shown
     out["count"] = len(shown)
     out["matched"] = matched_all
@@ -1193,7 +1198,8 @@ def scan_high_dividend(
 ) -> dict[str, Any]:
     """HTTP 路径不阻塞全量 AkShare 扫描（避免 Cloudflare 524）。
 
-    - 内存/磁盘有结果：立刻返回；过期或 refresh 时后台单飞重算
+    - 内存/磁盘有完整结果：立刻返回，不因过期自动重扫（须 refresh=True）
+    - partial（深扫未完）：继续后台补齐
     - 冷启动无缓存：立刻返回 status=computing，后台计算，前端轮询
     """
     uni = universe if universe in UNIVERSES else DEFAULT_UNIVERSE
@@ -1225,23 +1231,23 @@ def scan_high_dividend(
             mem_data, mem_ts = disk_data, disk_ts
 
     fresh = mem_data is not None and (now - mem_ts) < CACHE_TTL_SEC
-    need_refresh = refresh or not fresh
 
     with _LOCK:
         prog = dict(_SCAN_PROGRESS)
 
     if mem_data is not None:
         partial = bool(mem_data.get("partial"))
-        if (need_refresh or partial) and not refreshing:
+        # 仅用户强制刷新，或深扫未完成时才后台重算；过期不自动扫
+        if (refresh or partial) and not refreshing:
             _schedule_refresh(cache_key, uni, lim)
             refreshing = True
         out = _slice_report(mem_data, top)
-        out["cached"] = fresh and not refresh and not partial
+        out["cached"] = (not refresh) and (not partial)
         out["stale"] = not fresh
         out["partial"] = partial
         out["status"] = (
             "refreshing"
-            if (need_refresh or refreshing or partial)
+            if (refresh or refreshing or partial)
             else "ready"
         )
         out["progress"] = prog

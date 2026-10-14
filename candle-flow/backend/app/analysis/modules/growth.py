@@ -296,9 +296,13 @@ class GrowthAnalyzer(BaseAnalyzer):
                     return 35.0, AnalysisLevel.POOR
 
             hist_score, _ = _growth_score(profit_cagr_3y)
-            fwd_score, fwd_level = _growth_score(fwd_growth)
-            # 加权：历史40% + 前瞻60%
-            combined = hist_score * 0.4 + fwd_score * 0.6
+            # 极端增速（|同比|>300）评分时按 ±300 封顶，避免 472% 与正常 20% 同得满分
+            fwd_for_score = max(-300.0, min(300.0, float(fwd_growth)))
+            fwd_score, fwd_level = _growth_score(fwd_for_score)
+            # 加权：默认历史40% + 前瞻60%；极端增速时前瞻权重降至 30%
+            _fwd_w = 0.30 if abs(float(fwd_growth)) > 300 else 0.60
+            _hist_w = 1.0 - _fwd_w
+            combined = hist_score * _hist_w + fwd_score * _fwd_w
 
             # ===== 周期底部修正：识别非经常性损益扰动 + 主动收缩 =====
             cyclical_note = ""
@@ -325,7 +329,7 @@ class GrowthAnalyzer(BaseAnalyzer):
                 # 1) 用扣非增速替代归母增速（权重 70/30）
                 adjusted_fwd = float(deducted_yoy) * 0.7 + fwd_growth * 0.3
                 adj_fwd_score, _ = _growth_score(adjusted_fwd)
-                combined = hist_score * 0.4 + adj_fwd_score * 0.6
+                combined = hist_score * _hist_w + adj_fwd_score * _fwd_w
                 # 2) Q2 环比改善加分（边际修复奖励，最多+10）
                 q2_bonus = min(float(q2_qoq) * 0.5, 10.0)
                 combined = min(95.0, combined + q2_bonus)
@@ -359,10 +363,12 @@ class GrowthAnalyzer(BaseAnalyzer):
             # 极端同比（基期接近0 / 并表 / 非经常性损益）只影响计分上限，不改写展示值
             extreme_note = ""
             if abs(float(fwd_growth)) > 300:
-                extreme_note = "；⚠️ 属极端增速，仅按±300%上限计分，不可线性外推"
+                extreme_note = (
+                    f"；⚠️ 属极端增速，按±300%上限计分且前瞻权重降至{_fwd_w:.0%}，不可线性外推"
+                )
                 warnings.append(
                     f"净利同比{fwd_growth:.1f}% 为极端值（低基数/并表/非经常性损益），"
-                    f"评分已按 300% 上限计分，不可按此线性外推下一年"
+                    f"评分已按 300% 上限计分、前瞻权重{_fwd_w:.0%}，不可按此线性外推下一年"
                 )
             indicators.append(
                 IndicatorResult(
@@ -374,8 +380,8 @@ class GrowthAnalyzer(BaseAnalyzer):
                     weight=1.5,
                     period=yoy_period,
                     comment=(
-                        f"历史3年CAGR {profit_cagr_3y:.1f}%（权重40%）+"
-                        f"前瞻 {fwd_growth:.1f}%（权重60%，{fwd_source}）"
+                        f"历史3年CAGR {profit_cagr_3y:.1f}%（权重{_hist_w:.0%}）+"
+                        f"前瞻 {fwd_growth:.1f}%（权重{_fwd_w:.0%}，{fwd_source}）"
                         f"= 综合{combined:.0f}分{accel_note}{cyclical_note}{extreme_note}"
                     ),
                 )

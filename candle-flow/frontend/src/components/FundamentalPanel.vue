@@ -31,9 +31,10 @@ const LEVEL_LABEL: Record<string, string> = {
   E: '危险',
 }
 
-/** 内在价值分类标签：周期 > 红利 > 成长 > 价值（后端 models.intrinsic 的 style） */
+/** 内在价值分类标签：周期 > 银行 > 红利 > 成长 > 价值 */
 const STYLE_LABEL: Record<string, string> = {
   cyclical: '周期（正常化利润 + PB-ROE 锚）',
+  bank: '银行（DDM 主锚 + PB-ROE 辅锚）',
   dividend: '红利（股息锚定）',
   growth: '成长（DCF）',
   value: '价值（DCF）',
@@ -203,7 +204,21 @@ function bullBearTone(view: string | undefined) {
           </div>
           <div v-if="report.market?.price" class="market">
             现价 {{ report.market.price?.toFixed(2) }}
-            <span v-if="report.market.pe_ttm"> · PE {{ report.market.pe_ttm?.toFixed(1) }}</span>
+            <span v-if="report.market.pe_ttm">
+              · PE {{ report.market.pe_ttm?.toFixed(1) }}
+              <template v-if="report.market.pe_ttm_basis">（{{ report.market.pe_ttm_basis }}）</template>
+            </span>
+            <span
+              v-if="report.market.pe_normal_lo != null && report.market.pe_normal_hi != null"
+            >
+              · 常态PE
+              {{ Math.min(report.market.pe_normal_lo, report.market.pe_normal_hi)?.toFixed(0) }}—{{
+                Math.max(report.market.pe_normal_lo, report.market.pe_normal_hi)?.toFixed(0)
+              }}
+            </span>
+            <span v-else-if="report.market.pe_normal != null">
+              · 常态PE {{ report.market.pe_normal?.toFixed(1) }}
+            </span>
             <span v-if="report.market.pe_percentile != null">
               · PE分位 {{ report.market.pe_percentile?.toFixed(0) }}%
             </span>
@@ -444,12 +459,12 @@ function bullBearTone(view: string | undefined) {
         <p v-if="report.valuation.comps.warning" class="muted">{{ report.valuation.comps.warning }}</p>
         <div class="comps-summary">
           <div>
-            <span class="k">可比均 PE</span>
-            <strong>{{ report.valuation.comps.avg_pe ?? '—' }}</strong>
+            <span class="k">可比中位 PE</span>
+            <strong>{{ report.valuation.comps.median_pe ?? report.valuation.comps.avg_pe ?? '—' }}</strong>
           </div>
           <div>
-            <span class="k">可比均 PB</span>
-            <strong>{{ report.valuation.comps.avg_pb ?? '—' }}</strong>
+            <span class="k">可比中位 PB</span>
+            <strong>{{ report.valuation.comps.median_pb ?? report.valuation.comps.avg_pb ?? '—' }}</strong>
           </div>
           <div v-if="report.valuation.comps.signal">
             <span class="k">相对现价</span>
@@ -535,8 +550,13 @@ function bullBearTone(view: string | undefined) {
           </p>
           <ul class="intrinsic-models muted">
             <li v-for="(m, k) in report.valuation.intrinsic_value.models" :key="k">
-              {{ k }} = {{ m.value }} 元<template v-if="m.reliable === false">
-                （不可信：已入池，但整体改取保守侧 min）</template>
+              <template v-if="k === 'ddm' && report.valuation.intrinsic_value.style === 'bank'">
+                DDM 主锚 = {{ m.value }} 元
+              </template>
+              <template v-else>
+                {{ k }} = {{ m.value }} 元<template v-if="m.reliable === false">
+                  （不可信：已入池，但整体改取保守侧 min）</template>
+              </template>
               <span v-if="m.note"> — {{ m.note }}</span>
             </li>
           </ul>
@@ -544,6 +564,25 @@ function bullBearTone(view: string | undefined) {
             分类依据：{{ report.valuation.intrinsic_value.style_reason }}
           </p>
         </template>
+        <p
+          v-if="report.valuation.intrinsic_value.auxiliary?.pb_roe"
+          class="muted"
+        >
+          PB-ROE 辅锚：
+          <template
+            v-if="
+              report.valuation.intrinsic_value.auxiliary.pb_roe.price_lo != null &&
+              report.valuation.intrinsic_value.auxiliary.pb_roe.price_hi != null
+            "
+          >
+            {{ report.valuation.intrinsic_value.auxiliary.pb_roe.price_lo }}–
+            {{ report.valuation.intrinsic_value.auxiliary.pb_roe.price_hi }} 元
+          </template>
+          <template v-else>
+            {{ report.valuation.intrinsic_value.auxiliary.pb_roe.value }} 元
+          </template>
+          — {{ report.valuation.intrinsic_value.auxiliary.pb_roe.reason }}
+        </p>
         <p
           v-if="report.valuation.intrinsic_value.auxiliary?.dividend_anchor"
           class="muted"
@@ -556,13 +595,16 @@ function bullBearTone(view: string | undefined) {
           v-if="report.valuation.intrinsic_value.auxiliary?.dcf"
           class="muted"
         >
-          高成长 DCF 对照（仅参考，不参与交叉/定价）：
+          DCF 对照（仅参考，不参与交叉/定价）：
           {{ report.valuation.intrinsic_value.auxiliary.dcf.value }} 元
           — {{ report.valuation.intrinsic_value.auxiliary.dcf.reason }}
         </p>
       </section>
 
-      <section v-if="report.valuation?.dcf" class="valuation card-inner">
+      <section
+        v-if="report.valuation?.dcf && report.valuation.dcf.role !== 'not_applicable_bank'"
+        class="valuation card-inner"
+      >
         <h4>
           DCF 内在价值
           <span class="muted" style="font-weight:500;font-size:12px">

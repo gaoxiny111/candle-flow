@@ -21,8 +21,14 @@ PB_MAX = 20.0
 CAP_DIFF_MAX = 0.5  # 市值偏离上限 50%
 CAP_DIFF_RELAXED = 1.0  # 样本不足时放宽到 100%
 DEFAULT_LIMIT = 8
-BAND = 0.10  # 估值区间上下浮动 10%
-MIN_PEER_SAMPLE = 5  # 少于该数则行业/可比估值显示 N/A
+BAND = 0.10  # 兜底：样本清洗后区间用四分位；不足时才 ±10%
+MIN_PEER_SAMPLE = 5  # 可比公司家数门槛（筛选侧）
+MIN_MULTIPLE_SAMPLE = 3  # 清洗后有效倍数样本；<3 则该口径不采信
+# 相对中位数的极端倍数闸：>3× 或 <0.3× 视为污染样本
+PE_MEDIAN_HI_MULT = 3.0
+PE_MEDIAN_LO_MULT = 0.3
+# 行业中位 PE 过高（低基数/普遍亏损清洗后）→ 相对估值仅参考，不单独出「低估」
+INDUSTRY_PE_REFERENCE_THRESHOLD = 60.0
 
 
 def _soft_industry_match(row_ind: str, target: str) -> bool:
@@ -74,6 +80,48 @@ def _yjbb_annual_candidates(report_date: str | None) -> list[str]:
     except ValueError:
         return [primary]
     return [f"{yy}1231" for yy in range(y, y - 4, -1)]
+
+
+def clean_comp_multiples(
+    values: list[float],
+    *,
+    abs_max: float,
+    lo_mult: float = PE_MEDIAN_LO_MULT,
+    hi_mult: float = PE_MEDIAN_HI_MULT,
+) -> list[float]:
+    """清洗可比倍数：剔非正/超绝对上限，再按相对中位数剔极端值。"""
+    pe = [float(v) for v in values if v is not None]
+    pe = [v for v in pe if v > 0 and v < float(abs_max)]
+    if len(pe) < 2:
+        return pe
+    med = float(np.median(pe))
+    if med <= 0:
+        return pe
+    cleaned = [v for v in pe if med * lo_mult <= v <= med * hi_mult]
+    # 清洗后过少则退回「仅剔非正」样本，避免过度清洗致空集
+    return cleaned if len(cleaned) >= MIN_MULTIPLE_SAMPLE else pe
+
+
+def _multiple_anchor(values: list[float]) -> dict[str, Any]:
+    """中位数锚 + 四分位区间；n_used < MIN_MULTIPLE_SAMPLE 时不可信。"""
+    n = len(values)
+    if n < MIN_MULTIPLE_SAMPLE:
+        return {
+            "anchor": None,
+            "lo": None,
+            "hi": None,
+            "n_used": n,
+            "credible": False,
+        }
+    arr = np.asarray(values, dtype=float)
+    lo, hi = np.percentile(arr, [25, 75])
+    return {
+        "anchor": float(np.median(arr)),
+        "lo": float(lo),
+        "hi": float(hi),
+        "n_used": n,
+        "credible": True,
+    }
 
 
 def _shares_from_market(market: dict[str, Any]) -> float | None:
@@ -345,7 +393,7 @@ def calculate_comparable_valuation(
     limit: int = DEFAULT_LIMIT,
 ) -> dict[str, Any]:
     """
-    步骤3–4：计算可比公司平均 PE/PB，并套算目标每股估值区间（±10%）。
+    步骤3–4：清洗可比 PE/PB → 中位数锚 + 四分位区间套算目标价。
     """
     target = target_fundamentals(stock_code, market=market, meta=meta, fin_df=fin_df)
     if not target:
@@ -354,9 +402,13 @@ def calculate_comparable_valuation(
             "comparables": [],
             "avg_pe": None,
             "avg_pb": None,
+            "median_pe": None,
+            "median_pb": None,
             "valuation_range": {},
             "warning": "目标公司基本面数据不足，无法套算可比估值",
             "peer_count": 0,
+            "pe_n_used": 0,
+            "pb_n_used": 0,
             "insufficient_sample": True,
         }
 
@@ -381,39 +433,74 @@ def calculate_comparable_valuation(
         peer_symbols=peer_symbols or None,
     )
 
-    valid_pe = [m["pe"] for m in comparables if m.get("pe") is not None and 0 < float(m["pe"]) < PE_MAX]
-    valid_pb = [m["pb"] for m in comparables if m.get("pb") is not None and 0 < float(m["pb"]) < PB_MAX]
-    avg_pe = float(np.mean(valid_pe)) if valid_pe else None
-    avg_pb = float(np.mean(valid_pb)) if valid_pb else None
+    raw_pe = [float(m["pe"]) for m in comparables if m.get("pe") is not None]
+    raw_pb = [float(m["pb"]) for m in comparables if m.get("pb") is not None]
+    clean_pe = clean_comp_multiples(raw_pe, abs_max=PE_MAX)
+    clean_pb = clean_comp_multiples(raw_pb, abs_max=PB_MAX)
+    pe_stat = _multiple_anchor(clean_pe)
+    pb_stat = _multiple_anchor(clean_pb)
+    # 兼容旧字段名 avg_*：语义已改为中位数锚（不再用 mean）
+    avg_pe = pe_stat["anchor"]
+    avg_pb = pb_stat["anchor"]
 
     valuation_range: dict[str, Any] = {}
     shares = target["total_shares"]
-    if avg_pe is not None and target["net_profit"] > 0 and shares > 0:
-        base = target["net_profit"] * avg_pe / shares
+    if pe_stat["credible"] and target["net_profit"] > 0 and shares > 0:
+        mid = target["net_profit"] * float(pe_stat["anchor"]) / shares
+        lo = target["net_profit"] * float(pe_stat["lo"]) / shares
+        hi = target["net_profit"] * float(pe_stat["hi"]) / shares
         valuation_range["pe_based"] = {
-            "mid": round(base, 2),
-            "low": round(base * (1 - BAND), 2),
-            "high": round(base * (1 + BAND), 2),
+            "mid": round(mid, 2),
+            "low": round(lo, 2),
+            "high": round(hi, 2),
+            "n_used": pe_stat["n_used"],
+            "method": "median_iqr",
         }
-    if avg_pb is not None and target.get("net_assets") and target["net_assets"] > 0 and shares > 0:
-        base = target["net_assets"] * avg_pb / shares
+    if (
+        pb_stat["credible"]
+        and target.get("net_assets")
+        and target["net_assets"] > 0
+        and shares > 0
+    ):
+        mid = target["net_assets"] * float(pb_stat["anchor"]) / shares
+        lo = target["net_assets"] * float(pb_stat["lo"]) / shares
+        hi = target["net_assets"] * float(pb_stat["hi"]) / shares
         valuation_range["pb_based"] = {
-            "mid": round(base, 2),
-            "low": round(base * (1 - BAND), 2),
-            "high": round(base * (1 + BAND), 2),
+            "mid": round(mid, 2),
+            "low": round(lo, 2),
+            "high": round(hi, 2),
+            "n_used": pb_stat["n_used"],
+            "method": "median_iqr",
         }
 
     warning = None
     peer_n = len(comparables)
-    insufficient = peer_n < MIN_PEER_SAMPLE
-    if insufficient:
+    pe_ok = pe_stat["credible"]
+    pb_ok = pb_stat["credible"]
+    # 公司家数不足，或清洗后 PE/PB 均不可信 → 整体不采信
+    insufficient = peer_n < MIN_PEER_SAMPLE or (not pe_ok and not pb_ok)
+    if peer_n < MIN_PEER_SAMPLE:
         warning = f"N/A（样本不足）：可比公司仅 {peer_n} 家，需至少 {MIN_PEER_SAMPLE} 家"
-        # 样本不足时不输出有误导性的均 PE/PB、信号与套算区间
         avg_pe = None
         avg_pb = None
         valuation_range = {}
         signal = None
+    elif not pe_ok and not pb_ok:
+        warning = (
+            f"样本不足，相对估值不采信：清洗后有效 PE {pe_stat['n_used']} / "
+            f"PB {pb_stat['n_used']}（需≥{MIN_MULTIPLE_SAMPLE}）"
+        )
+        avg_pe = None
+        avg_pb = None
+        valuation_range = {}
+        signal = None
+        insufficient = True
     else:
+        if not pe_ok:
+            warning = (
+                f"PE 套算不可信（清洗后有效样本 {pe_stat['n_used']}<{MIN_MULTIPLE_SAMPLE}），"
+                f"同行多为亏损/极端倍数；改看 PB/PS"
+            )
         price = target.get("price") or market.get("price")
         signal = None
         mid_candidates = [
@@ -422,7 +509,8 @@ def calculate_comparable_valuation(
             if k in valuation_range and valuation_range[k].get("mid") is not None
         ]
         if price and mid_candidates:
-            mid = float(np.mean(mid_candidates))
+            # 多锚时取中位数，避免单一污染口径带偏
+            mid = float(np.median(mid_candidates))
             if float(price) < mid * 0.9:
                 signal = "低估"
             elif float(price) > mid * 1.1:
@@ -431,6 +519,29 @@ def calculate_comparable_valuation(
                 signal = "合理"
 
     price = target.get("price") or market.get("price")
+
+    # 行业中位 PE 虚高（影视等低基数）：相对估值降级为「参考」，不得单独出低估
+    reference_only = False
+    if (
+        avg_pe is not None
+        and float(avg_pe) > INDUSTRY_PE_REFERENCE_THRESHOLD
+        and not insufficient
+    ):
+        reference_only = True
+        if signal == "低估":
+            signal = "参考"
+        _ref_msg = (
+            f"可比中位PE={float(avg_pe):.0f}>60，行业低基数/亏损清洗后常见虚高，"
+            f"相对估值仅作参考，不单独支撑低估结论"
+        )
+        warning = f"{warning}；{_ref_msg}" if warning else _ref_msg
+
+    # 爆款周期股（极端增速）：即使行业 PE 不高，相对低估也只能参考
+    if bool((meta or {}).get("profit_yoy_extreme")) and signal == "低估":
+        reference_only = True
+        signal = "参考"
+        _blk = "爆款/极端增速周期股：可比低估仅作参考，须看常态盈利兑现"
+        warning = f"{warning}；{_blk}" if warning else _blk
 
     return {
         "stock_code": stock_code,
@@ -448,6 +559,10 @@ def calculate_comparable_valuation(
         ],
         "avg_pe": round(avg_pe, 2) if avg_pe is not None else None,
         "avg_pb": round(avg_pb, 2) if avg_pb is not None else None,
+        "median_pe": round(avg_pe, 2) if avg_pe is not None else None,
+        "median_pb": round(avg_pb, 2) if avg_pb is not None else None,
+        "pe_n_used": int(pe_stat["n_used"]),
+        "pb_n_used": int(pb_stat["n_used"]),
         "valuation_range": valuation_range,
         "target": {
             "net_profit": target["net_profit"],
@@ -456,6 +571,7 @@ def calculate_comparable_valuation(
             "price": price,
         },
         "signal": signal,
+        "reference_only": reference_only,
         "warning": warning,
         "peer_count": peer_n,
         "peer_source": (

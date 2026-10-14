@@ -123,11 +123,121 @@ def check_dividend_coverage(
 class CashflowAnalyzer(BaseAnalyzer):
     """经营现金流含金量、自由现金流、资本开支压力、增长质量背离。"""
 
-    def _analyze_financial_lite(self, financial_data: pd.DataFrame, **kwargs) -> ModuleResult:
-        """金融/地产轻量口径：不评 FCF/分红 FCF 覆盖，避免制造业阈值误杀。"""
+    def _analyze_bank_dividend_sustainability(
+        self, financial_data: pd.DataFrame, **kwargs
+    ) -> ModuleResult:
+        """银行：现金流维改「分红可持续性」，不看 FCF/分红覆盖。"""
         indicators: list[IndicatorResult] = []
         warnings: list[str] = []
+        dy = kwargs.get("dividend_yield")
+        try:
+            dy_f = float(dy) if dy is not None else None
+        except (TypeError, ValueError):
+            dy_f = None
+        payout = kwargs.get("payout_ratio_pct")
+        try:
+            po_f = float(payout) if payout is not None else None
+        except (TypeError, ValueError):
+            po_f = None
+
+        # 股息率吸引力
+        if dy_f is not None and dy_f >= 3.2:
+            dy_score = 78.0 if dy_f < 4.5 else 88.0
+            dy_c = f"股息率{dy_f:.2f}%，分红来源为归母净利润，覆盖稳定"
+        elif dy_f is not None and dy_f >= 2.5:
+            dy_score = 65.0
+            dy_c = f"股息率{dy_f:.2f}%，尚可"
+        elif dy_f is not None:
+            dy_score = 50.0
+            dy_c = f"股息率{dy_f:.2f}%，偏薄"
+        else:
+            dy_score = 58.0
+            dy_c = "股息率缺失"
+        indicators.append(
+            IndicatorResult(
+                name="股息率(分红可持续)",
+                value=round(dy_f, 2) if dy_f is not None else 0.0,
+                score=dy_score,
+                level=score_to_level(dy_score),
+                weight=2.0,
+                comment=dy_c,
+            )
+        )
+
+        # 分红率稳定性（银行常态 30–45%）
+        if po_f is not None:
+            if 25 <= po_f <= 55:
+                po_score = 75.0
+                po_c = f"分红率{po_f:.1f}%处于银行常态区间，分红覆盖稳定"
+            elif 15 <= po_f < 25 or 55 < po_f <= 70:
+                po_score = 62.0
+                po_c = f"分红率{po_f:.1f}%，尚可跟踪"
+            else:
+                po_score = 48.0
+                po_c = f"分红率{po_f:.1f}%，偏离银行常态"
+            indicators.append(
+                IndicatorResult(
+                    name="分红覆盖率",
+                    value=round(po_f, 1),
+                    score=po_score,
+                    level=score_to_level(po_score),
+                    weight=1.5,
+                    comment=po_c,
+                )
+            )
+
+        fd = financial_data
+        ocf = fd.get("operating_cashflow", pd.Series(dtype=float))
+        net_profit = (
+            fd["net_profit"].replace(0, pd.NA)
+            if "net_profit" in fd.columns
+            else pd.Series(dtype=float)
+        )
+        if len(ocf.dropna()) and len(net_profit.dropna()):
+            cr = float(
+                (ocf / net_profit).replace([np.inf, -np.inf], np.nan).dropna().iloc[-1]
+            )
+            indicators.append(
+                IndicatorResult(
+                    name="经营现金流/净利润(银行参考)",
+                    value=round(cr, 2),
+                    score=58.0,
+                    level=AnalysisLevel.NEUTRAL,
+                    weight=0.5,
+                    comment=f"银行口径仅作参考（{cr:.2f}），不作 FCF 否决",
+                )
+            )
+
+        score = self._weighted_score(indicators) if indicators else 70.0
+        # 银行分红可持续性中枢约 70
+        score = max(55.0, min(82.0, float(score)))
+        warnings.append(
+            "银行现金流维已切换为「分红可持续性」：关闭通用 FCF/分红 FCF 覆盖"
+        )
+        return ModuleResult(
+            module_name="分红可持续性",
+            score=round(score, 1),
+            level=score_to_level(score),
+            indicators=indicators,
+            warnings=warnings,
+            metadata={
+                "paper_wealth": False,
+                "financial_lite": True,
+                "bank_dividend_sustainability": True,
+                "sector_kind": "bank",
+                "disable_generic_fcf": True,
+                "scoring_note": "银行：分红可持续性替代制造业现金流质量",
+            },
+        )
+
+    def _analyze_financial_lite(self, financial_data: pd.DataFrame, **kwargs) -> ModuleResult:
+        """金融/地产轻量口径：不评 FCF/分红 FCF 覆盖，避免制造业阈值误杀。"""
         kind = str(kwargs.get("sector_kind") or "financial")
+        if kind == "bank":
+            return self._analyze_bank_dividend_sustainability(financial_data, **kwargs)
+
+        indicators: list[IndicatorResult] = []
+        warnings: list[str] = []
         label = {
             "bank": "银行",
             "insurance": "保险",
@@ -340,8 +450,19 @@ class CashflowAnalyzer(BaseAnalyzer):
                     score_ratio = cash_ratio
                     cr_comment = ">1 利润含金量高，<0.5 警惕利润注水"
 
-                # 评分标准：>0.8=A档, 0.5-0.8=B档, 0.3-0.5=C档, <0.3=D档
-                score, level = self._score_by_range(score_ratio, (0.8, 5.0), (0.5, 0.8), (0.3, 0.5))
+                # 评分收紧（2026-10-14）：5年均值 0.51 不再给 75
+                # ≥1.0→85，0.6～1.0→70，0.4～0.6→55，更低按线性下探
+                if score_ratio >= 1.0:
+                    score, level = 85.0, AnalysisLevel.GOOD
+                elif score_ratio >= 0.6:
+                    score, level = 70.0, AnalysisLevel.GOOD
+                elif score_ratio >= 0.4:
+                    score, level = 55.0, AnalysisLevel.NEUTRAL
+                else:
+                    score, level = self._score_by_range(
+                        score_ratio, (0.8, 5.0), (0.5, 0.8), (0.3, 0.5)
+                    )
+                    score = min(score, 45.0)
                 if use_latest and cash_ratio < 0.4 and not is_anomaly:
                     # ── 年报修正锚：上年年报健康时，中报/季报低比值可能是阶段性现象 ──
                     # 战略备货（存货↑）+ 订单饱满（应收↑）导致现金流占用，≠利润注水
@@ -1039,53 +1160,92 @@ class CashflowAnalyzer(BaseAnalyzer):
         if len(ocf.dropna()) >= 3 and (ocf.iloc[-3:] < 0).all():
             warnings.append("经营现金流连续3期为负，造血能力严重不足")
 
-        # ── OCF 环比大幅改善（>100%）额外加分，>200% 加分更多 ──
+        # ── OCF 环比大幅改善：年报/半年报受项目回款节奏影响极大，封顶约 60 ──
         ocf_rebound_boost = 0.0
+        _period_key = str(latest_period or "").replace("-", "")
+        _period_is_annual = bool(_period_key) and _period_key.endswith("1231")
+        _period_is_semi = bool(_period_key) and _period_key.endswith("0630")
+        _period_is_slow = _period_is_annual or _period_is_semi
         if len(ocf.dropna()) >= 2:
             ocf_vals_rb = ocf.dropna().values
             prev_ocf = float(ocf_vals_rb[-2])
             curr_ocf = float(ocf_vals_rb[-1])
             if abs(prev_ocf) > 1e-6:
                 ocf_qoq = (curr_ocf - prev_ocf) / abs(prev_ocf)
-                if ocf_qoq > 3.0:
-                    ocf_rebound_boost = 10.0
+                if _period_is_slow and ocf_qoq > 1.0:
+                    _label = "年报" if _period_is_annual else "半年报"
+                    _neg = "；当期经营现金流仍为负，环比受回款节奏影响，不按高分" if curr_ocf < 0 else ""
                     indicators.append(
                         IndicatorResult(
-                            name="经营现金流环比大幅改善",
+                            name=f"经营现金流改善({_label})",
                             value=round(ocf_qoq * 100, 1),
-                            score=95.0,
-                            level=AnalysisLevel.GOOD,
+                            score=55.0 if curr_ocf < 0 else 60.0,
+                            level=AnalysisLevel.NEUTRAL,
                             trend="up",
-                            weight=1.0,
-                            comment=f"最新期经营现金流环比改善{ocf_qoq*100:.0f}%（>300%），造血能力强劲修复",
+                            weight=0.5,
+                            comment=(
+                                f"最新期为{_label}，相邻期对比非单季环比；"
+                                f"改善{ocf_qoq*100:.0f}%仅作弱参考，评分封顶约60"
+                                f"{_neg}"
+                            ),
                             period=latest_period,
                         )
                     )
-                elif ocf_qoq > 2.0:
-                    ocf_rebound_boost = 8.0
+                elif (not _period_is_slow) and ocf_qoq > 3.0:
+                    # 单季口径也收紧：幅度再大也约 60 分档，避免 678%→90 幻觉
+                    _sc = 52.0 if curr_ocf < 0 else 62.0
+                    ocf_rebound_boost = 4.0 if curr_ocf >= 0 else 0.0
                     indicators.append(
                         IndicatorResult(
                             name="经营现金流环比大幅改善",
                             value=round(ocf_qoq * 100, 1),
-                            score=95.0,
-                            level=AnalysisLevel.GOOD,
+                            score=_sc,
+                            level=AnalysisLevel.NEUTRAL,
                             trend="up",
-                            weight=1.0,
-                            comment=f"最新期经营现金流环比改善{ocf_qoq*100:.0f}%（>200%），造血能力强劲修复",
+                            weight=0.8,
+                            comment=(
+                                f"最新期经营现金流环比改善{ocf_qoq*100:.0f}%（>300%），"
+                                f"改善幅度受回款节奏扰动大，评分约60封顶"
+                                + ("；当期OCF仍为负" if curr_ocf < 0 else "")
+                            ),
                             period=latest_period,
                         )
                     )
-                elif ocf_qoq > 1.0:
-                    ocf_rebound_boost = 5.0
+                elif (not _period_is_slow) and ocf_qoq > 2.0:
+                    _sc = 50.0 if curr_ocf < 0 else 60.0
+                    ocf_rebound_boost = 3.0 if curr_ocf >= 0 else 0.0
                     indicators.append(
                         IndicatorResult(
                             name="经营现金流环比大幅改善",
                             value=round(ocf_qoq * 100, 1),
-                            score=90.0,
-                            level=AnalysisLevel.GOOD,
+                            score=_sc,
+                            level=AnalysisLevel.NEUTRAL,
                             trend="up",
-                            weight=1.0,
-                            comment=f"最新期经营现金流环比改善{ocf_qoq*100:.0f}%（>100%），造血能力显著修复",
+                            weight=0.8,
+                            comment=(
+                                f"最新期经营现金流环比改善{ocf_qoq*100:.0f}%（>200%），"
+                                f"评分约60封顶"
+                                + ("；当期OCF仍为负" if curr_ocf < 0 else "")
+                            ),
+                            period=latest_period,
+                        )
+                    )
+                elif (not _period_is_slow) and ocf_qoq > 1.0:
+                    _sc = 48.0 if curr_ocf < 0 else 58.0
+                    ocf_rebound_boost = 2.0 if curr_ocf >= 0 else 0.0
+                    indicators.append(
+                        IndicatorResult(
+                            name="经营现金流环比大幅改善",
+                            value=round(ocf_qoq * 100, 1),
+                            score=_sc,
+                            level=AnalysisLevel.NEUTRAL,
+                            trend="up",
+                            weight=0.7,
+                            comment=(
+                                f"最新期经营现金流环比改善{ocf_qoq*100:.0f}%（>100%），"
+                                f"评分约60封顶"
+                                + ("；当期OCF仍为负" if curr_ocf < 0 else "")
+                            ),
                             period=latest_period,
                         )
                     )

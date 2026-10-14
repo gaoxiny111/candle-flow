@@ -151,7 +151,7 @@ def test_classify_thresholds_usable_standalone():
     assert I.classify_intrinsic_style(
         row, cyclical_industries=NO_CYCLICALS
     ) == I.STYLE_GROWTH
-    assert I.STYLE_PRECEDENCE == ("cyclical", "dividend", "growth", "value")
+    assert I.STYLE_PRECEDENCE == ("cyclical", "bank", "dividend", "growth", "value")
 
 
 # ── 2. 四类模型 ─────────────────────────────────────────────────────────
@@ -287,11 +287,12 @@ def test_ddm_payout_gate_three_states():
 
 
 # ── 3. 交叉验证 ─────────────────────────────────────────────────────────
-def test_cross_validation_two_models_median():
+def test_cross_validation_growth_dcf_ddm_weighted():
+    """成长股双模型：中性DCF 60% + DDM 40% 加权；高增只抬区间上沿。"""
     o = I.compute_intrinsic_value(
         _row(industry="半导体", eps_ttm=1.2, profit_yoy=35.0, dividend_per_share=0.3,
              payout_ratio_pct=35.0),
-        dcf={"value": 52.0, "note": "DCF", "reliable": True},
+        dcf={"value": 52.0, "note": "DCF", "reliable": True, "dcf_high": 70.0},
         ddm={"value": 46.0, "note": "DDM", "reliable": True},
         is_dividend_asset=False,
         is_growth_stock=True,
@@ -299,13 +300,63 @@ def test_cross_validation_two_models_median():
     )
     assert o["cross_model"] is True
     assert o["model_count"] == 2
-    assert o["cross_basis"] == "median"
+    assert o["cross_basis"] == "weighted"
     assert o["conservative"] is False
     assert o["unreliable_models"] == []
-    assert o["intrinsic_value_per_share"] == pytest.approx(49.0)
-    assert o["margin_of_safety_pct"] == pytest.approx((49.0 / 10.0 - 1) * 100, abs=0.05)
-    assert "交叉验证" in o["note"]
+    expect = 52.0 * 0.6 + 46.0 * 0.4  # 49.6
+    assert o["intrinsic_value_per_share"] == pytest.approx(expect)
+    assert o["iv_lo"] == pytest.approx(46.0)
+    assert o["iv_hi"] == pytest.approx(70.0)  # 高增上沿
+    assert o["margin_of_safety_pct"] == pytest.approx((expect / 10.0 - 1) * 100, abs=0.05)
+    assert "交叉验证" in o["note"] and "加权" in o["note"]
     assert o["display_only"] is True
+
+
+def test_growth_high_growth_reference_dcf_stays_out_of_weighted_mid():
+    """成长股：高增情景 DCF 不入加权中枢；须用中性DCF入池。"""
+    o = I.compute_intrinsic_value(
+        _row(industry="电影", eps_ttm=0.3, profit_yoy=472.0, dividend_per_share=0.2,
+             payout_ratio_pct=40.0, price=20.0),
+        dcf={"value": 24.97, "note": "DCF", "reliable": False,
+             "role": "high_growth_reference"},
+        ddm={"value": 5.67, "note": "DDM", "reliable": True},
+        is_dividend_asset=False,
+        is_growth_stock=True,
+        cyclical_industries=CYCLICALS,
+    )
+    assert "dcf" not in o["models"]
+    assert "ddm" in o["models"]
+    assert o["cross_model"] is False
+    assert o["intrinsic_value_per_share"] == pytest.approx(5.67)
+    assert o["auxiliary"]["dcf"]["value"] == pytest.approx(24.97)
+    assert "不参与" in o["auxiliary"]["dcf"]["reason"]
+
+
+def test_growth_normal_dcf_weighted_with_high_as_range():
+    """成长股：中性DCF入池加权；高增仅区间上沿。"""
+    o = I.compute_intrinsic_value(
+        _row(industry="电影", eps_ttm=0.3, profit_yoy=472.0, dividend_per_share=0.2,
+             payout_ratio_pct=40.0, price=11.7),
+        dcf={
+            "value": 12.0,
+            "note": "中性DCF",
+            "reliable": True,
+            "role": "normal_growth",
+            "dcf_high": 24.97,
+        },
+        ddm={"value": 5.67, "note": "DDM", "reliable": True},
+        is_dividend_asset=False,
+        is_growth_stock=True,
+        cyclical_industries=CYCLICALS,
+    )
+    assert "dcf" in o["models"]
+    assert "ddm" in o["models"]
+    assert o["cross_basis"] == "weighted"
+    expect = 12.0 * 0.6 + 5.67 * 0.4
+    assert o["intrinsic_value_per_share"] == pytest.approx(expect, abs=0.02)
+    assert o["iv_lo"] == pytest.approx(5.67)
+    assert o["iv_hi"] == pytest.approx(24.97)
+    assert "dcf_high" in o["auxiliary"]
 
 
 def test_single_model_is_labeled_not_crossed():

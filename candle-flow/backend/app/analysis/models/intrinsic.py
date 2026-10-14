@@ -32,11 +32,10 @@
    不可信模型**不被剔除出池**（估值偏离、股本缺失等）：整条剔出去会丢掉交叉，
    按原值入中位数又会被无法外推的高值抬高 —— 取 min 两头都避开。
 
-   **例外（2026-10-09）**：引擎把营收同比 ≥30% 的 DCF 标成
-   ``role="high_growth_reference"`` 时，这份 DCF 是被增速上限压低的极端悲观
-   压力测试。它若入池再取 min，会把最终值拖到自己身上（工业富联一类）。
-   故只记入 ``auxiliary``，不参与交叉。池里若只剩可信 DDM，标明单模型；
-   DDM 也被分红率闸掉则返回 None，不用这份 DCF 兜底。
+   **例外（2026-10-09 / 2026-10-14 修订）**：``role="high_growth_reference"``
+   （高增/峰值情景 DCF）只记入 ``auxiliary`` 或乐观区间上沿，**永不入加权中枢**。
+   成长股主锚改用引擎注入的中性 DCF（常态增速≈8%）。池里若只剩可信 DDM，
+   标明单模型；DDM 也被分红率闸掉则返回 None，不用高增 DCF 兜底。
 
 单位约定（与项目其余模块一致，**全部用百分数**）
 ----------------------------------------------
@@ -60,28 +59,28 @@ import statistics
 from typing import Any
 
 STYLE_CYCLICAL = "cyclical"
+STYLE_BANK = "bank"
 STYLE_DIVIDEND = "dividend"
 STYLE_GROWTH = "growth"
 STYLE_VALUE = "value"
 
-# 分类优先级（一处可调）。
-# 注意：这里刻意采用「周期 > 红利 > 成长 > 价值」（2026-09-29 经确认保留，不回调
-# 为「红利 > 周期」），而 ``cyclical_profile.classify_cyclical_stock`` 的文档注释
-# 写的是「红利 > 周期 > 成长」、估值打分侧也是红利框架优先。两者只在
-# 「既是强周期行业、当年盈利又大幅波动、同时还是红利资产」这一交集上分歧；
-# 该交集正是股息锚最不可靠的场景：强周期行业在景气高点的股息率往往极高，
-# 但高分红来自**峰值利润**、现金流不可持续，按红利优先会被高股息率「骗」出
-# 虚高的内在价值。周期优先可先把它们按正常化利润 + PB-ROE 处理，股息锚至多
-# 作为辅助参考（见 ``compute_intrinsic_value`` 周期分支的兜底注释）。
-# 2026-09-29 定案：该优先级此前只在「|净利同比| > 30%」时才真正生效，导致强周期行业
-# 里盈利平稳的票整批漏进红利分支；现已**取消该闸** —— 行业命中即强制走周期框架
-# （``matched = cyclical_industry``），评分侧由 ``dividend_profile`` 的同源拦截保持一致。
+# 分类优先级：周期 > 银行 > 红利 > 成长 > 价值。
+# 银行必须在红利之前：农行类 3.5% 股息会漏进股息锚或价值 DCF，
+# 而通用 FCF-DCF 对存款类机构无定价意义。
 STYLE_PRECEDENCE: tuple[str, ...] = (
     STYLE_CYCLICAL,
+    STYLE_BANK,
     STYLE_DIVIDEND,
     STYLE_GROWTH,
     STYLE_VALUE,
 )
+
+# 银行 PB-ROE 辅锚：合理 PB ≈ ROE × 合理 PE（9–10x）；边际改善放宽上沿
+BANK_FAIR_PE_LO = 9.0
+BANK_FAIR_PE_HI = 10.0
+BANK_FAIR_PE_HI_IMPROVING = 11.0  # H1 净利同比改善时上沿
+BANK_DDM_REQUIRED_RETURN = 0.047  # 国债≈1.7% + 风险溢价 3.0%
+BANK_DDM_GROWTH = 0.02
 
 # ── 分类阈值 ────────────────────────────────────────────────────────────
 # **不再是周期身份的闸门**（2026-09-29 取消）：行业 ∈ STRONG_CYCLICAL_INDUSTRIES
@@ -126,6 +125,11 @@ DCF_HIGH_GROWTH_CAP = 0.30
 DCF_TRANSITION_CAP = 0.10
 DCF_HIGH_YEARS = 3
 DCF_MID_YEARS = 2
+# 成长/价值双模型交叉权重（成长主锚=中性DCF，高增DCF仅乐观上沿）
+GROWTH_WEIGHT_DCF = 0.6
+GROWTH_WEIGHT_DDM = 0.4
+VALUE_WEIGHT_DCF = 0.4
+VALUE_WEIGHT_DDM = 0.6
 
 
 # ── 小工具 ──────────────────────────────────────────────────────────────
@@ -153,12 +157,62 @@ def _engine_cyclical_industries() -> frozenset[str]:
 
 
 # ── 1. 分类 ─────────────────────────────────────────────────────────────
+def _is_bank_row(row: dict[str, Any]) -> bool:
+    if row.get("is_bank") is True:
+        return True
+    industry = str(row.get("industry") or "")
+    return "银行" in industry and not any(
+        k in industry for k in ("证券", "保险", "非银", "多元金融")
+    )
+
+
+def bank_pb_roe_anchors(row: dict[str, Any]) -> dict[str, Any]:
+    """银行 PB-ROE 辅锚：合理 PB ≈ ROE × 合理 PE；输出价格区间。
+
+    不参与加权中枢（中枢由 DDM 独占），只作对照区间。
+    """
+    bvps = _f(row.get("bvps"))
+    roe = _f(row.get("roe_ttm"))
+    profit_yoy = _f(row.get("profit_yoy"))
+    improving = profit_yoy is not None and profit_yoy >= 3.0
+    pe_lo = BANK_FAIR_PE_LO
+    pe_hi = BANK_FAIR_PE_HI_IMPROVING if improving else BANK_FAIR_PE_HI
+    pb_lo = pb_hi = price_lo = price_hi = None
+    if roe is not None and roe > 0:
+        pb_lo = round(roe / 100.0 * pe_lo, 3)
+        pb_hi = round(roe / 100.0 * pe_hi, 3)
+        if bvps is not None and bvps > 0:
+            price_lo = round(bvps * pb_lo, 2)
+            price_hi = round(bvps * pb_hi, 2)
+    mid = None
+    if price_lo is not None and price_hi is not None:
+        mid = round((price_lo + price_hi) / 2.0, 2)
+    return {
+        "roe_ttm_pct": roe,
+        "bvps": bvps,
+        "fair_pe_lo": pe_lo,
+        "fair_pe_hi": pe_hi,
+        "pb_lo": pb_lo,
+        "pb_hi": pb_hi,
+        "price_lo": price_lo,
+        "price_hi": price_hi,
+        "price_mid": mid,
+        "improving": improving,
+        "profit_yoy": profit_yoy,
+        "note": (
+            f"合理PB≈ROE×PE（{pe_lo:.0f}–{pe_hi:.0f}x）"
+            + ("；H1净利改善放宽上沿" if improving else "")
+        ),
+    }
+
+
 def classify_intrinsic_style_detail(
     row: dict[str, Any],
     *,
     is_dividend_asset: bool | None = None,
     is_growth_stock: bool | None = None,
     cyclical_industries: frozenset[str] | None = None,
+    is_bank: bool | None = None,
 ) -> dict[str, Any]:
     """返回 ``{"style", "reason", "matched"}``；三态缺失一律留痕不猜。
 
@@ -239,6 +293,18 @@ def classify_intrinsic_style_detail(
             ),
         }
 
+    # ①b 银行：禁用通用 FCF-DCF；DDM 主锚 + PB-ROE 辅锚
+    _bank = is_bank is True or (is_bank is None and _is_bank_row(row))
+    if _bank:
+        return {
+            "style": STYLE_BANK,
+            "matched": "bank_industry",
+            "reason": (
+                f"银行行业「{industry or '银行'}」→ DDM 主锚 + PB-ROE 辅锚；"
+                "通用 FCF-DCF（经营现金流−资本开支）对存款类机构无定价意义，已剔除"
+            ),
+        }
+
     # ② 红利：权威判定优先
     if is_dividend_asset is True:
         return {
@@ -300,13 +366,15 @@ def classify_intrinsic_style(
     is_dividend_asset: bool | None = None,
     is_growth_stock: bool | None = None,
     cyclical_industries: frozenset[str] | None = None,
+    is_bank: bool | None = None,
 ) -> str:
-    """分类入口，返回 ``cyclical`` / ``dividend`` / ``growth`` / ``value``。"""
+    """分类入口，返回 ``cyclical`` / ``bank`` / ``dividend`` / ``growth`` / ``value``。"""
     return classify_intrinsic_style_detail(
         row,
         is_dividend_asset=is_dividend_asset,
         is_growth_stock=is_growth_stock,
         cyclical_industries=cyclical_industries,
+        is_bank=is_bank,
     )["style"]
 
 
@@ -561,14 +629,24 @@ def intrinsic_value_dcf(row: dict[str, Any]) -> tuple[float | None, str]:
     )
 
 
-def ddm_payout_allows(payout_pct: float | None) -> bool:
+def ddm_payout_allows(
+    payout_pct: float | None,
+    *,
+    is_bank: bool = False,
+) -> bool:
     """DDM 适用性闸门（**唯一实现**）：分红率必须落在 [20%, 90%]。
 
     三态语义：``payout_pct is None`` → 不可得 → 返回 False（不判、不给结论），
     调用方须在 note 里体现「分红率不可得」而非当成「不适用」。
     过低（<20%）说明分红不稳定，过高（>90%）不具备可持续性。
+
+    银行例外：分红率缺失时仍允许（大行分红稳定、口径常滞后）；允许区间略宽。
     """
     p = _f(payout_pct)
+    if is_bank:
+        if p is None:
+            return True
+        return 10.0 <= p <= 95.0
     if p is None:
         return False
     return DDM_PAYOUT_MIN_PCT <= p <= DDM_PAYOUT_MAX_PCT
@@ -612,6 +690,7 @@ def compute_intrinsic_value(
     is_dividend_asset: bool | None = None,
     is_growth_stock: bool | None = None,
     cyclical_industries: frozenset[str] | None = None,
+    is_bank: bool | None = None,
 ) -> dict[str, Any]:
     """按 style 选模型 → 交叉验证 → 安全边际。
 
@@ -632,8 +711,10 @@ def compute_intrinsic_value(
     为什么一般不可信模型不剔除：估值偏离或股本缺失的 DCF 整条剔出去会丢掉
     交叉，按原值入中位数又会被无法外推的高值抬高。取 min 两头都避开。
 
-    ``role="high_growth_reference"`` 是例外：这份 DCF 被增速上限压低，取 min
-    会被低值拖垮。它只进 ``auxiliary``，不入 ``models``。
+    ``role="high_growth_reference"`` 是例外：高增/峰值情景只进 ``auxiliary``
+    与乐观区间上沿，不入 ``models`` 加权中枢。
+
+    银行：禁用 FCF-DCF；DDM 独占中枢；PB-ROE 只进 auxiliary 区间。
 
     DDM 候选（无论注入还是自算）一律受 ``ddm_payout_allows`` 分红率闸门约束。
     """
@@ -642,14 +723,18 @@ def compute_intrinsic_value(
         is_dividend_asset=is_dividend_asset,
         is_growth_stock=is_growth_stock,
         cyclical_industries=cyclical_industries,
+        is_bank=is_bank,
     )
     style = detail["style"]
     price = _f(row.get("price"))
+    bank_mode = style == STYLE_BANK
 
     models: dict[str, dict[str, Any]] = {}
     # 辅助参考（display_only，**不入 models、不参与交叉验证**）：
-    # 周期股的股息锚，以及营收高增时被标成压力测试的 DCF。
+    # 周期股的股息锚，高增/峰值情景 DCF，银行 PB-ROE。
     auxiliary: dict[str, Any] = {}
+    dcf_high_iv = _f((dcf or {}).get("dcf_high")) if dcf is not None else None
+    bank_pb_meta: dict[str, Any] | None = None
 
     def _put(name: str, value: Any, note: str | None, reliable: bool = True) -> None:
         v = _f(value)
@@ -669,37 +754,102 @@ def compute_intrinsic_value(
         }
 
     def _resolve_dcf() -> None:
-        """DCF 候选：注入优先（引擎那套真实 FCF 版），否则按简化式自算。
-
-        ``role="high_growth_reference"``（营收同比 ≥30%）的注入值是被增速上限
-        压低的压力测试，只进 auxiliary，避免取 min 时被它拖垮。
-        """
+        """DCF 候选：注入优先（引擎中性 DCF）；高增情景永不入池。"""
         if dcf is not None and _f(dcf.get("value")) is not None:
             if dcf.get("role") == "high_growth_reference":
                 _park(
                     "dcf",
                     dcf.get("value"),
                     dcf.get("note"),
-                    "营收高增的 DCF 为极端悲观压力测试，增速无法外推，"
-                    "只作对照、不参与交叉取值",
+                    "高增/峰值情景 DCF 仅作乐观对照，不参与交叉取值；"
+                    "成长股主锚请用中性 DCF（常态增速）",
                 )
                 return
-            _put("dcf", dcf.get("value"), dcf.get("note"), bool(dcf.get("reliable", True)))
+            if dcf.get("role") in (
+                "not_applicable_bank",
+                "not_applicable_dividend",
+                "not_applicable_cyclical",
+            ):
+                _park(
+                    "dcf",
+                    dcf.get("value"),
+                    dcf.get("note"),
+                    str(dcf.get("note") or "该 DCF 不适用当前风格，不参与交叉"),
+                )
+                return
+            note = dcf.get("note") or ""
+            if dcf.get("role") == "normal_growth":
+                note = (
+                    note
+                    + "；成长股主锚：中性DCF入池与DDM加权（DCF 60%/DDM 40%）"
+                )
+            _put("dcf", dcf.get("value"), note, bool(dcf.get("reliable", True)))
+            if dcf_high_iv is not None:
+                _park(
+                    "dcf_high",
+                    dcf_high_iv,
+                    "高增情景 DCF",
+                    "乐观高增情景，只作区间上沿、不入加权中枢",
+                )
             return
         v, n = intrinsic_value_dcf(row)
         _put("dcf", v, n)
 
     def _resolve_ddm() -> None:
         """DDM 候选：分红率闸门统一走 ddm_payout_allows（唯一实现，注入值同受闸门约束）。"""
-        if not ddm_payout_allows(row.get("payout_ratio_pct")):
+        if not ddm_payout_allows(row.get("payout_ratio_pct"), is_bank=bank_mode):
             return
         if ddm is not None and _f(ddm.get("value")) is not None:
             _put("ddm", ddm.get("value"), ddm.get("note"), bool(ddm.get("reliable", True)))
             return
+        # 银行独立运行：用银行口径 r/g
+        if bank_mode:
+            dps = _f(row.get("dividend_per_share"))
+            if dps is not None and dps > 0:
+                r, g = BANK_DDM_REQUIRED_RETURN, BANK_DDM_GROWTH
+                if r > g:
+                    v = dps * (1 + g) / (r - g)
+                    _put(
+                        "ddm",
+                        v,
+                        (
+                            f"银行DDM：DPS {dps:.2f} 元，r={r*100:.1f}%"
+                            f"（国债+风险溢价），g={g*100:.1f}%，价值≈{v:.2f} 元"
+                        ),
+                    )
+                    return
         v, n = intrinsic_value_ddm(row)
         _put("ddm", v, n)
 
-    if style == STYLE_DIVIDEND:
+    if style == STYLE_BANK:
+        _resolve_ddm()
+        bank_pb_meta = bank_pb_roe_anchors(row)
+        if bank_pb_meta.get("price_mid") is not None:
+            _lo = bank_pb_meta.get("price_lo")
+            _hi = bank_pb_meta.get("price_hi")
+            auxiliary["pb_roe"] = {
+                "value": bank_pb_meta["price_mid"],
+                "price_lo": _lo,
+                "price_hi": _hi,
+                "note": bank_pb_meta.get("note"),
+                "anchors": bank_pb_meta,
+                "reliable": False,
+                "reason": (
+                    f"银行 PB-ROE 辅锚 "
+                    f"{_lo}–{_hi} 元（不入加权中枢；中枢由 DDM 独占）"
+                ),
+            }
+        # 若误注入了 FCF-DCF，明确剔除说明
+        if dcf is not None and _f(dcf.get("value")) is not None:
+            if dcf.get("role") != "not_applicable_bank":
+                _park(
+                    "dcf",
+                    dcf.get("value"),
+                    dcf.get("note"),
+                    "通用 FCF-DCF 不适用于银行，已剔除",
+                )
+
+    elif style == STYLE_DIVIDEND:
         v, n = intrinsic_value_dividend(row)
         _put("dividend_anchor", v, n)
         _resolve_ddm()
@@ -762,44 +912,101 @@ def compute_intrinsic_value(
         }
 
     # 2026-09-29 修订：不可信模型不再被剔除出池，改为「入池但取保守侧」。
-    # 不可靠 ≠ 不能入池：整条剔出去会让高成长票退化成「只剩 DDM 的单模型」，
-    # 而按原值参与中位数又会用无法外推的高值抬高结果 —— 取 min 两头都避开。
+    # 2026-10-14：成长主锚=中性DCF（60%）+DDM（40%）；高增DCF只抬区间上沿。
     vals = [m["value"] for m in models.values()]
     unreliable = [k for k, m in models.items() if not m["reliable"]]
     cross = len(models) >= 2
+    iv_lo = min(vals) if vals else None
+    iv_hi = max(vals) if vals else None
+    # 乐观上沿：优先用高增情景，否则取池内 max
+    if dcf_high_iv is not None and dcf_high_iv > 0:
+        iv_hi = max(iv_hi or 0.0, dcf_high_iv)
+    elif "dcf_high" in auxiliary:
+        _hi = _f(auxiliary["dcf_high"].get("value"))
+        if _hi is not None:
+            iv_hi = max(iv_hi or 0.0, _hi)
 
-    if cross:
+    if (
+        cross
+        and style in (STYLE_GROWTH, STYLE_VALUE)
+        and "dcf" in models
+        and "ddm" in models
+        and not unreliable
+    ):
+        # 全部可信：成长中性 DCF 主锚 / 价值 DDM 主锚；区间下沿 DDM、上沿高增DCF
+        w_dcf = GROWTH_WEIGHT_DCF if style == STYLE_GROWTH else VALUE_WEIGHT_DCF
+        w_ddm = GROWTH_WEIGHT_DDM if style == STYLE_GROWTH else VALUE_WEIGHT_DDM
+        final = models["dcf"]["value"] * w_dcf + models["ddm"]["value"] * w_ddm
+        if style == STYLE_GROWTH:
+            iv_lo = models["ddm"]["value"]
+        cross_basis = "weighted"
+        note = (
+            f"交叉验证（{style}：中性DCF {w_dcf:.0%}+DDM {w_ddm:.0%} 加权 "
+            f"{final:.2f} 元；区间 {iv_lo:.2f}～{iv_hi:.2f}"
+            + ("，上沿为高增情景" if dcf_high_iv or "dcf_high" in auxiliary else "")
+            + "）"
+        )
+    elif cross:
         if unreliable:
             final = min(vals)          # 保守锚：宁可低估，不可被不可信的高值拉高
             cross_basis = "conservative"
             _unrel_label = "、".join(unreliable)
             note = (
                 f"交叉验证（含不可信模型 {_unrel_label}，取保守值 {final:.2f} 元；"
-                f"参与：{'+'.join(models)}）"
+                f"参与：{'+'.join(models)}；区间 {iv_lo:.2f}～{iv_hi:.2f}）"
             )
         else:
             final = statistics.median(vals)
             cross_basis = "median"
-            note = "交叉验证（" + "+".join(models) + f" 中位数 {final:.2f} 元）"
+            note = (
+                "交叉验证（" + "+".join(models)
+                + f" 中位数 {final:.2f} 元；区间 {iv_lo:.2f}～{iv_hi:.2f}）"
+            )
     else:
         only = next(iter(models))
         final = vals[0]
         cross_basis = None
-        note = f"单模型参考，未交叉（仅 {only}）"
-        if unreliable:
-            note += "；该模型被标记不可信，结果仅供参考"
-        if "dcf" in auxiliary:
-            note += (
-                f"；高成长 DCF {auxiliary['dcf']['value']:.2f} 元仅作对照，未入池"
+        if bank_mode and only == "ddm":
+            # 银行：文案明确是 DDM 主锚，不是「含不可信 DCF 的保守值」
+            _pb = auxiliary.get("pb_roe") or {}
+            _plo, _phi = _pb.get("price_lo"), _pb.get("price_hi")
+            if _plo is not None and _phi is not None:
+                iv_lo, iv_hi = float(_plo), float(_phi)
+            note = (
+                f"DDM 内在价值：{final:.2f} 元（银行主锚）；"
+                f"通用 FCF-DCF 不适用于银行，已剔除"
             )
+            if _plo is not None and _phi is not None:
+                note += f"；PB-ROE 辅锚：{_plo}–{_phi} 元"
+            if price and price > 0:
+                note += (
+                    f"；现价 {price:.2f} 元，DDM 安全边际 "
+                    f"{(final / price - 1) * 100:+.1f}%"
+                )
+        else:
+            note = f"单模型参考，未交叉（仅 {only}）"
+            if unreliable:
+                note += "；该模型被标记不可信，结果仅供参考"
+            if "dcf" in auxiliary:
+                note += (
+                    f"；高成长 DCF {auxiliary['dcf']['value']:.2f} 元仅作对照，未入池"
+                )
 
     margin = (final / price - 1) * 100 if price and price > 0 else None
     return {
         **base,
         "intrinsic_value_per_share": round(final, 2),
+        "iv_mid": round(final, 2),
+        "iv_lo": round(iv_lo, 2) if iv_lo is not None else None,
+        "iv_hi": round(iv_hi, 2) if iv_hi is not None else None,
+        "iv_range": (
+            [round(iv_lo, 2), round(iv_hi, 2)]
+            if iv_lo is not None and iv_hi is not None
+            else None
+        ),
         "cross_model": cross,
         "cross_basis": cross_basis,
-        "conservative": cross_basis == "conservative",
+        "conservative": cross_basis in ("conservative", "weighted_conservative"),
         "model_count": len(models),
         "models": {
             k: {

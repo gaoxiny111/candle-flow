@@ -31,6 +31,15 @@ WEIGHTS_FINANCIAL: dict[str, float] = {
     "valuation": 0.24,
 }
 
+# 银行专属：低增长是常态 → 成长降权；抬估值与分红可持续（现金流维）
+WEIGHTS_BANK: dict[str, float] = {
+    "profitability": 0.22,
+    "growth": 0.12,
+    "solvency": 0.24,
+    "cashflow": 0.16,  # 银行=分红可持续性
+    "valuation": 0.26,
+}
+
 # 地产：经营现金流仍重要，但少用制造业 FCF 否决
 WEIGHTS_PROPERTY: dict[str, float] = {
     "profitability": 0.18,
@@ -151,7 +160,7 @@ def resolve_sector_profile(
         return SectorProfile(
             kind="bank",
             label="银行",
-            weights=dict(WEIGHTS_FINANCIAL),
+            weights=dict(WEIGHTS_BANK),
             disable_generic_fcf=True,
             disable_roic_wacc_trap=True,
             soft_cashflow_veto=True,

@@ -13,7 +13,9 @@ import { useWatchlistStore } from '@/stores/watchlist'
 const watchlist = useWatchlistStore()
 
 const universe = ref<'large_cap' | 'csi_div' | 'all'>('large_cap')
-const top = ref(100)
+const pageSize = ref(50)
+const page = ref(1)
+const nameQuery = ref('')
 const loading = ref(false)
 const error = ref('')
 const report = ref<HighDividendReport | null>(null)
@@ -22,11 +24,32 @@ let loadGen = 0
 let pollTimer: ReturnType<typeof setTimeout> | null = null
 
 const allItems = computed(() => report.value?.items || [])
-const items = computed(() => {
-  const list = allItems.value
-  if (viewMode.value === 'passed') return list.filter((x) => x.passed)
-  if (viewMode.value === 'failed') return list.filter((x) => !x.passed)
+
+function matchesName(it: HighDividendItem, q: string): boolean {
+  if (!q) return true
+  const name = (it.name || '').toLowerCase()
+  const code = (it.code || '').toLowerCase()
+  const sym = (it.symbol || '').toLowerCase()
+  const plain = sym.replace(/\.(sh|sz|bj)$/i, '')
+  return name.includes(q) || code.includes(q) || sym.includes(q) || plain.includes(q)
+}
+
+const filteredItems = computed(() => {
+  const q = nameQuery.value.trim().toLowerCase()
+  let list = allItems.value
+  if (viewMode.value === 'passed') list = list.filter((x) => x.passed)
+  else if (viewMode.value === 'failed') list = list.filter((x) => !x.passed)
+  if (q) list = list.filter((x) => matchesName(x, q))
   return list
+})
+
+const totalPages = computed(() =>
+  Math.max(1, Math.ceil(filteredItems.value.length / pageSize.value) || 1),
+)
+
+const items = computed(() => {
+  const start = (page.value - 1) * pageSize.value
+  return filteredItems.value.slice(start, start + pageSize.value)
 })
 
 const matchedCount = computed(
@@ -61,6 +84,18 @@ const progressText = computed(() => {
   return '后台筛选中…'
 })
 
+const pageNumbers = computed(() => {
+  const total = totalPages.value
+  const cur = page.value
+  const window = 5
+  let start = Math.max(1, cur - Math.floor(window / 2))
+  let end = Math.min(total, start + window - 1)
+  start = Math.max(1, end - window + 1)
+  const nums: number[] = []
+  for (let i = start; i <= end; i++) nums.push(i)
+  return nums
+})
+
 function clearPoll() {
   if (pollTimer != null) {
     clearTimeout(pollTimer)
@@ -85,7 +120,7 @@ async function load(refresh = false, fromPoll = false) {
   try {
     const { data } = await fetchHighDividend({
       universe: universe.value,
-      top: top.value,
+      top: 5000,
       limit: universe.value === 'all' ? 200 : undefined,
       refresh,
     })
@@ -93,7 +128,6 @@ async function load(refresh = false, fromPoll = false) {
     report.value = data.data || null
     const status = report.value?.status
     if (status === 'computing' || status === 'refreshing') {
-      // 冷启动 / 后台重算：轮询直到 ready（避免 Cloudflare 524 长连接）
       schedulePoll(gen)
     } else {
       clearPoll()
@@ -128,8 +162,21 @@ function addWatch(it: HighDividendItem) {
   void watchlist.add(it.symbol)
 }
 
-watch([universe, top], () => {
+function goPage(p: number) {
+  page.value = Math.min(totalPages.value, Math.max(1, p))
+}
+
+watch(universe, () => {
+  page.value = 1
   void load(false)
+})
+
+watch([viewMode, nameQuery, pageSize], () => {
+  page.value = 1
+})
+
+watch(totalPages, (tp) => {
+  if (page.value > tp) page.value = tp
 })
 
 onMounted(() => {
@@ -144,7 +191,8 @@ onMounted(() => {
         <h1>高股息选股</h1>
         <p class="sub">
           命中须 PE ≤ 15 · PB ≤ 1.5（不满足仍展示为未命中）· 连续分红 3～5 年 · 近3年均息 ≥ 4% ·
-          近1年息 ≥ 3% · 支付率 30%～80% · 近3年ROE均 ≥ 8% · 最新ROE ≥ 6% · 经营现金流/净利 ≥ 0.8 · 市值 ≥ 200 亿
+          近1年息 ≥ 3% · 支付率 30%～80% · 近3年ROE均 ≥ 8% · 最新ROE ≥ 6% · 经营现金流/净利 ≥ 0.8 · 市值 ≥ 200 亿。
+          优先用缓存，不必每日更新；要重算再点「重新筛选」。
         </p>
       </div>
       <button type="button" class="primary" :disabled="loading || isBuilding" @click="load(true)">
@@ -161,9 +209,18 @@ onMounted(() => {
           <option value="all">沪深市值前 200（演示）</option>
         </select>
       </label>
+      <label class="search">
+        名称
+        <input
+          v-model="nameQuery"
+          type="search"
+          placeholder="名称 / 代码，如 洋河、002304"
+          autocomplete="off"
+        />
+      </label>
       <label>
-        条数
-        <select v-model.number="top">
+        每页
+        <select v-model.number="pageSize">
           <option :value="50">50</option>
           <option :value="100">100</option>
           <option :value="200">200</option>
@@ -201,7 +258,8 @@ onMounted(() => {
       <span>扫描 {{ report.scanned ?? '—' }}</span>
       <span class="ok">命中 {{ matchedCount }}</span>
       <span class="bad">未命中 {{ rejectedCount }}</span>
-      <span>展示 {{ items.length }}</span>
+      <span>筛选后 {{ filteredItems.length }}</span>
+      <span>本页 {{ items.length }}</span>
       <span>{{ report.pool_note || report.universe }}</span>
       <span v-if="report.cached">缓存</span>
       <span v-else-if="report.stale">旧缓存</span>
@@ -217,7 +275,15 @@ onMounted(() => {
       已用行情快照出榜，分红深扫进行中（{{ progressText || '…' }}），列表会自动补全。
     </p>
     <p v-else-if="!loading && !items.length" class="muted">
-      {{ viewMode === 'passed' ? '暂无命中标的。' : viewMode === 'failed' ? '暂无未命中标的。' : '暂无数据。' }}
+      {{
+        nameQuery.trim()
+          ? '无匹配名称/代码。'
+          : viewMode === 'passed'
+            ? '暂无命中标的。'
+            : viewMode === 'failed'
+              ? '暂无未命中标的。'
+              : '暂无数据。'
+      }}
     </p>
 
     <div v-if="items.length" class="table-wrap">
@@ -249,7 +315,7 @@ onMounted(() => {
             :key="it.symbol"
             :class="{ failed: !it.passed }"
           >
-            <td>{{ idx + 1 }}</td>
+            <td>{{ (page - 1) * pageSize + idx + 1 }}</td>
             <td>
               <span class="badge" :class="it.passed ? 'badge-ok' : 'badge-bad'">
                 {{ it.passed ? '命中' : '未命中' }}
@@ -290,6 +356,49 @@ onMounted(() => {
           </tr>
         </tbody>
       </table>
+    </div>
+
+    <div v-if="filteredItems.length > 0" class="pager">
+      <button type="button" class="pg-btn" :disabled="page <= 1" @click="goPage(page - 1)">
+        上一页
+      </button>
+      <button
+        v-if="pageNumbers[0] > 1"
+        type="button"
+        class="pg-btn"
+        @click="goPage(1)"
+      >
+        1
+      </button>
+      <span v-if="pageNumbers[0] > 2" class="pg-ellipsis">…</span>
+      <button
+        v-for="n in pageNumbers"
+        :key="n"
+        type="button"
+        class="pg-btn"
+        :class="{ active: n === page }"
+        @click="goPage(n)"
+      >
+        {{ n }}
+      </button>
+      <span v-if="pageNumbers[pageNumbers.length - 1] < totalPages - 1" class="pg-ellipsis">…</span>
+      <button
+        v-if="pageNumbers[pageNumbers.length - 1] < totalPages"
+        type="button"
+        class="pg-btn"
+        @click="goPage(totalPages)"
+      >
+        {{ totalPages }}
+      </button>
+      <button
+        type="button"
+        class="pg-btn"
+        :disabled="page >= totalPages"
+        @click="goPage(page + 1)"
+      >
+        下一页
+      </button>
+      <span class="pg-meta">第 {{ page }} / {{ totalPages }} 页 · 共 {{ filteredItems.length }} 条</span>
     </div>
 
     <ul v-if="report?.notes?.length" class="notes">
@@ -333,12 +442,16 @@ onMounted(() => {
   font-size: 0.9rem;
   color: var(--text-secondary);
 }
-.filters select {
+.filters select,
+.filters input {
   background: var(--bg-light);
   border: 1px solid var(--border-color);
   color: var(--text-primary);
   border-radius: 6px;
   padding: 0.3rem 0.5rem;
+}
+.filters .search input {
+  min-width: 12rem;
 }
 .view-tabs {
   display: inline-flex;
@@ -458,6 +571,40 @@ onMounted(() => {
   cursor: pointer;
   padding: 0;
 }
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+}
+.pg-btn {
+  border: 1px solid var(--border-color);
+  background: var(--bg-light);
+  color: var(--text-primary);
+  border-radius: 6px;
+  padding: 0.3rem 0.65rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+  min-width: 2rem;
+}
+.pg-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.pg-btn.active {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  color: #fff;
+}
+.pg-ellipsis {
+  color: var(--text-secondary);
+  padding: 0 0.15rem;
+}
+.pg-meta {
+  margin-left: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
 .notes {
   margin: 0;
   padding-left: 1.1rem;
@@ -468,6 +615,9 @@ onMounted(() => {
 @media (max-width: 768px) {
   .hd-head {
     flex-direction: column;
+  }
+  .filters .search input {
+    min-width: 8rem;
   }
 }
 </style>

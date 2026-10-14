@@ -40,7 +40,7 @@ from app.analysis.models.intrinsic import compute_intrinsic_value
 from app.analysis.models.relative import RelativeValuation
 from app.analysis.models.comps import calculate_comparable_valuation
 from app.analysis.modules.profitability import _estimate_wacc_pct
-from app.analysis.config.company_profiles import business_model_of
+from app.analysis.config.company_profiles import business_model_of, is_bank
 from app.analysis.modules.cashflow import CashflowAnalyzer
 from app.analysis.modules.efficiency import EfficiencyAnalyzer
 from app.analysis.modules.growth import GrowthAnalyzer
@@ -437,6 +437,9 @@ class FundamentalEngine:
                     sym, float(d0), float(price), float(market["dividend_yield"]),
                 )
 
+        # PE_TTM：亏损不输出负 PE；尽量与年报成长窗口对齐，避免「净利+472% vs PE−64」打架
+        self._sanitize_market_pe(market, meta, fin_df)
+
         symbol_roe = meta.get("latest_roe")
         if symbol_roe is None and not fin_df.empty and "roe" in fin_df.columns:
             symbol_roe = float(fin_df["roe"].iloc[-1])
@@ -561,6 +564,24 @@ class FundamentalEngine:
             meta["_growth_cagr_3y"] = _gm.metadata.get("profit_cagr_3y")
             meta["_growth_v_shape"] = bool(_gm.metadata.get("v_shape"))
             meta["_growth_marginal_recovery"] = bool(_gm.metadata.get("marginal_recovery"))
+            # 银行：最新期（常为 H1）净利同比改善应体现在成长分，避免只看年报低增速
+            if sector_early.kind == "bank":
+                _py = meta.get("profit_yoy")
+                try:
+                    _py_f = float(_py) if _py is not None else None
+                except (TypeError, ValueError):
+                    _py_f = None
+                if _py_f is not None and _py_f >= 3.0 and float(_gm.score) < 78.0:
+                    _lifted = min(78.0, max(float(_gm.score), float(_gm.score) + 5.0))
+                    if _lifted > float(_gm.score):
+                        _gm.score = round(_lifted, 1)
+                        _gm.level = score_to_level(_gm.score)
+                        _gm.metadata["bank_interim_yoy_lift"] = True
+                        _gm.metadata["bank_interim_profit_yoy"] = _py_f
+                        _gm.warnings.append(
+                            f"银行最新期净利同比+{_py_f:.2f}%已计入成长分"
+                            f"（低增长常态，权重已降；不可线性外推）"
+                        )
         # 净利率已在算 ctx 前由 fin_df 直接算出并透传（见上方 net_margin_pct），
         # 此处仅把百分数口径写回现金流 metadata 留痕，便于报告自证闸门判据。
         if cf is not None and net_margin_pct is not None:
@@ -669,6 +690,44 @@ class FundamentalEngine:
             return round(max(0.0, min(100.0, composite)), 1)
 
         composite = _compose(val_score)
+
+        # ── 短板惩罚：任一子项（含营运效率/行业/风险）<60 → 综合分封顶 <A ──
+        _has_d_grade = val_score < 60.0
+        for _mr in module_results.values():
+            if _mr is not None and float(_mr.score) < 60.0:
+                _has_d_grade = True
+                break
+        if _has_d_grade:
+            composite = min(composite, 79.9)
+
+        # ── 极端增速：风险预警与成长性联动，禁止风险维虚高满分稀释短板 ──
+        _yoy_raw = meta.get("profit_yoy")
+        _growth_extreme = bool(meta.get("profit_yoy_extreme")) or (
+            _yoy_raw is not None and abs(float(_yoy_raw)) > 300.0
+        )
+        if _growth_extreme:
+            _risk_mod = module_results["risk"]
+            _risk_s = float(_risk_mod.score)
+            _risk_capped = min(_risk_s, 75.0)
+            # 展示分与计入口径一致：雷达/模块列表显示封顶后的 75，不再并陈 100·A
+            if _risk_capped < _risk_s:
+                _risk_mod.score = _risk_capped
+                _risk_mod.level = score_to_level(_risk_capped)
+                _risk_mod.metadata["score_capped_at"] = 75.0
+                _risk_mod.metadata["score_cap_reason"] = "极端增速联动封顶75"
+                _risk_mod.metadata["score_raw_before_cap"] = _risk_s
+            composite = round(composite * 0.85 + _risk_capped * 0.15, 1)
+            if _has_d_grade:
+                composite = min(composite, 79.9)
+            all_warnings_pending = (
+                f"净利同比{float(_yoy_raw):+.0f}% 属极端增速，不可线性外推；"
+                f"风险预警已按75计入（展示分同步封顶）、综合分已短板封顶"
+                if _yoy_raw is not None
+                else "极端增速：风险预警已按75计入（展示分同步封顶）、综合分已短板封顶"
+            )
+            # 稍后并入 all_warnings（此处先挂 meta，避免前移声明）
+            meta["_growth_extreme_composite_note"] = all_warnings_pending
+
         letter = rating_label(composite)
 
         # ── 高成长保护：须利润含金量/现金转化尚可，防伪成长抬分 ──
@@ -708,6 +767,12 @@ class FundamentalEngine:
         all_warnings: list[str] = []
         for r in module_results.values():
             all_warnings.extend(r.warnings)
+        _ext_note = meta.pop("_growth_extreme_composite_note", None)
+        if _ext_note:
+            all_warnings.append(str(_ext_note))
+        _pe_note = meta.pop("_pe_align_warning", None)
+        if _pe_note:
+            all_warnings.append(str(_pe_note))
         # 模块间可能重复同一提示（如应收恶化），按原文去重保序
         _seen_w: set[str] = set()
         deduped: list[str] = []
@@ -930,6 +995,17 @@ class FundamentalEngine:
                 "pe_percentile_na": None if peer_sample_ok else "N/A（样本不足）",
                 "market_cap": market.get("market_cap"),
                 "dividend_yield": market.get("dividend_yield"),
+                "pe_ttm_basis": market.get("pe_ttm_basis"),
+                "pe_ttm_note": market.get("pe_ttm_note"),
+                "pe_ttm_annual_aligned": market.get("pe_ttm_annual_aligned"),
+                "pe_ttm_raw": market.get("pe_ttm_raw"),
+                "eps_normal": market.get("eps_normal"),
+                "eps_normal_lo": market.get("eps_normal_lo"),
+                "eps_normal_hi": market.get("eps_normal_hi"),
+                "pe_normal": market.get("pe_normal"),
+                "pe_normal_lo": market.get("pe_normal_lo"),
+                "pe_normal_hi": market.get("pe_normal_hi"),
+                "pe_normal_note": market.get("pe_normal_note"),
             },
             "warnings": all_warnings,
             "risk_level_label": risk_level_label,
@@ -1069,6 +1145,12 @@ class FundamentalEngine:
         is_div = bool(div_profile.get("is_dividend_asset"))
         result["dividend_profile"] = div_profile
         result["is_dividend_asset"] = is_div
+        _is_bank = is_bank(
+            str(meta.get("name") or market.get("name") or ""),
+            str(meta.get("symbol") or market.get("symbol") or ""),
+            str(meta.get("industry") or ""),
+        )
+        result["is_bank"] = _is_bank
 
         # ── 成长股/周期底部反转识别（用于估值框架切换） ──────────────
         # 这里只算 growth_stock_tier，不影响 value_trap_veto（那个在 run_full_analysis 前）
@@ -1223,7 +1305,108 @@ class FundamentalEngine:
             weights_list.append(weight)
             breakdown.append({"factor": factor, "points": round(points, 1), "detail": detail})
 
-        if is_div:
+        if _is_bank:
+            # 银行估值模板：股息吸引力 + PB + 相对同业（不用自身 PE 历史高分位误杀）
+            bank_w = {
+                "股息率吸引力": 0.40,
+                "绝对PB": 0.25,
+                "相对同业": 0.20,
+                "资本缓冲": 0.15,
+            }
+            # 1) 股息率
+            if div is not None:
+                dy = float(div)
+                if dy >= 4.5:
+                    dy_s, dy_d = 88.0, f"股息率{dy:.2f}%具备吸引力"
+                elif dy >= 3.2:
+                    dy_s, dy_d = 78.0, f"股息率{dy:.2f}%具备吸引力（银行高股息价值）"
+                elif dy >= 2.5:
+                    dy_s, dy_d = 65.0, f"股息率{dy:.2f}%尚可"
+                else:
+                    dy_s, dy_d = 45.0, f"股息率{dy:.2f}%偏薄"
+            else:
+                dy_s, dy_d = 55.0, "股息率缺失"
+            _add_points("股息率吸引力", dy_s, dy_d, weight=bank_w["股息率吸引力"])
+            # 2) 绝对 PB
+            if pb is not None and float(pb) > 0:
+                pbv = float(pb)
+                if pbv <= 0.75:
+                    pb_s = 86.0
+                elif pbv <= 0.95:
+                    pb_s = 76.0
+                elif pbv <= 1.15:
+                    pb_s = 62.0
+                else:
+                    pb_s = 45.0
+                _add_points("绝对PB", pb_s, f"PB={pbv:.2f}", weight=bank_w["绝对PB"])
+            # 3) 相对同业（PE/PB 中位）；历史自身分位只作文案，不进高权打分
+            peer_pe = (comps.get("median_pe") or comps.get("avg_pe")) if sample_ok else None
+            peer_pb = (comps.get("median_pb") or comps.get("avg_pb")) if sample_ok else None
+            rel_bits: list[str] = []
+            rel_s = 58.0
+            if pe is not None and peer_pe is not None and float(peer_pe) > 0:
+                rpe = float(pe) / float(peer_pe)
+                if rpe < 0.9:
+                    rel_s = 72.0
+                    rel_bits.append(f"PE相对行业略便宜（{float(pe):.1f}/{float(peer_pe):.1f}）")
+                elif rpe <= 1.15:
+                    rel_s = 58.0
+                    rel_bits.append(f"PE相对行业略贵/持平（{float(pe):.1f}/{float(peer_pe):.1f}）")
+                else:
+                    rel_s = 42.0
+                    rel_bits.append(f"PE相对行业偏贵（{float(pe):.1f}/{float(peer_pe):.1f}）")
+            if pb is not None and peer_pb is not None and float(peer_pb) > 0:
+                rpb = float(pb) / float(peer_pb)
+                if rpb > 1.05:
+                    rel_s = min(rel_s, 52.0)
+                    rel_bits.append(f"PB相对行业略贵（{float(pb):.2f}/{float(peer_pb):.2f}）")
+                elif rpb < 0.95:
+                    rel_s = max(rel_s, 68.0)
+                    rel_bits.append(f"PB相对行业略便宜")
+            if pe_pct is not None:
+                rel_bits.append(
+                    f"自身历史PE分位约{float(pe_pct):.0f}%（银行不作主扣分锚）"
+                )
+            _add_points(
+                "相对同业",
+                rel_s,
+                "；".join(rel_bits) or "同业样本不足",
+                weight=bank_w["相对同业"],
+            )
+            # 4) 资本缓冲（权益/总资产 vs 同业中位 8.06%）
+            from app.analysis.config.company_profiles import bank_benchmarks
+
+            _eq_med = float(bank_benchmarks().get("equity_ratio_pct") or 8.06)
+            _dr = meta.get("debt_ratio")
+            if _dr is not None:
+                _eq = 100.0 - float(_dr)
+                _diff = _eq - _eq_med
+                buf_s = max(40.0, min(78.0, 60.0 + _diff * 4.0))
+                buf_d = (
+                    f"权益/总资产{_eq:.2f}%（同业中位{_eq_med:.2f}%），"
+                    + ("资本缓冲偏低" if _diff < -0.5 else "资本缓冲尚可")
+                )
+            else:
+                buf_s, buf_d = 55.0, "资本缓冲数据缺失"
+            _add_points("资本缓冲", buf_s, buf_d, weight=bank_w["资本缓冲"])
+
+            base_score = round(
+                sum(s * w for s, w in zip(scores, weights_list)) / max(sum(weights_list), 1e-9),
+                1,
+            )
+            result["valuation_framework"] = "bank_ddm_pb_roe"
+            # 统一相对估值文案，避免「分位96%」与「分位10分」并陈误解
+            if "PE_TTM" in rel and pe is not None:
+                _msg = f"PE {float(pe):.1f}"
+                if pe_pct is not None:
+                    _msg += f"，自身历史分位约{float(pe_pct):.0f}%"
+                if peer_pe is not None:
+                    _msg += f"；行业中位{float(peer_pe):.2f}，相对行业不算便宜"
+                rel["PE_TTM"]["note"] = _msg
+                if pe_pct is not None:
+                    rel["PE_TTM"]["percentile_5y"] = float(pe_pct)
+
+        elif is_div:
             # 红利股估值框架：股息率利差 40% + 分红确定性 30%
             # + 自由现金流覆盖 20% + PE历史分位 10%（弱化历史分位噪音）
             div_factors = self._dividend_valuation_factors(
@@ -1329,6 +1512,16 @@ class FundamentalEngine:
                     anchor_added = True
                     _spread_added = True
             pe_pct_val = rel.get("PE_TTM", {}).get("percentile_5y")
+            # 爆款/极端增速：评分用常态 PE，避免年报峰值 EPS 把绝对 PE 打成「便宜」
+            _pe_anchor = pe
+            if (
+                market.get("pe_normal") is not None
+                and (
+                    meta.get("profit_yoy_extreme")
+                    or market.get("eps_blockbuster_excluded")
+                )
+            ):
+                _pe_anchor = market.get("pe_normal")
             if not anchor_added:
                 # 1. PE历史分位（权重50%）；周期锚数据全缺时回退此口径
                 if pe_pct_val is not None:
@@ -1344,27 +1537,64 @@ class FundamentalEngine:
                     else:
                         pe_pct_score = 10.0
                     _add_points("PE历史分位", pe_pct_score, f"分位{pp:.0f}%", weight=0.50)
-                elif pe is not None and 0 < float(pe):
-                    # 无历史分位时用绝对PE回退
-                    pv = float(pe)
+                elif _pe_anchor is not None and 0 < float(_pe_anchor):
+                    # 无历史分位时用绝对PE回退（极端增速用常态PE）
+                    pv = float(_pe_anchor)
+                    _pe_label = (
+                        f"常态PE={pv:.1f}"
+                        if _pe_anchor is not pe and pe is not None
+                        else f"PE={pv:.1f}"
+                    )
                     if pv < 12:
-                        _add_points("绝对PE", 88, f"PE={pv:.1f}<12（无分位数据）")
+                        _add_points("绝对PE", 88, f"{_pe_label}<12（无分位数据）")
                     elif pv < 20:
-                        _add_points("绝对PE", 65, f"PE={pv:.1f}（无分位数据）")
+                        _add_points("绝对PE", 65, f"{_pe_label}（无分位数据）")
+                    elif pv < 35:
+                        _add_points("绝对PE", 48, f"{_pe_label}（无分位数据）")
                     else:
-                        _add_points("绝对PE", 40, f"PE={pv:.1f}（无分位数据）")
-            # 2. 相对估值（权重30%）：PE / 同行中位数
-            peer_pe = comps.get("avg_pe") if sample_ok else None
-            if pe is not None and peer_pe is not None and float(peer_pe) > 0:
-                relative_pe = float(pe) / float(peer_pe)
+                        _add_points("绝对PE", 38, f"{_pe_label}（无分位数据）")
+            # 2. 相对估值（权重30%）：PE / 同行中位数；行业中位PE>60 自动降权
+            peer_pe = (
+                (comps.get("median_pe") or comps.get("avg_pe")) if sample_ok else None
+            )
+            _comps_ref_only = bool((comps or {}).get("reference_only")) or (
+                comps_signal == "参考"
+            )
+            if (
+                meta.get("profit_yoy_extreme")
+                and comps_signal == "低估"
+            ):
+                _comps_ref_only = True
+            if (
+                _pe_anchor is not None
+                and peer_pe is not None
+                and float(peer_pe) > 0
+                and not _comps_ref_only
+            ):
+                relative_pe = float(_pe_anchor) / float(peer_pe)
                 if relative_pe < 0.8:
                     rel_score = 80.0
                 elif relative_pe < 1.2:
                     rel_score = 50.0
                 else:
                     rel_score = 20.0
-                _add_points("相对PE", rel_score, f"PE/同行中位={relative_pe:.2f}", weight=0.30)
-            elif comps_signal:
+                _rel_w = 0.10 if float(peer_pe) > 60 else 0.30
+                _add_points(
+                    "相对PE",
+                    rel_score,
+                    f"PE/可比中位={relative_pe:.2f}"
+                    + (f"（可比中位PE={float(peer_pe):.0f}>60，已降权）" if _rel_w < 0.30 else ""),
+                    weight=_rel_w,
+                )
+            elif _comps_ref_only and peer_pe is not None:
+                _add_points(
+                    "相对PE",
+                    50.0,
+                    f"可比中位PE={float(peer_pe):.0f}，影视/低基数行业或爆款周期股"
+                    f"相对估值仅作参考，不单独出低估",
+                    weight=0.10,
+                )
+            elif comps_signal and comps_signal != "参考":
                 # 无可比中位数时用信号回退
                 if comps_signal == "低估":
                     _add_points("可比公司", 82, "相对可比低估")
@@ -1460,7 +1690,12 @@ class FundamentalEngine:
             total_w = sum(weights_list)
             base_score = sum(s * w for s, w in zip(scores, weights_list)) / total_w if total_w > 0 else 55.0
         rationale_parts: list[str] = []
-        if is_div:
+        if _is_bank:
+            rationale_parts.append(
+                "银行估值模板：股息率+PB+相对同业+资本缓冲；"
+                "自身PE历史高分位不作主扣分锚；整体合理偏低，非深度低估"
+            )
+        elif is_div:
             rationale_parts.append(
                 dividend_valuation_note(
                     dividend_yield_pct=div_profile.get("dividend_yield_pct"),
@@ -1608,34 +1843,36 @@ class FundamentalEngine:
 
         if not fin_df.empty:
             result["dcf"] = self._build_dcf(fin_df, market, meta)
-            # ── 高成长科技股：DCF 模型过于悲观，仅作极端压力测试参考 ──
-            revenue_yoy_v = meta.get("revenue_yoy")
-            if revenue_yoy_v is not None and float(revenue_yoy_v) >= 30:
+            # ── 银行：通用 FCF-DCF 无定价意义，强制剔除 ──
+            if _is_bank:
                 dcf_r = result["dcf"]
-                dcf_r["role"] = "high_growth_reference"
+                dcf_r["role"] = "not_applicable_bank"
+                dcf_r["suppressed"] = True
                 dcf_r["is_reliable"] = False
-                dcf_r["display_label"] = "DCF内在价值（极端悲观情景）"
-                iv_str = None
-                if dcf_r.get("intrinsic_value_per_share"):
-                    iv_str = f"{float(dcf_r['intrinsic_value_per_share']):.2f}元"
+                dcf_r["display_label"] = "通用DCF不适用于银行"
+                dcf_r["intrinsic_value_per_share"] = None
+                dcf_r["margin_of_safety_pct"] = None
                 dcf_r["note"] = (
-                    (dcf_r.get("note") or "")
-                    + f"；高成长科技股（营收增速>30%）DCF模型假设过于保守，"
-                    f"结果仅供参考，核心定价请参考相对估值（PEG/PS/可比公司）"
+                    "银行不适用通用 FCF-DCF（经营现金流−资本开支对存款类机构无定价意义）；"
+                    "内在价值请见 DDM 主锚 + PB-ROE 辅锚"
                 )
-                # DCF 权重降至 10%：高成长股以 PEG/PS/可比公司为主（占 90%）
+            # ── 高成长：主锚已是中性 DCF；评分侧仍避免被 DCF 安全边际单独拉低 ──
+            revenue_yoy_v = meta.get("revenue_yoy")
+            if (not _is_bank) and revenue_yoy_v is not None and float(revenue_yoy_v) >= 30:
+                dcf_r = result["dcf"]
+                # role 由 _build_dcf 标成 normal_growth（入池）或保留 high 仅在 dcf_high
+                if dcf_r.get("role") != "normal_growth":
+                    dcf_r["display_label"] = "DCF内在价值（高成长对照）"
                 if final_score < 55:
                     final_score = 60.0
                     result["composite_valuation_score"] = final_score
-                    # 只有当 PEG/成长补充因子真的进入了估值构成时才这么写，
-                    # 否则文案会声称「以 PEG/PS 为主」而构成里根本没有 PEG。
                     _bd = result.get("valuation_score_breakdown") or []
                     _has_peg = any("PEG" in str(b.get("factor") or "") for b in _bd)
-                    _note = "；高成长科技股 DCF 权重降至 10%"
+                    _note = "；高成长股估值以中性DCF×DDM交叉+相对估值为主"
                     _note += (
-                        "，以 PEG/PS/可比公司为主"
+                        "，PEG/PS 已纳入构成"
                         if _has_peg
-                        else "（PEG 未纳入本次构成：成长口径未确认，按核心三因子定价）"
+                        else "（PEG 未纳入本次构成：成长口径未确认）"
                     )
                     result["valuation_rationale"] = (
                         (result.get("valuation_rationale") or "") + _note
@@ -1646,7 +1883,7 @@ class FundamentalEngine:
             # 注意：此处**不清空** intrinsic_value_per_share —— 它仍是估值分
             # 「无相对估值信号」兜底路径（本函数末尾）的输入，清空会改变
             # composite_valuation_score，那是另一套口径流程。
-            elif _ind_anchor in STRONG_CYCLICAL_INDUSTRIES and not is_div:
+            elif (not _is_bank) and _ind_anchor in STRONG_CYCLICAL_INDUSTRIES and not is_div:
                 dcf_r = result["dcf"]
                 dcf_r["role"] = "not_applicable_cyclical"
                 dcf_r["suppressed"] = True
@@ -1657,14 +1894,13 @@ class FundamentalEngine:
                     "DCF 会被系统性高估），内在价值请见「周期正常化锚」"
                 )
 
-        # 红利资产：DDM（股利贴现）作为核心参考估值，替代 DCF
-        # 扩展：分红率>60% 的非红利股也构建 DDM 用于多模型交叉
+        # 红利/银行/高分红/成长：构建 DDM（银行必建，作主锚）
         payout_ratio_pct = meta.get("payout_ratio_pct")
         is_high_payout = (
             payout_ratio_pct is not None and float(payout_ratio_pct) >= 60
         )
-        if (is_div or is_high_payout) and not fin_df.empty:
-            result["ddm"] = self._build_ddm(market, meta)
+        if (_is_bank or is_div or is_high_payout or is_growth) and not fin_df.empty:
+            result["ddm"] = self._build_ddm(market, meta, bank_mode=_is_bank)
 
         # ── 内在价值：先分类 → 再选模型 → 最后交叉验证 ──────────────────
         # 与 composite_valuation_score（估值分）严格分离：本块是展示参考锚，
@@ -1681,6 +1917,7 @@ class FundamentalEngine:
             is_div=is_div,
             is_growth=is_growth,
             cycle_stats=_cycle_stats,
+            is_bank=_is_bank,
         )
         result["intrinsic_value"] = intrinsic
         # 旧键位保留（shape 已由「固定拼盘」改为「按 style 选模」）：
@@ -1702,12 +1939,12 @@ class FundamentalEngine:
         # 无相对估值信号时：仅用「可信」DCF 的安全边际粗估，避免默认 55 / 爆表估值污染分数
         dcf = result.get("dcf") or {}
         if not scores and dcf.get("intrinsic_value_per_share"):
-            # 高成长科技股：DCF 过于悲观，不给低分
+            # 高增情景对照：不单独用其安全边际打高分/低分
             if dcf.get("role") == "high_growth_reference":
                 result["composite_valuation_score"] = max(final_score, 60.0)
                 result["valuation_rationale"] = (
                     (result.get("valuation_rationale") or "")
-                    + "；高成长科技股以相对估值（PEG/PS/可比公司）为主，DCF 仅作参考"
+                    + "；高增情景 DCF 仅作对照，估值分不以该安全边际定锚"
                 )
             elif dcf.get("is_reliable"):
                 price = market.get("price")
@@ -1755,23 +1992,207 @@ class FundamentalEngine:
         return None, "缺失"
 
     @staticmethod
+    def _sanitize_market_pe(
+        market: dict[str, Any],
+        meta: dict[str, Any],
+        fin_df: pd.DataFrame,
+    ) -> None:
+        """亏损不输出负 PE；TTM 失真时尝试用最近年报 EPS 对齐成长窗口。
+
+        另算常态 EPS/PE：剔爆款峰值后中位，并在极端增速时并入 2026E 代理区间，
+        避免用「利润顶点年报」单独支撑低估结论。
+        """
+        pe_raw = market.get("pe_ttm")
+        price = market.get("price")
+        try:
+            pe_f = float(pe_raw) if pe_raw is not None else None
+        except (TypeError, ValueError):
+            pe_f = None
+        try:
+            price_f = float(price) if price is not None else None
+        except (TypeError, ValueError):
+            price_f = None
+
+        annual_eps, _ = FundamentalEngine._annual_eps_stats(fin_df, meta)
+        latest_report = str(meta.get("latest_report") or "")
+        pe_basis = "行情TTM"
+
+        if pe_f is not None and pe_f <= 0:
+            # 负/零 PE 无意义：先清空，再用年报 EPS 重算（若年报仍盈利）
+            market["pe_ttm"] = None
+            market["pe_ttm_raw"] = pe_f
+            if annual_eps is not None and annual_eps > 0 and price_f and price_f > 0:
+                market["pe_ttm"] = round(price_f / annual_eps, 2)
+                pe_basis = "年报EPS对齐"
+                market["pe_ttm_note"] = (
+                    f"滚动TTM为负（{pe_f:.1f}），已改用最近年报EPS={annual_eps:.3f}"
+                    f" 对齐成长窗口（报告期优先年报）"
+                )
+            else:
+                market["pe_ttm_note"] = (
+                    "净利窗口亏损，不输出负PE，改看PB/PS"
+                )
+                pe_basis = "无效(亏损)"
+        elif (
+            pe_f is not None
+            and pe_f > 0
+            and annual_eps is not None
+            and annual_eps > 0
+            and price_f
+            and price_f > 0
+            and latest_report
+            and not latest_report.endswith("1231")
+            and bool(meta.get("profit_yoy_extreme"))
+        ):
+            # 极端增速 + 非年报最新期：补一年报对齐 PE 供对照（主 pe_ttm 仍保留 TTM）
+            aligned = round(price_f / annual_eps, 2)
+            market["pe_ttm_annual_aligned"] = aligned
+            market["pe_ttm_note"] = (
+                f"净利窗口对齐提示：成长性多用年报口径，年报对齐PE={aligned:.1f}"
+                f"（行情TTM={pe_f:.1f}）"
+            )
+            pe_basis = "行情TTM+年报对照"
+
+        market["pe_ttm_basis"] = pe_basis
+
+        # ── 常态 EPS / PE（并列展示，评分优先用常态锚）──
+        normal = FundamentalEngine._estimate_eps_normal(fin_df, meta)
+        if normal and price_f and price_f > 0:
+            eps_n = normal["eps_normal"]
+            eps_lo = normal["eps_normal_lo"]
+            eps_hi = normal["eps_normal_hi"]
+            market["eps_normal"] = eps_n
+            market["eps_normal_lo"] = eps_lo
+            market["eps_normal_hi"] = eps_hi
+            market["eps_blockbuster_excluded"] = normal.get("eps_blockbuster_excluded")
+            if eps_n and eps_n > 0:
+                market["pe_normal"] = round(price_f / eps_n, 2)
+            if eps_hi and eps_hi > 0:
+                market["pe_normal_lo"] = round(price_f / eps_hi, 2)
+            if eps_lo and eps_lo > 0:
+                market["pe_normal_hi"] = round(price_f / eps_lo, 2)
+            pe_ann = market.get("pe_ttm") or market.get("pe_ttm_annual_aligned")
+            pe_n = market.get("pe_normal")
+            pe_n_lo = market.get("pe_normal_lo")
+            pe_n_hi = market.get("pe_normal_hi")
+            if pe_n is not None and pe_n_lo is not None and pe_n_hi is not None:
+                band = f"{min(pe_n_lo, pe_n_hi):.0f}—{max(pe_n_lo, pe_n_hi):.0f}"
+                market["pe_normal_note"] = (
+                    f"PE {pe_ann:.1f}（年报口径）并列 "
+                    f"PE {band}（常态/2026E口径，eps_normal={eps_n:.3f}）"
+                    if pe_ann is not None
+                    else f"PE {band}（常态/2026E口径，eps_normal={eps_n:.3f}）"
+                )
+                # 并入 pe_ttm_note，前端现有字段即可看到双口径
+                _extra = market["pe_normal_note"]
+                if market.get("pe_ttm_note"):
+                    if "常态" not in str(market["pe_ttm_note"]):
+                        market["pe_ttm_note"] = f"{market['pe_ttm_note']}；{_extra}"
+                else:
+                    market["pe_ttm_note"] = _extra
+
+        if market.get("pe_ttm_note"):
+            meta.setdefault("_pe_align_warning", market["pe_ttm_note"])
+
+    @staticmethod
+    def _annual_eps_list(fin_df: pd.DataFrame) -> list[float]:
+        """年报正 EPS 序列（按时间顺序）。"""
+        vals: list[float] = []
+        if fin_df is None or fin_df.empty or "eps" not in fin_df.columns:
+            return vals
+        for _, r in fin_df.iterrows():
+            rd = str(r.get("report_date") or "")
+            if rd and len(rd) >= 8 and not rd.endswith("1231"):
+                continue
+            try:
+                e = float(r.get("eps"))
+            except (TypeError, ValueError):
+                continue
+            if e == e and e > 0:
+                vals.append(e)
+        return vals
+
+    @staticmethod
+    def _estimate_eps_normal(
+        fin_df: pd.DataFrame, meta: dict
+    ) -> dict[str, Any] | None:
+        """常态 EPS：median([近年剔爆款, 2026E代理])。
+
+        无机构一致预期数据源时，极端增速/爆款年用 peak×0.45~0.55 作 2026E 代理
+        （对应光线类「峰值年报 EPS→常态约一半」的量级）。
+        """
+        vals = FundamentalEngine._annual_eps_list(fin_df)
+        if not vals:
+            try:
+                e = float(meta.get("eps")) if meta.get("eps") is not None else None
+            except (TypeError, ValueError):
+                e = None
+            if e is None or e <= 0:
+                return None
+            vals = [e]
+
+        peak = max(vals)
+        others = [e for e in vals if e < peak * 0.85]
+        med_rest = None
+        if others:
+            s = sorted(others)
+            med_rest = (
+                s[len(s) // 2]
+                if len(s) % 2
+                else (s[len(s) // 2 - 1] + s[len(s) // 2]) / 2.0
+            )
+        elif len(vals) >= 2:
+            s = sorted(vals[:-1])
+            med_rest = (
+                s[len(s) // 2]
+                if len(s) % 2
+                else (s[len(s) // 2 - 1] + s[len(s) // 2]) / 2.0
+            )
+        blockbuster = bool(
+            med_rest is not None and med_rest > 0 and peak >= 2.0 * med_rest
+        )
+        extreme = bool(meta.get("profit_yoy_extreme")) or blockbuster
+
+        sample: list[float] = []
+        if blockbuster:
+            sample.extend(e for e in vals if e < peak * 0.85)
+        else:
+            sample.extend(vals[-4:])
+        if extreme:
+            # 2026E 代理区间（无一致预期时）
+            sample.append(peak * 0.45)
+            sample.append(peak * 0.55)
+        sample = [e for e in sample if e > 0]
+        if not sample:
+            sample = list(vals)
+
+        s = sorted(sample)
+        if len(s) % 2:
+            eps_normal = s[len(s) // 2]
+        else:
+            eps_normal = (s[len(s) // 2 - 1] + s[len(s) // 2]) / 2.0
+
+        if extreme:
+            eps_lo = peak * 0.44
+            eps_hi = peak * 0.56
+        else:
+            eps_lo = min(sample)
+            eps_hi = max(sample)
+
+        return {
+            "eps_normal": round(eps_normal, 4),
+            "eps_normal_lo": round(min(eps_lo, eps_normal), 4),
+            "eps_normal_hi": round(max(eps_hi, eps_normal), 4),
+            "eps_blockbuster_excluded": blockbuster,
+            "eps_annual_peak": round(peak, 4),
+        }
+
+    @staticmethod
     def _annual_eps_stats(
         fin_df: pd.DataFrame, meta: dict
     ) -> tuple[float | None, float | None]:
         """从年报序列取最近全年 EPS 与近 5 年中位数（供周期锚，避开中报累计）。"""
-        vals: list[float] = []
-        if fin_df is not None and not fin_df.empty and "eps" in fin_df.columns:
-            # fin_df 由年报 yjbb 堆成时，每行即一年；若带 report_date 则只取 1231
-            for _, r in fin_df.iterrows():
-                rd = str(r.get("report_date") or "")
-                if rd and len(rd) >= 8 and not rd.endswith("1231"):
-                    continue
-                try:
-                    e = float(r.get("eps"))
-                except (TypeError, ValueError):
-                    continue
-                if e == e and e > 0:
-                    vals.append(e)
+        vals = FundamentalEngine._annual_eps_list(fin_df)
         if not vals:
             return None, None
         latest = vals[-1]
@@ -1795,6 +2216,7 @@ class FundamentalEngine:
         is_div: bool,
         is_growth: bool,
         cycle_stats: dict[str, Any] | None,
+        is_bank: bool = False,
     ) -> dict[str, Any]:
         """把引擎已有数据组装成 row，交给 `models.intrinsic`（分类/选模/交叉）。
 
@@ -1896,23 +2318,31 @@ class FundamentalEngine:
             # growth_score 此处不注入：引擎传的是权威 is_growth_stock，
             # 模块自带的 growth_score 阈值只服务于独立运行/单测。
             "growth_score": None,
+            "is_bank": bool(is_bank),
         }
 
         # ── 注入引擎已有的 DCF / DDM，避免同一份模型在本仓算两遍（铁律10）──
         dcf_obj = result.get("dcf") or {}
         dcf_value = dcf_obj.get("intrinsic_value_per_share")
         dcf_reliable = bool(dcf_obj.get("is_reliable"))
+        dcf_high_v = dcf_obj.get("dcf_high") or dcf_obj.get("scenario_optimistic")
         dcf_payload = None
-        if dcf_value is not None:
+        if dcf_obj.get("role") == "not_applicable_bank":
+            dcf_payload = {
+                "value": None,
+                "note": dcf_obj.get("note"),
+                "reliable": False,
+                "role": "not_applicable_bank",
+            }
+        elif dcf_value is not None:
             _note = (
                 f"三阶段 DCF（真实 FCF 口径：{dcf_obj.get('fcf_source') or '未知'}；"
                 f"股本来源：{dcf_obj.get('shares_source') or '未知'}）"
             )
-            if dcf_obj.get("role") == "high_growth_reference":
-                _note += (
-                    "；营收高增 DCF 为极端悲观压力测试，"
-                    "只作对照、不参与内在价值交叉"
-                )
+            if dcf_obj.get("role") == "normal_growth":
+                _note += "；中性DCF（常态增速≈8%）入池；高增情景仅乐观区间上沿"
+            elif dcf_obj.get("role") == "high_growth_reference":
+                _note += "；高增/峰值情景 DCF 只作对照，不参与加权中枢"
             elif not dcf_reliable:
                 _note += (
                     "；该 DCF 已被标记不可信（估值偏离或股本缺失），"
@@ -1923,6 +2353,7 @@ class FundamentalEngine:
                 "note": _note,
                 "reliable": dcf_reliable,
                 "role": dcf_obj.get("role"),
+                "dcf_high": dcf_high_v,
             }
 
         ddm_obj = result.get("ddm") or {}
@@ -1933,12 +2364,15 @@ class FundamentalEngine:
                 break
         ddm_payload = None
         if ddm_value is not None:
+            _ddm_note = (
+                f"DDM 戈登中性情景（D0={ddm_obj.get('d0')} 元，"
+                f"{ddm_obj.get('d0_source') or '来源未知'}）"
+            )
+            if ddm_obj.get("bank_mode"):
+                _ddm_note += "；银行口径 r=4.7%、g=2%"
             ddm_payload = {
                 "value": ddm_value,
-                "note": (
-                    f"DDM 戈登中性情景（D0={ddm_obj.get('d0')} 元，"
-                    f"{ddm_obj.get('d0_source') or '来源未知'}）"
-                ),
+                "note": _ddm_note,
                 "reliable": True,
             }
 
@@ -1949,6 +2383,7 @@ class FundamentalEngine:
             is_dividend_asset=is_div,
             is_growth_stock=is_growth,
             cyclical_industries=STRONG_CYCLICAL_INDUSTRIES,
+            is_bank=is_bank,
         )
         out["bvps_source"] = bvps_src
         out["eps_normalized_source"] = (
@@ -2432,10 +2867,13 @@ class FundamentalEngine:
             "PE/PB分位": {"score": pct_score, "detail": pct_detail},
         }
 
-    def _build_ddm(self, market: dict, meta: dict) -> dict[str, Any]:
+    def _build_ddm(
+        self, market: dict, meta: dict, *, bank_mode: bool = False
+    ) -> dict[str, Any]:
         """
-        DDM（戈登股利贴现模型）三情景估值，仅红利资产调用。
+        DDM（戈登股利贴现模型）三情景估值。
         D0 取 meta["dividend"]["d0"]（真实每股分红），回退 股息率×股价。
+        银行中性情景：r=4.7%（国债1.7%+溢价3%）、g=2%。
         """
         div_info = meta.get("dividend") or {}
         d0 = div_info.get("d0")
@@ -2452,16 +2890,25 @@ class FundamentalEngine:
                     "scenarios": [],
                     "current_price": price,
                     "note": "D0 数据缺失，跳过 DDM",
+                    "bank_mode": bank_mode,
                 }
         else:
             d0 = float(d0)
             d0_src = f"分红历史（{div_info.get('fy', '')}年度）"
 
-        scenarios_def = [
-            ("保守", 0.02, 0.08),
-            ("中性", 0.03, 0.07),
-            ("乐观", 0.03, 0.065),
-        ]
+        if bank_mode:
+            # 保守/中性/乐观：银行高股息价值口径（中性对齐国债+3%溢价）
+            scenarios_def = [
+                ("保守", 0.015, 0.055),
+                ("中性", 0.020, 0.047),
+                ("乐观", 0.025, 0.042),
+            ]
+        else:
+            scenarios_def = [
+                ("保守", 0.02, 0.08),
+                ("中性", 0.03, 0.07),
+                ("乐观", 0.03, 0.065),
+            ]
         scenarios: list[dict[str, Any]] = []
         for name, g, r in scenarios_def:
             model = DDMModel(required_return=r, terminal_growth=g)
@@ -2485,17 +2932,26 @@ class FundamentalEngine:
         # 写死「2026 中期已派 0.98 元（分红比例 74%）、EPS 中枢 2.86-3.15 元、
         # 前瞻股息率约 5.5%-6%」，对**任何**走 DDM 的红利股都输出同一串数字
         # （不参与打分、只做展示，但会误导）。已删除。宁可少一句，不臆造。
+        if bank_mode:
+            _note = (
+                f"D0={d0:.2f}元（{d0_src}）；银行DDM："
+                "中性 r=4.7%（国债1.7%+溢价3%）、g=2%；"
+                "保守 g1.5%/r5.5%、乐观 g2.5%/r4.2%"
+            )
+        else:
+            _note = (
+                f"D0={d0:.2f}元（{d0_src}）；"
+                "戈登模型 V=D0(1+g)/(r−g)；"
+                "保守 g2%/r8%、中性 g3%/r7%、乐观 g3%/r6.5%"
+            )
         return {
             "model": "DDM",
             "d0": round(d0, 2),
             "d0_source": d0_src,
             "scenarios": scenarios,
             "current_price": price,
-            "note": (
-                f"D0={d0:.2f}元（{d0_src}）；"
-                "戈登模型 V=D0(1+g)/(r−g)；"
-                "保守 g2%/r8%、中性 g3%/r7%、乐观 g3%/r6.5%"
-            ),
+            "bank_mode": bank_mode,
+            "note": _note,
         }
 
     def _build_dcf(self, fin_df: pd.DataFrame, market: dict, meta: dict) -> dict[str, Any]:
@@ -2588,38 +3044,66 @@ class FundamentalEngine:
         else:
             terminal = 0.02
 
-        # 高成长科技股用三情景DCF，取中性值
-        if is_high_growth:
-            dcf = DCFModel(wacc=wacc, terminal_growth=terminal).value_three_scenarios(
-                base_fcf=base_fcf,
-                high_growth_rate=growth,
-                transition_growth_rate=max(0.03, growth * 0.5),
-                shares_outstanding=shares,
-            )
-        else:
-            dcf = DCFModel(wacc=wacc, terminal_growth=terminal).value(
-                base_fcf=base_fcf,
-                high_growth_rate=growth,
-                transition_growth_rate=max(0.03, growth * 0.5),
-                shares_outstanding=shares,
-            )
-        dcf["fcf_source"] = fcf_src
-        dcf["shares_source"] = shares_src
-        dcf["role"] = "pessimistic_reference"
-        base_note = (
-            "DCF 为极端悲观情景参考，非核心定价依据；"
-            "高成长科技股请优先参考相对估值、机构共识与品类扩张叙事"
+        model = DCFModel(wacc=wacc, terminal_growth=terminal)
+        need_normal_split = bool(
+            is_high_growth
+            or meta.get("profit_yoy_extreme")
+            or (meta.get("profit_yoy") is not None and abs(float(meta["profit_yoy"])) > 100)
         )
-        if is_high_growth:
-            base_note += (
-                f"；高成长参数已适配：WACC≈{wacc*100:.1f}%，"
-                f"永续增速{terminal*100:.1f}%，"
-                f"基期FCF来源={fcf_src}"
+
+        # 高增/峰值情景（仅乐观区间上沿，不入加权中枢）
+        dcf_high = model.value(
+            base_fcf=base_fcf,
+            high_growth_rate=max(growth, 0.18) if need_normal_split else growth,
+            transition_growth_rate=max(0.05, growth * 0.5),
+            shares_outstanding=shares,
+            growth_cap=0.25 if need_normal_split else 0.15,
+        )
+        dcf_high_iv = dcf_high.get("intrinsic_value_per_share")
+
+        if need_normal_split:
+            # 中性 DCF：常态增速 8% + 基期 FCF 向常态折扣（峰值利润年不可永续）
+            base_fcf_normal = base_fcf * (
+                0.55 if meta.get("profit_yoy_extreme") else 0.75
             )
-        if is_hgq:
+            dcf = model.value(
+                base_fcf=base_fcf_normal,
+                high_growth_rate=0.08,
+                transition_growth_rate=0.04,
+                shares_outstanding=shares,
+                growth_cap=0.10,
+            )
+            dcf["role"] = "normal_growth"
+            dcf["display_label"] = "DCF内在价值（中性/常态增速）"
+            dcf["fcf_source"] = f"{fcf_src}+normal_haircut"
+            base_note = (
+                "中性DCF入池（营收常态增速≈8%，基期FCF已向常态折扣）；"
+                f"高增情景IV={dcf_high_iv}仅作乐观区间上沿，不参与加权中枢"
+            )
+            if is_high_growth:
+                base_note += (
+                    f"；WACC≈{wacc*100:.1f}%，永续增速{terminal*100:.1f}%"
+                )
+        else:
+            dcf = model.value(
+                base_fcf=base_fcf,
+                high_growth_rate=growth,
+                transition_growth_rate=max(0.03, growth * 0.5),
+                shares_outstanding=shares,
+            )
+            dcf["role"] = "standard"
+            dcf["fcf_source"] = fcf_src
+            base_note = (
+                f"三阶段DCF（WACC≈{wacc*100:.1f}%，永续{terminal*100:.1f}%；"
+                f"基期FCF来源={fcf_src}）"
+            )
+
+        dcf["shares_source"] = shares_src
+        dcf["dcf_high"] = dcf_high_iv
+        dcf["scenario_optimistic"] = dcf_high_iv
+        if is_hgq and not need_normal_split:
             base_note += (
-                f"；高毛利高成长赛道已用 WACC≈{HIGH_GROWTH_WACC_PCT:.1f}% / "
-                f"扩张期增速上限，结果仍可能显著低于市场定价"
+                f"；高毛利高成长赛道已用 WACC≈{HIGH_GROWTH_WACC_PCT:.1f}%"
             )
         dcf["note"] = base_note
         dcf["dividend_asset"] = False
@@ -2644,13 +3128,16 @@ class FundamentalEngine:
                 dcf["note"] = base_note + "；估值偏离现价过大，已标记不可信（勿作核心定价）"
             else:
                 dcf["is_reliable"] = bool(shares_src != "default_1e9")
-            # 高成长且安全边际极差：强制不可信，避免 36 元 vs 220 元误导
+            # 高成长且安全边际极差：中性锚仍可信时保留；仅标注勿单独外推
             if is_hgq and float(dcf.get("margin_of_safety_pct") or 0) < -50:
-                dcf["is_reliable"] = False
-                dcf["note"] = (
-                    base_note
-                    + "；相对现价安全边际极差，仅作极端悲观压力测试，请勿作为核心定价"
-                )
+                if dcf.get("role") == "normal_growth":
+                    dcf["note"] = base_note + "；相对现价折价较大，请与DDM/相对估值交叉"
+                else:
+                    dcf["is_reliable"] = False
+                    dcf["note"] = (
+                        base_note
+                        + "；相对现价安全边际极差，仅作压力测试，请勿作为核心定价"
+                    )
         else:
             # 无现价对照时：默认股本一律不可信
             dcf["is_reliable"] = bool(iv) and shares_src != "default_1e9"

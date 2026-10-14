@@ -342,7 +342,7 @@ _REQUIRED_SNAPSHOT_KEYS: tuple[str, ...] = ("profit_yoy", "scoring_version")
 #      反复重建读缓存，属预期内的一次性开销。
 # 2026.10.09.1：行业自适应权重 / 周期内在价值锚 / 现金流金融轻量等打分口径变更，
 #      旧快照不可与图表页综合分混用，须重建。
-SCORING_VERSION = "2026.10.09.1"
+SCORING_VERSION = "2026.10.14.3"  # 银行DDM+PB-ROE模板；禁FCF-DCF；分红可持续/资本缓冲
 
 
 def _outdated_snapshot_symbols() -> set[str]:

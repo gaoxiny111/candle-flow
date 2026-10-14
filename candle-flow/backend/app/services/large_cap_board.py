@@ -25,8 +25,9 @@ DEFAULT_TOP = MAX_UNIVERSE
 DEFAULT_UNIVERSE_LIMIT = MAX_UNIVERSE
 GRADE_BANDS = ("A", "B", "C", "D", "E")
 SCORE_WORKERS = 3
-CACHE_TTL_SEC = 3600
-UNIVERSE_DISK_TTL_SEC = 6 * 3600
+# 股票池内存/磁盘缓存：有缓存直接用，不因过期自动拉行情；须点「重新打分」
+CACHE_TTL_SEC = 7 * 24 * 3600
+UNIVERSE_DISK_TTL_SEC = 7 * 24 * 3600
 
 _DISK_CACHE_DIR = Path("data") / "cache" / "large_cap_board"
 
@@ -34,6 +35,8 @@ _LOCK = threading.Lock()
 _REFRESHING = False
 _UNIVERSE_LOADING = False
 _AUTO_SCORED = False  # 本轮已自动补算过；未点「重新打分」不反复开线程
+# 后台自动补算开关：False=仅「重新打分」才开线程，打开页面不打分
+AUTO_SCORE_ENABLED = False
 _LAST_BOARD: dict[str, Any] | None = None
 _LAST_TS = 0.0
 _PROGRESS: dict[str, Any] = {
@@ -475,14 +478,19 @@ def scan_large_cap_board(
         if not it.get("scored"):
             pending_syms.append(u["symbol"])
 
-    started = False
-    if pending_syms and not refreshing and (refresh or not auto_done):
-        started = _schedule_scoring(pending_syms)
-
     groups_full = _group_by_grade(items)
     grade_counts = {g: len(groups_full[g]) for g in GRADE_BANDS}
     grade_counts["pending"] = len(groups_full["pending"])
     scored_count = sum(grade_counts[g] for g in GRADE_BANDS)
+
+    # 股票池走缓存、不每日重拉。后台自动补算已暂停（AUTO_SCORE_ENABLED=False）：
+    # 仅点「重新打分」(refresh) 才开线程；打开页面只读已有分数。
+    started = False
+    should_score = pending_syms and not refreshing and (
+        refresh or (AUTO_SCORE_ENABLED and not auto_done)
+    )
+    if should_score:
+        started = _schedule_scoring(pending_syms)
 
     # 按需裁剪下发内容
     lim = max(1, min(int(pending_limit), 500))
@@ -537,7 +545,7 @@ def scan_large_cap_board(
             "股票池：沪深 A 股全量，不设市值门槛",
             "默认只返回已评分 A–E；未评分请点「未评」分页加载（避免超时）",
             "展示按 A/B/C/D/E 主档分组（A- 归 A，B+/B- 归 B）",
-            "未评分标的后台补算，本页自动刷新",
+            "股票池优先用缓存；后台自动打分已暂停，未评保持 pending；全量重算请点「重新打分」",
         ],
     }
     with _LOCK:

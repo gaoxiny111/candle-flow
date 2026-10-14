@@ -107,17 +107,45 @@ class SolvencyAnalyzer(BaseAnalyzer):
                     )
                 elif tight:
                     comment_parts.append("轻资产行业采用更严阈值")
-            indicators.append(
-                IndicatorResult(
-                    name="资产负债率(%)",
-                    value=round(dr, 2),
-                    score=score,
-                    level=level,
-                    weight=3.0,
-                    comment="；".join(comment_parts),
-                    period=bs_period,
+            if _is_bank:
+                indicators.append(
+                    IndicatorResult(
+                        name="权益/总资产(%)",
+                        value=round(_bank_eq, 2),
+                        score=score,
+                        level=level,
+                        weight=3.5,
+                        comment="；".join(comment_parts) if comment_parts else (
+                            f"资本缓冲；同业中位 {_bank_eq_med:.2f}%"
+                            if _bank_eq_med else "资本缓冲（权益/总资产）"
+                        ),
+                        period=bs_period,
+                    )
                 )
-            )
+                # 资产负债率仅作留痕，不计入加权（存款负债无制造业含义）
+                indicators.append(
+                    IndicatorResult(
+                        name="资产负债率(%)",
+                        value=round(dr, 2),
+                        score=score,
+                        level=level,
+                        weight=0.0,
+                        comment="银行负债以客户存款为主，本项不适用制造业阈值（权重0）",
+                        period=bs_period,
+                    )
+                )
+            else:
+                indicators.append(
+                    IndicatorResult(
+                        name="资产负债率(%)",
+                        value=round(dr, 2),
+                        score=score,
+                        level=level,
+                        weight=3.0,
+                        comment="；".join(comment_parts),
+                        period=bs_period,
+                    )
+                )
 
         ibd_ratio = kwargs.get("interest_bearing_ratio")
         if ibd_ratio is None and bs.get("interest_bearing_ratio") is not None:
@@ -125,7 +153,19 @@ class SolvencyAnalyzer(BaseAnalyzer):
         # 银行不评有息负债率：该口径（短借+长借+应付债券）不含吸收存款，
         # 对银行系统性偏低（20 家样本在 0.44%~16.8% 之间乱跳，与风险无关），
         # 计入反而会把招行这类银行抬到 90 分（偏宽松）。
-        if ibd_ratio is not None and not _is_bank:
+        if _is_bank:
+            indicators.append(
+                IndicatorResult(
+                    name="有息负债率(%)",
+                    value=0.0,
+                    score=60.0,
+                    level=AnalysisLevel.NEUTRAL,
+                    weight=0.0,
+                    comment="不适用：存款类机构有息负债口径不含吸收存款",
+                    period=bs_period,
+                )
+            )
+        elif ibd_ratio is not None:
             ibr = float(ibd_ratio)
             # 有息负债率：优秀 <25，良好 25–40，中性 40–55
             ib_score, ib_level = self._score_by_range(ibr, (0, 25), (25, 40), (40, 55))
@@ -199,7 +239,30 @@ class SolvencyAnalyzer(BaseAnalyzer):
 
         # 银行不评流动/速动比率：存款类机构没有「流动资产/流动负债」的对应
         # 科目划分（数据源对银行的货币资金/应收/存货均未映射），该口径不适用。
-        if current_ratio is not None and not _is_bank:
+        if _is_bank:
+            indicators.append(
+                IndicatorResult(
+                    name="流动比率",
+                    value=0.0,
+                    score=60.0,
+                    level=AnalysisLevel.NEUTRAL,
+                    weight=0.0,
+                    comment="不适用：银行无制造业流动资产/流动负债对应科目",
+                    period=bs_period,
+                )
+            )
+            indicators.append(
+                IndicatorResult(
+                    name="速动比率",
+                    value=0.0,
+                    score=60.0,
+                    level=AnalysisLevel.NEUTRAL,
+                    weight=0.0,
+                    comment="不适用：银行无制造业速动比率口径",
+                    period=bs_period,
+                )
+            )
+        elif current_ratio is not None:
             cr = float(current_ratio)
             score_cr = self._linear_score(cr, 0.8, 2.5)
             cr_comment = "由货币资金+应收+存货 / 流动负债粗估，简表口径"
@@ -373,8 +436,8 @@ class SolvencyAnalyzer(BaseAnalyzer):
 
         if _is_bank:
             warnings.append(
-                "银行偿债评分仅基于杠杆水平（权益/总资产相对同业中位）；"
-                "数据源不提供不良贷款率/拨备覆盖率/资本充足率，未纳入资产质量判断"
+                "资本缓冲低于同业中位时杠杆在银行体系内偏高；"
+                "但数据源未提供不良贷款率、拨备覆盖率、资本充足率，资产质量未纳入判断"
             )
 
         if not indicators:

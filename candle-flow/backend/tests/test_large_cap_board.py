@@ -112,7 +112,9 @@ def test_board_groups_by_abcde() -> None:
     assert out["items"][0]["symbol"] == "601318.SH"
     assert out["count"] == 3
     assert "warnings" not in out["items"][0]
-    sched.assert_called_once()
+    # 后台自动打分已暂停：打开页面不调度
+    sched.assert_not_called()
+    assert out["status"] == "partial"
 
     with (
         patch.object(board, "_load_universe_disk", return_value=universe),
@@ -124,6 +126,32 @@ def test_board_groups_by_abcde() -> None:
         pend = board.scan_large_cap_board(refresh=False, grade="pending")
     assert len(pend["groups"]["pending"]) == 1
     assert pend["groups"]["pending"][0]["symbol"] == "600036.SH"
+
+
+def test_board_manual_refresh_still_schedules() -> None:
+    """点「重新打分」仍可开线程，不受 AUTO_SCORE_ENABLED 暂停影响。"""
+    universe = [
+        {
+            "symbol": "600036.SH",
+            "code": "600036",
+            "name": "招商银行",
+            "price": 35.0,
+            "pe_ttm": 6.0,
+            "pb": 0.9,
+            "market_cap": 8e11,
+            "market_cap_yi": 8000.0,
+        },
+    ]
+    with (
+        patch.object(board, "_load_universe_disk", return_value=universe),
+        patch.object(board, "_load_scored_map", return_value={}),
+        patch.object(board, "_schedule_scoring", return_value=True) as sched,
+        patch.object(board, "_clear_universe_disk"),
+    ):
+        out = board.scan_large_cap_board(refresh=True)
+
+    sched.assert_called_once()
+    assert out["refresh_started"] is True
 
 
 def test_board_does_not_reschedule_after_auto_round() -> None:
